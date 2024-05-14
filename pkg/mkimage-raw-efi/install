@@ -172,6 +172,7 @@ zfs_umount() {
 # create_efi_boot_entry DISK
 create_efi_boot_entry() {
    local DISK="$1"
+   efibootmgr
    # the pach to EFI bootloader is different on ARM and X86
    if [ -e /root/EFI/BOOT/BOOTAA64.EFI ]; then
       echo "INFO: creating EFI boot entry for ARM64 on disk $DISK at /EFI/BOOT/BOOTAA64.EFI"
@@ -180,6 +181,7 @@ create_efi_boot_entry() {
       echo "INFO: creating EFI boot entry for X86_64 on disk $DISK at /EFI/BOOT/BOOTX64.EFI"
       efibootmgr -c -d "/dev/$DISK" -p 1 -L "EVE-OS" -l '\EFI\BOOT\BOOTX64.EFI'
    fi
+   efibootmgr
 }
 
 logmsg "EVE-OS installation started"

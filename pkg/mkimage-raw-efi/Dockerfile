@@ -5,11 +5,11 @@
 #   /EFI/BOOT/grub.cfg - Chainloads main bootloader
 #   /UsbInvocationScript.txt - Enables USB boot on Dell 3000 series
 #
-FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb AS build
+FROM lfedge/eve-alpine:61cdbba633ac08243ee55a371c5b74d01a673784-dirty-99937cd AS build
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ENV BUILD_PKGS grep patch git make gcc linux-headers musl-dev autoconf automake pkgconfig kmod-dev util-linux-dev cryptsetup-dev lddtree libgcc
 ENV PKGS mtools dosfstools libarchive-tools sgdisk e2fsprogs util-linux squashfs-tools coreutils tar dmidecode \
-    kmod-libs cryptsetup-libs libblkid
+    kmod-libs cryptsetup-libs libblkid efibootmgr
 RUN eve-alpine-deploy.sh
 
 # get mkinitfs source from git and build it locally
