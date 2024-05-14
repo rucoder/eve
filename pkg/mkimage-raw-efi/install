@@ -168,6 +168,20 @@ zfs_umount() {
   umount /root/dev ||:
 }
 
+# create a EFI boot entry for installed EVE
+# create_efi_boot_entry DISK
+create_efi_boot_entry() {
+   local DISK="$1"
+   # the pach to EFI bootloader is different on ARM and X86
+   if [ -e /root/EFI/BOOT/BOOTAA64.EFI ]; then
+      echo "INFO: creating EFI boot entry for ARM64 on disk $DISK at /EFI/BOOT/BOOTAA64.EFI"
+      efibootmgr -c -d "/dev/$DISK" -p 1 -L "EVE-OS" -l '\EFI\BOOT\BOOTAA64.EFI'
+   else
+      echo "INFO: creating EFI boot entry for X86_64 on disk $DISK at /EFI/BOOT/BOOTX64.EFI"
+      efibootmgr -c -d "/dev/$DISK" -p 1 -L "EVE-OS" -l '\EFI\BOOT\BOOTX64.EFI'
+   fi
+}
+
 logmsg "EVE-OS installation started"
 # do this just in case
 modprobe usbhid && modprobe usbkbd
@@ -548,6 +562,9 @@ if [ "$INSTALL_ZFS" = true ]; then
 else
    umount /persist 2>/dev/null
 fi
+
+# installation wen well, create a boot entry
+create_efi_boot_entry "$INSTALL_DEV"
 
 # lets hope this is enough to flush the caches
 sync; sleep 5; sync
