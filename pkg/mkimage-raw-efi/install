@@ -168,20 +168,40 @@ zfs_umount() {
   umount /root/dev ||:
 }
 
+ctr_run() {
+   local SYS_DIRS="/sys /proc /dev"
+   local DIR="$1"
+   shift
+   for d in $SYS_DIRS; do mount --bind "$d" "$DIR/$d"; done
+   chroot "$DIR" "$@"
+   for d in $SYS_DIRS; do umount "$DIR/$d"; done
+}
+
 # create a EFI boot entry for installed EVE
 # create_efi_boot_entry DISK
 create_efi_boot_entry() {
    local DISK="$1"
-   chroot /root efibootmgr
-   # the pach to EFI bootloader is different on ARM and X86
-   if [ -e /root/EFI/BOOT/BOOTAA64.EFI ]; then
-      echo "INFO: creating EFI boot entry for ARM64 on disk $DISK at /EFI/BOOT/BOOTAA64.EFI"
-      chroot /root efibootmgr -c -D -a -d "/dev/$DISK" -p 1 -L "EVE-OS" -l '\EFI\BOOT\BOOTAA64.EFI'
+   local BOOTLOADER=''
+   local PLATFORM=''
+   mount -t efivarfs efivarfs /sys/firmware/efi/efivars || bail "FATAL: cannot mount efivarfs"
+   efibootmgr
+   # the path to EFI bootloader is different on ARM, X86_4 and RISCV64
+   # check whcih one is present and create the boot entry accordingly
+   if [ -e /root/EFI/BOOT/BOOTRISCV64.EFI ]; then
+      BOOTLOADER='BOOTRISCV64.EFI'
+      PLATFORM='RISCV64'
+   elif [ -e /root/EFI/BOOT/BOOTAA64.EFI ]; then
+      BOOTLOADER='BOOTAA64.EFI'
+      PLATFORM='ARM64'
+   elif [ -e /root/EFI/BOOT/BOOTX64.EFI ]; then
+      BOOTLOADER='BOOTX64.EFI'
+      PLATFORM='X86_64'
    else
-      echo "INFO: creating EFI boot entry for X86_64 on disk $DISK at /EFI/BOOT/BOOTX64.EFI"
-      chroot /root efibootmgr -c -D -a -d "/dev/$DISK" -p 1 -L "EVE-OS" -l '\EFI\BOOT\BOOTX64.EFI'
+      bail "FATAL: cannot find EFI bootloader"
    fi
-   chroot /root efibootmgr
+   echo "INFO: creating EFI boot entry for EVE-OS -> ($PLATFORM) $DISK:\\EFI\\BOOT\\$BOOTLOADER"
+   efibootmgr -c -D -d "/dev/$DISK" -p 1 -L "EVE-OS" -l "\\EFI\\BOOT\\$BOOTLOADER" || bail "FATAL: cannot create EFI boot entry"
+   efibootmgr
 }
 
 logmsg "EVE-OS installation started"
