@@ -42,6 +42,7 @@ dtc
 dtc-dev
 e2fsprogs
 e2fsprogs-extra
+efibootmgr
 elfutils-dev
 ethtool
 eudev-dev
