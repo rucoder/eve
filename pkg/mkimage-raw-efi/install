@@ -199,7 +199,7 @@ create_efi_boot_entry() {
    else
       bail "FATAL: cannot find EFI bootloader"
    fi
-   echo "INFO: creating EFI boot entry for EVE-OS -> ($PLATFORM) $DISK:\\EFI\\BOOT\\$BOOTLOADER"
+   logmsg "INFO: creating EFI boot entry for EVE-OS -> ($PLATFORM) $DISK:\\EFI\\BOOT\\$BOOTLOADER"
    efibootmgr -c -D -d "/dev/$DISK" -p 1 -L "EVE-OS" -l "\\EFI\\BOOT\\$BOOTLOADER" || bail "FATAL: cannot create EFI boot entry"
    efibootmgr
 }
