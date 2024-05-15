@@ -512,6 +512,9 @@ run-installer-raw: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 	qemu-img create -f ${IMG_FORMAT} $(TARGET_IMG) ${MEDIA_SIZE}M
 	$(QEMU_SYSTEM) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT) -drive file=$(INSTALLER).raw,format=raw $(QEMU_OPTS)
 
+run-installed: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
+	$(QEMU_SYSTEM) $(QEMU_OPTS) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT),id=uefi-disk
+
 run-verification-raw: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM)
 	qemu-img create -f ${IMG_FORMAT} $(TARGET_IMG) ${MEDIA_SIZE}M
 	@if [ "$(BUILD_DIR)" != "$(shell readlink -f $(CURRENT_DIR))" ]; then\
