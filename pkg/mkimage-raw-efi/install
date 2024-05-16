@@ -168,23 +168,15 @@ zfs_umount() {
   umount /root/dev ||:
 }
 
-ctr_run() {
-   local SYS_DIRS="/sys /proc /dev"
-   local DIR="$1"
-   shift
-   for d in $SYS_DIRS; do mount --bind "$d" "$DIR/$d"; done
-   chroot "$DIR" "$@"
-   for d in $SYS_DIRS; do umount "$DIR/$d"; done
-}
-
 # create a EFI boot entry for installed EVE
 # create_efi_boot_entry DISK
 create_efi_boot_entry() {
+   echo "======================================"
    local DISK="$1"
    local BOOTLOADER=''
    local PLATFORM=''
    mount -t efivarfs efivarfs /sys/firmware/efi/efivars || bail "FATAL: cannot mount efivarfs"
-   efibootmgr
+   efibootmgr -v
    # the path to EFI bootloader is different on ARM, X86_4 and RISCV64
    # check whcih one is present and create the boot entry accordingly
    if [ -e /root/EFI/BOOT/BOOTRISCV64.EFI ]; then
@@ -200,8 +192,30 @@ create_efi_boot_entry() {
       bail "FATAL: cannot find EFI bootloader"
    fi
    logmsg "INFO: creating EFI boot entry for EVE-OS -> ($PLATFORM) $DISK:\\EFI\\BOOT\\$BOOTLOADER"
-   efibootmgr -c -D -d "/dev/$DISK" -p 1 -L "EVE-OS" -l "\\EFI\\BOOT\\$BOOTLOADER" || bail "FATAL: cannot create EFI boot entry"
-   efibootmgr
+   efibootmgr -q -c -D -d "/dev/$DISK" -p 1 -L "EVE-OS" -l "\\EFI\\BOOT\\$BOOTLOADER" || bail "FATAL: cannot create EFI boot entry"
+   efibootmgr -v
+   # cleanup duplicate entries.
+   # The entry we just added is the first one in BootOrder list
+   CURRENT_ENTRY_INDEX=$(efibootmgr | grep -i "BootOrder" | cut -d ':' -f2 | cut -d ',' -f1 | sed 's/ //g')
+   logmsg "current index $CURRENT_ENTRY_INDEX"
+   CURRENT_ENTRY=$(efibootmgr -v | grep -i "Boot$CURRENT_ENTRY_INDEX")
+   CURRENT_ENTRY_DATA=$(echo "$CURRENT_ENTRY" | cut -d ' ' -f2-)
+   logmsg "current entry $CURRENT_ENTRY"
+   EVE_BOOT_ENTRIES=$(efibootmgr -v | grep -i "EVE-OS")
+   logmsg "All:"
+   logmsg "$EVE_BOOT_ENTRIES"
+   # get all 'EVE-OS' entries and delete them if they point to the same loader
+   for i in "$EVE_BOOT_ENTRIES"; do
+      if [ "$i" != "$CURRENT_ENTRY" ]; then
+         i_DATA=$(echo "$i" | cut -d ' ' -f2-)
+         if [ "$i_DATA" = "$CURRENT_ENTRY_DATA" ]; then
+            logmsg "will remove $i"
+            # efibootmgr -b $(echo "$i" | cut -d ' ' -f1 | sed 's/Boot//') -B -q
+         fi
+      fi
+   done
+   echo "Final result:"
+   efibootmgr -v
 }
 
 logmsg "EVE-OS installation started"
@@ -586,7 +600,7 @@ else
 fi
 
 # installation wen well, create a boot entry
-create_efi_boot_entry "$INSTALL_DEV"
+# create_efi_boot_entry "$INSTALL_DEV"
 
 # lets hope this is enough to flush the caches
 sync; sleep 5; sync
