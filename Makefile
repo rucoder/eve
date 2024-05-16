@@ -19,7 +19,7 @@ GOTREE=$(CURDIR)/pkg/pillar
 BUILDTOOLS_BIN=$(CURDIR)/build-tools/bin
 PATH:=$(BUILDTOOLS_BIN):$(PATH)
 
-GOPKGVERSION=$(shell tools/goversion.sh 2>/dev/null)
+GOPKGVERSION:=$(shell tools/goversion.sh 2>/dev/null)
 
 export CGO_ENABLED GOOS GOARCH PATH
 
@@ -79,10 +79,10 @@ UNAME_S_LCASE=$(shell uname -s | tr '[A-Z]' '[a-z]')
 # store the goos for local, as an easier-to-reference var
 LOCAL_GOOS=$(UNAME_S_LCASE)
 
-USER         = $(shell id -u -n)
-GROUP        = $(shell id -g -n)
-UID          = $(shell id -u)
-GID          = $(shell id -g)
+USER         := $(shell id -u -n)
+GROUP        := $(shell id -g -n)
+UID          := $(shell id -u)
+GID          := $(shell id -g)
 
 #for MacOS - use predefined user and group IDs
 ifeq ($(UNAME_S),Darwin)
@@ -92,18 +92,19 @@ ifeq ($(UNAME_S),Darwin)
 	GID          = 1001
 endif
 
-REPO_BRANCH=$(shell git rev-parse --abbrev-ref HEAD | tr / _)
-REPO_SHA=$(shell git describe --match '$$^' --abbrev=8 --always --dirty)
-REPO_TAG=$(shell git describe --always --tags | grep -E '[0-9]*\.[0-9]*\.[0-9]*' || echo snapshot)
-REPO_DIRTY_TAG=$(if $(findstring -dirty,$(REPO_SHA)),-$(shell date -u +"%Y-%m-%d.%H.%M"))
-EVE_TREE_TAG = $(shell git describe --abbrev=8 --always --dirty --tags)
+REPO_BRANCH:=$(shell git rev-parse --abbrev-ref HEAD | tr / _)
+REPO_SHA:=$(shell git describe --match '$$^' --abbrev=8 --always --dirty)
+REPO_TAG:=$(shell git describe --always --tags | grep -E '[0-9]*\.[0-9]*\.[0-9]*' || echo snapshot)
+#REPO_DIRTY_TAG=$(if $(findstring -dirty,$(REPO_SHA)),-$(shell date -u +"%Y-%m-%d.%H.%M"))
+#REPO_DIRTY_TAG:=$(REPO_SHA)
+EVE_TREE_TAG:=$(shell git describe --abbrev=8 --always --dirty --tags)
 
 ifeq ($(DEV),y)
 	DEV_TAG:=-dev
 endif
 
 # ROOTFS_VERSION used to construct the installer directory
-ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(REPO_DIRTY_TAG)$(DEV_TAG),$(REPO_TAG))
+ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(DEV_TAG),$(REPO_TAG))
 
 HOSTARCH:=$(subst aarch64,arm64,$(subst x86_64,amd64,$(shell uname -m)))
 # by default, take the host architecture as the target architecture, but can override with `make ZARCH=foo`
@@ -510,7 +511,13 @@ run-installer-iso: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 
 run-installer-raw: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 	qemu-img create -f ${IMG_FORMAT} $(TARGET_IMG) ${MEDIA_SIZE}M
-	$(QEMU_SYSTEM) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT) -drive file=$(INSTALLER).raw,format=raw $(QEMU_OPTS)
+	$(QEMU_SYSTEM) \
+	-device ahci,id=ahci \
+	-device ide-hd,drive=disk2,bus=ahci.1,bootindex=1 \
+	-drive file=$(TARGET_IMG),format=$(IMG_FORMAT),id=disk2,if=none \
+	-device ide-hd,drive=disk1,bus=ahci.0,bootindex=0 \
+	-drive file=$(INSTALLER).raw,format=raw,id=disk1,if=none \
+	$(QEMU_OPTS)
 
 run-installed: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 	$(QEMU_SYSTEM) $(QEMU_OPTS) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT),id=uefi-disk
