@@ -1,0 +1,3 @@
+# ignore cargo artifacts
+target/
+

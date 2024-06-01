@@ -1,0 +1,16 @@
+[package]
+name = "monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.4"
+anyhow = "1.0.86"
+
+[dependencies.cursive]
+# we need my commit "Let crossterm to initialyze with file for stdout"
+# but it is not yet available in 0.20.0
+git="https://github.com/gyscos/cursive.git"
+rev = "84bb85faa1cf9391e8a17da7e5df49d6814b2081"
+#branch = "main"
+features = ["crossterm-backend", "crossterm"]
