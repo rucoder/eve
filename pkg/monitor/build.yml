@@ -1,0 +1,53 @@
+# Copyright (c) 2022 Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+org: lfedge
+image: eve-monitor
+network: yes
+config:
+  pid: host
+  binds:
+    - /:/hostfs
+    - /lib/modules:/lib/modules
+    - /dev:/dev
+    - /run:/run
+    - /var:/var
+    - /persist:/persist:rshared,rbind
+    - /config:/config:rshared,rbind
+    - /containers:/containers:rshared,rbind
+    # this one doesn't exist if we run 'live'
+    #- /media/boot:/bits:rshared,rbind
+    #- /opt/zededa:/containers/services/pillar/lower/opt/zededa:rshared,rbind,rw
+    #- /opt/debug:/containers/services/debug/lower:rshared,rbind,rw
+  devices:
+    # all block devices
+    - path: all
+      type: b
+    - path: "/dev/console"
+      type: c
+      major: 5
+      minor: 1
+      mode: 0666
+    - path: "/dev/tty0"
+      type: c
+      major: 4
+      minor: 0
+      mode: 0666
+    - path: "/dev/ttyS0"
+      type: c
+      major: 4
+      minor: 64
+      mode: 0666
+    - path: "/dev/ttyAMA0"
+      type: c
+      major: 204
+      minor: 64
+      mode: 0666
+    - path: "/dev/hvc0"
+      type: c
+      major: 229
+      minor: 0
+      mode: 0666
+  capabilities:
+    - all
+  rootfsPropagation: shared
