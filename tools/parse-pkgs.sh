@@ -125,6 +125,7 @@ BSP_IMX_TAG=${BSP_IMX_TAG}
 APPARMOR_TAG=${APPARMOR_TAG}
 KUBE_TAG=${KUBE_TAG}
 RECOVERTPM_TAG=${RECOVERTPM_TAG}
+MONITOR_TAG=${MONITOR_TAG}
 EOF
 }
 
@@ -178,6 +179,7 @@ BSP_IMX_TAG=$(linuxkit_tag pkg/bsp-imx)
 APPARMOR_TAG=$(linuxkit_tag pkg/apparmor)
 KUBE_TAG=$(linuxkit_tag pkg/kube)
 RECOVERTPM_TAG=$(linuxkit_tag pkg/recovertpm)
+MONITOR_TAG=$(linuxkit_tag pkg/monitor)
 
 # Synthetic tags: the following tags are based on hashing
 # the contents of all the Dockerfile.in that we can find.
