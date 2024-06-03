@@ -1,2 +1,3 @@
 image: eve-cross-compilers
 org: lfedge
+network: yes
