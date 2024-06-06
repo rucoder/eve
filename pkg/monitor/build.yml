@@ -15,10 +15,7 @@ config:
     - /persist:/persist:rshared,rbind
     - /config:/config:rshared,rbind
     - /containers:/containers:rshared,rbind
-    # this one doesn't exist if we run 'live'
-    #- /media/boot:/bits:rshared,rbind
-    #- /opt/zededa:/containers/services/pillar/lower/opt/zededa:rshared,rbind,rw
-    #- /opt/debug:/containers/services/debug/lower:rshared,rbind,rw
+
   devices:
     # all block devices
     - path: all
@@ -47,6 +44,12 @@ config:
       type: c
       major: 229
       minor: 0
+      mode: 0666
+# we run the monitor on tty1
+    - path: "/dev/tty1"
+      type: c
+      major: 4
+      minor: 1
       mode: 0666
   capabilities:
     - all

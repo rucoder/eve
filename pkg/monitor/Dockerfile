@@ -47,5 +47,8 @@ RUN apk add --no-cache ncurses-dev ncurses-static
 RUN cargo  build --release
 
 FROM alpine:3.20 as runtime
+RUN apk add --no-cache kbd
 COPY --from=builder /app/target/release/monitor /sbin/monitor
-CMD ["/sbin/monitor"]
+COPY run-monitor.sh /sbin/run-monitor.sh
+
+CMD ["/sbin/run-monitor.sh"]
