@@ -89,6 +89,8 @@ type diagContext struct {
 	rowPtr                 *int
 	columnPtr              *int
 	triggerPrintChan       chan<- string
+	dataUpdaterChan        chan string
+	dataUpdater            string
 	ph                     *PrintHandle
 }
 
@@ -119,6 +121,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		globalConfig:     types.DefaultConfigItemValueMap(),
 		zedcloudMetrics:  zedcloud.NewAgentMetrics(),
 		triggerPrintChan: triggerPrintChan,
+		dataUpdaterChan:  make(chan string, 1),
 	}
 	agentbase.Init(&ctx, logger, log, agentName,
 		agentbase.WithBaseDir(baseDir),
@@ -384,6 +387,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	pubTimer := time.NewTimer(30 * time.Second)
 
 	go printTask(&ctx, triggerPrintChan)
+
+	if err := startMonitorIPCServer(&ctx); err != nil {
+		log.Fatalf("Cannot start Monitor IPC server but diag will continue `%v`", err)
+	}
 
 	for {
 		gotAll := ctx.gotBC && ctx.gotDNS && ctx.gotDPCList
@@ -739,11 +746,10 @@ func triggerPrintOutput(ctx *diagContext, caller string) {
 // printTask waits for 5 seconds after each print to limit the rate
 func printTask(ctx *diagContext, triggerPrintChan <-chan string) {
 	for {
-		select {
-		case caller := <-triggerPrintChan:
-			printOutput(ctx, caller)
-			time.Sleep(5 * time.Second)
-		}
+		caller := <-triggerPrintChan
+		ctx.dataUpdaterChan <- caller
+		printOutput(ctx, caller)
+		time.Sleep(5 * time.Second)
 	}
 }
 
