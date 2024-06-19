@@ -193,6 +193,7 @@ require (
 
 require (
 	github.com/bicomsystems/go-libzfs v0.4.0 // indirect
+	github.com/getlantern/framed v0.0.0-20190601192238-ceb6431eeede // indirect
 	github.com/go-kit/kit v0.13.0 // indirect
 	github.com/go-kit/log v0.2.1 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
@@ -205,6 +206,7 @@ require (
 	github.com/openshift/api v0.0.0-20230503133300-8bbcb7ca7183 // indirect
 	github.com/openshift/client-go v0.0.0-20210112165513-ebc401615f47 // indirect
 	github.com/openshift/custom-resource-status v1.1.2 // indirect
+	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
 	github.com/pborman/uuid v1.2.1 // indirect
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.68.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
