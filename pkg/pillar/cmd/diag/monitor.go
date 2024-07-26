@@ -7,6 +7,7 @@ import (
 	"net"
 
 	framed "github.com/getlantern/framed"
+	"github.com/lf-edge/eve/pkg/pillar/types"
 )
 
 type Request struct {
@@ -186,6 +187,15 @@ func startMonitorIPCServer(ctx *diagContext) error {
 
 						ctx.IPCServer.sendIpcMessage("NetworkStatus", ctx.DeviceNetworkStatus)
 					}
+
+					// send info about downloads
+					items := ctx.subDownloaderStatus.GetAll()
+					for index, item := range items {
+						ds := item.(types.DownloaderStatus)
+						log.Notice("[MON] Got Downloader Status %d/%d", index, len(items))
+						ctx.IPCServer.sendIpcMessage("DownloaderStatus", ds)
+					}
+
 				}
 			}()
 		}
