@@ -121,6 +121,7 @@ type DevicePortConfig struct {
 	Ports []NetworkPortConfig
 }
 
+// TODO: check for key
 // PubKey is used for pubsub. Key string plus TimePriority
 func (config DevicePortConfig) PubKey() string {
 	return config.Key + "@" + config.TimePriority.UTC().Format(time.RFC3339Nano)

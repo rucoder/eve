@@ -93,6 +93,7 @@ type diagContext struct {
 	dataUpdater            string
 	ph                     *PrintHandle
 	IPCServer              *IPCServer
+	pubDevicePortConfig    pubsub.Publication
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -388,6 +389,19 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	pubTimer := time.NewTimer(30 * time.Second)
 
 	go printTask(&ctx, triggerPrintChan)
+
+	ctx.pubDevicePortConfig, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			TopicType:  types.DevicePortConfig{},
+			Persistent: true,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = ctx.pubDevicePortConfig.ClearRestarted(); err != nil {
+		log.Fatal(err)
+	}
 
 	if err := startMonitorIPCServer(&ctx); err != nil {
 		log.Fatalf("Cannot start Monitor IPC server but diag will continue `%v`", err)
