@@ -1,4 +1,4 @@
-FROM alpine:3.20 as toolchain
+FROM alpine:3.20 AS toolchain
 #install rust and cargo
 RUN apk add --no-cache rustup gcc musl-dev
 # call rustup-init but do not install default toolchain
@@ -14,15 +14,15 @@ RUN rustup show
 
 # TODO: install specific version cargo-chef
 RUN cargo install cargo-chef
-FROM toolchain as planer
-# copy sources
-COPY ./src /app/src
-COPY Cargo.toml /app/Cargo.toml
-COPY Cargo.lock /app/Cargo.lock
+FROM toolchain AS planer
+# get sources from GIT
+ADD git@github.com:rucoder/standalone-tui.git /app
+ADD rust-toolchain.toml /app
+
 # create a recipe
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM toolchain as cacher
+FROM toolchain AS cacher
 # copy the recipe
 WORKDIR /app
 COPY --from=planer /app/recipe.json recipe.json
@@ -31,22 +31,18 @@ RUN apk add --no-cache ncurses-dev ncurses-static
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # building the final image
-FROM toolchain as builder
-WORKDIR /app
-# copy sources
-COPY ./src /app/src
-COPY Cargo.toml /app
-COPY Cargo.lock /app
+FROM toolchain AS builder
+ADD git@github.com:rucoder/standalone-tui.git /app
 COPY rust-toolchain.toml /app
+WORKDIR /app
 
 # copy the cooked dependencies
 COPY --from=cacher /app/target target
 # copy the .cargo directory
 COPY --from=cacher /root/.cargo /root/.cargo
-RUN apk add --no-cache ncurses-dev ncurses-static
 RUN cargo  build --release
 
-FROM alpine:3.20 as runtime
+FROM alpine:3.20 AS runtime
 RUN apk add --no-cache kbd
 COPY --from=builder /app/target/release/monitor /sbin/monitor
 COPY run-monitor.sh /sbin/run-monitor.sh
