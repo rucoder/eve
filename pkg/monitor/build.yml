@@ -45,12 +45,17 @@ config:
       major: 229
       minor: 0
       mode: 0666
-# we run the monitor on tty1
-    - path: "/dev/tty1"
+# we run the monitor on tty2
+    - path: "/dev/tty2"
       type: c
       major: 4
-      minor: 1
+      minor: 2
       mode: 0666
+    - path: "/dev/kmsg"
+      type: c
+      major: 1
+      minor: 11
+      mode: 0660
   capabilities:
     - all
   rootfsPropagation: shared
