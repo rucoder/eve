@@ -1,8 +1,7 @@
 [toolchain]
-channel = "1.78.0"
+channel = "1.80.0"
 # The supported toolchains used to build the project
 targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # riscv target doesn't have a musl target yet and std is not available for it
 #, "riscv64gc-unknown-linux-gnu"]
 profile = "minimal"
-
