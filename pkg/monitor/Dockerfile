@@ -16,7 +16,7 @@ RUN rustup show
 RUN cargo install cargo-chef
 FROM toolchain AS planer
 # get sources from GIT
-ADD git@github.com:rucoder/standalone-tui.git /app
+ADD git@github.com:rucoder/standalone-tui.git#rucoder/model-conversion /app
 ADD rust-toolchain.toml /app
 
 # create a recipe
@@ -32,7 +32,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # building the final image
 FROM toolchain AS builder
-ADD git@github.com:rucoder/standalone-tui.git /app
+ADD git@github.com:rucoder/standalone-tui.git#rucoder/model-conversion /app
 COPY rust-toolchain.toml /app
 WORKDIR /app
 
