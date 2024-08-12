@@ -106,7 +106,9 @@ type nim struct {
 	assignableAdapters types.AssignableAdapters
 	enabledLastResort  bool
 	forceLastResort    bool
+	forceManualDPC     bool
 	lastResort         *types.DevicePortConfig
+	manualDPC          *types.DevicePortConfig
 }
 
 // AddAgentSpecificCLIFlags adds CLI options

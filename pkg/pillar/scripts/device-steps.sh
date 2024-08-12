@@ -309,7 +309,7 @@ for AGENT in $AGENTS; do
       # NOTE: it is safe to do either kill -STOP or an outright
       # kill -9 on the following cat process if you want to stop
       # receiving those messages on the console.
-      size="$(stty -F /dev/console size)"
+      size="$(stty -F /dev/tty1 size)"
       rows=$(echo "$size" | awk '{print $1}')
       columns=$(echo "$size" | awk '{print $2}')
       [ "$rows" != 0 ] || rows=""
@@ -317,7 +317,7 @@ for AGENT in $AGENTS; do
       [ "$columns" != 0 ] || columns=""
       [ -z "$columns" ] || columns="-c $columns"
       mkfifo /run/diag.pipe
-      (while true; do cat; done) < /run/diag.pipe >/dev/console 2>&1 &
+      (while true; do cat; done) < /run/diag.pipe >/dev/tty1 2>&1 &
       # shellcheck disable=SC2086
       $BINDIR/diag -f -o /run/diag.pipe -s /run/diag.out $rows $columns &
     else
@@ -431,14 +431,14 @@ if [ ! -s "$DEVICE_CERT_NAME" ]; then
     umount $CONFIGDIR_PERSIST
     # Did we fail to generate a certificate?
     if [ ! -s "$DEVICE_CERT_NAME" ]; then
-        echo "$(date -Ins -u) Failed to generate a device certificate. Done" | tee /dev/console
+        echo "$(date -Ins -u) Failed to generate a device certificate. Done" | tee /dev/tty
         exit 0
     fi
 else
     echo "$(date -Ins -u) Using existing device key pair"
 fi
 if [ ! -s $CONFIGDIR/server ] || [ ! -s $CONFIGDIR/root-certificate.pem ]; then
-    echo "$(date -Ins -u) No server or root-certificate to connect to. Done" | tee /dev/console
+    echo "$(date -Ins -u) No server or root-certificate to connect to. Done" | tee /dev/tty
     exit 0
 fi
 

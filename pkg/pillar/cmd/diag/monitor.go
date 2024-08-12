@@ -10,16 +10,51 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 )
 
+// All mesages except for Request type, have the following format:
+// where type is one of the following:
+// Request, Response, NetworkStatus, DPCList, DownloaderStatus
+// message is a json object that can be flattened
+//   {
+//		"type": "Response",
+//		"message": {
+//   		"Err": "big error",
+//	    	"id": 10
+//		}
+//   }
+//
+//   {
+//    	"RequestType": "SetDPC",
+//	    "RequestData": {
+//	        "dddd": "test datat"
+//	    },
+//	    "id": 15
+//   }
+
 type Request struct {
-	Command string `json:"command"`
-	Id      uint64 `json:"id"`
+	Id          uint64
+	RequestType string          `json:"RequestType"`
+	RequestData json.RawMessage `json:"RequestData"`
+}
+
+func (r *Request) validate() error {
+	if r.RequestType == "" {
+		return errors.New("RequestType is empty")
+	}
+	if r.RequestData == nil {
+		return errors.New("RequestData is nil")
+	}
+	// check supported request types
+	if r.RequestType != "SetDPC" {
+		return errors.New("Unsupported RequestType " + r.RequestType)
+	}
+	return nil
 }
 
 type Response struct {
-	Type   string          `json:"type"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
-	Id     uint64          `json:"id"` // Id is the id of the request that this response is for
+	// Ok and Err in exactly this spelling are variants or rust's Result<T, E> type
+	Ok  string `json:"Ok,omitempty"`
+	Err string `json:"Err,omitempty"`
+	Id  uint64 `json:"id"` // Id is the id of the request that this response is for
 }
 
 type IpcMessage struct {
@@ -90,20 +125,17 @@ func (s *IPCServer) readRequest() (*Request, error) {
 		return nil, err
 	}
 	log.Noticef("Received frame: %v", string(frame))
-	var req Request
-	if err := json.Unmarshal(frame, &req); err != nil {
+
+	var request Request
+	if err := json.Unmarshal(frame, &request); err != nil {
 		return nil, err
 	}
-	return &req, nil
+	return &request, nil
 }
 
 // send response
 func (s *IPCServer) sendResponse(resp *Response) error {
-	var err error
-
-	err = s.sendIpcMessage("response", resp)
-
-	return err
+	return s.sendIpcMessage("Response", resp)
 }
 
 func (s *IPCServer) sendIpcMessage(t string, msg any) error {
@@ -119,28 +151,72 @@ func (s *IPCServer) sendIpcMessage(t string, msg any) error {
 	return err
 }
 
-func (s *IPCServer) unimplementedResponse(req *Request) *Response {
+func (r *Request) errResponse(errorText string, err error) *Response {
+	if err != nil {
+		errorText = errorText + ": " + err.Error()
+	}
 	return &Response{
-		Error: "Unimplemented",
-		Id:    req.Id,
+		Err: errorText,
+		Id:  r.Id,
 	}
 }
 
-func (s *IPCServer) unknownCommandResponse(req *Request) *Response {
+func (r *Request) okResponse() *Response {
 	return &Response{
-		Error: "Unknown command",
-		Id:    req.Id,
+		Id: r.Id,
+		Ok: "ok",
 	}
+}
+
+func (r *Request) unimplementedResponse() *Response {
+	return r.errResponse("Unimplemented request", nil)
+}
+
+func (r *Request) unknownRequestResponse() *Response {
+	return r.errResponse("Unknown request", nil)
+}
+
+func (r *Request) malformedRequestResponse(err error) *Response {
+	err_message := "Malformed request [" + string(r.RequestData) + "]"
+	return r.errResponse(err_message, err)
+}
+
+func (r *Request) handleRequest(ctx *diagContext) *Response {
+	switch r.RequestType {
+	case "SetDPC":
+		// Unmarshal the request data
+		var dpc types.DevicePortConfig
+		if err := json.Unmarshal(r.RequestData, &dpc); err != nil {
+			if err := ctx.IPCServer.validateDPC(dpc); err != nil {
+				return r.errResponse("Failed to validate DPC", err)
+			}
+			// publish the DPC
+			if err := ctx.pubDevicePortConfig.Publish(dpc.Key, dpc); err != nil {
+				return r.errResponse("Failed to publish DPC", err)
+			} else {
+				return r.okResponse()
+			}
+		} else {
+			return r.malformedRequestResponse(err)
+		}
+	default:
+		return r.unknownRequestResponse()
+	}
+}
+
+func (s *IPCServer) validateDPC(dpc types.DevicePortConfig) error {
+	//TODO: validate DPC
+	return nil
 }
 
 // handle request
 func (s *IPCServer) handleRequest(ctx *diagContext, req *Request) *Response {
-	switch req.Command {
-	case "SetDPC":
-		return s.unimplementedResponse(req)
-	default:
-		return s.unknownCommandResponse(req)
+	// validate request
+	if err := req.validate(); err != nil {
+		return req.errResponse("Failed to validate request", err)
 	}
+	// handle request
+	return req.handleRequest(ctx)
 }
 
 func startMonitorIPCServer(ctx *diagContext) error {
@@ -187,13 +263,24 @@ func startMonitorIPCServer(ctx *diagContext) error {
 
 						ctx.IPCServer.sendIpcMessage("NetworkStatus", ctx.DeviceNetworkStatus)
 					}
+					if ctx.IOAdapters.Initialized {
+						log.Notice("[MON] Got IO Adapters")
+						ctx.IPCServer.sendIpcMessage("IOAdapters", ctx.IOAdapters)
+					}
 
 					// send info about downloads
 					items := ctx.subDownloaderStatus.GetAll()
-					for index, item := range items {
+					for key, item := range items {
 						ds := item.(types.DownloaderStatus)
-						log.Notice("[MON] Got Downloader Status %d/%d", index, len(items))
+						log.Noticef("[MON] Got Downloader Status %s/%v", key, item)
 						ctx.IPCServer.sendIpcMessage("DownloaderStatus", ds)
+					}
+
+					// send info about apps
+					items = ctx.subAppInstanceStatus.GetAll()
+					for _, item := range items {
+						ais := item.(types.AppInstanceStatus)
+						ctx.IPCServer.sendIpcMessage("AppStatus", ais)
 					}
 
 				}

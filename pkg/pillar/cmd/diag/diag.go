@@ -69,6 +69,7 @@ type diagContext struct {
 	appInstanceSummary      types.AppInstanceSummary
 	subAppInstanceStatus    pubsub.Subscription
 	subDownloaderStatus     pubsub.Subscription
+	subPhysicalIOAdapter    pubsub.Subscription
 	zedcloudMetrics         *zedcloud.AgentMetrics
 	gotBC                   bool
 	gotDNS                  bool
@@ -94,6 +95,7 @@ type diagContext struct {
 	ph                     *PrintHandle
 	IPCServer              *IPCServer
 	pubDevicePortConfig    pubsub.Publication
+	IOAdapters             types.PhysicalIOAdapterList
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -378,6 +380,25 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	ctx.subDownloaderStatus = subDownloaderStatus
 	subDownloaderStatus.Activate()
 
+	// Look for PhysicalIOAdapter from zedagent
+	subPhysicalIOAdapter, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		MyAgentName:   agentName,
+		TopicImpl:     types.PhysicalIOAdapterList{},
+		Activate:      false,
+		Ctx:           &ctx,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		CreateHandler: handlePhysicalIOAdapterCreate,
+		ModifyHandler: handlePhysicalIOAdapterModify,
+		DeleteHandler: handlePhysicalIOAdapterDelete,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.subPhysicalIOAdapter = subPhysicalIOAdapter
+	subPhysicalIOAdapter.Activate()
+
 	cloudPingMetricPub, err := ps.NewPublication(
 		pubsub.PublicationOptions{
 			AgentName: agentName,
@@ -443,6 +464,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 		case change := <-subDownloaderStatus.MsgChan():
 			subDownloaderStatus.ProcessChange(change)
+
+		case change := <-subPhysicalIOAdapter.MsgChan():
+			subPhysicalIOAdapter.ProcessChange(change)
 		}
 		// Is this the first time we have all the info to print?
 		if !gotAll && ctx.gotBC && ctx.gotDNS && ctx.gotDPCList {
@@ -596,6 +620,31 @@ func handleDownloaderStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	ctx := ctxArg.(*diagContext)
 	triggerPrintOutput(ctx, "Download")
+}
+
+func handlePhysicalIOAdapterCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handlePhysicalIOAdapterImpl(ctxArg, key, statusArg)
+}
+
+func handlePhysicalIOAdapterModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handlePhysicalIOAdapterImpl(ctxArg, key, statusArg)
+}
+
+func handlePhysicalIOAdapterImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	ctx := ctxArg.(*diagContext)
+	ctx.IOAdapters = statusArg.(types.PhysicalIOAdapterList)
+
+	triggerPrintOutput(ctx, "IOAdapters")
+}
+
+func handlePhysicalIOAdapterDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	ctx := ctxArg.(*diagContext)
+	ctx.IOAdapters = types.PhysicalIOAdapterList{}
+	triggerPrintOutput(ctx, "IOAdapters")
 }
 
 func handleDNSCreate(ctxArg interface{}, key string,

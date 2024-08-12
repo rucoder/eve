@@ -16,7 +16,7 @@ RUN rustup show
 RUN cargo install cargo-chef
 FROM toolchain AS planer
 # get sources from GIT
-ADD git@github.com:rucoder/standalone-tui.git#rucoder/model-conversion /app
+ADD git@github.com:rucoder/standalone-tui.git#rucoder/iface-details /app
 ADD rust-toolchain.toml /app
 
 # create a recipe
@@ -32,7 +32,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # building the final image
 FROM toolchain AS builder
-ADD git@github.com:rucoder/standalone-tui.git#rucoder/model-conversion /app
+ADD git@github.com:rucoder/standalone-tui.git#rucoder/iface-details /app
 COPY rust-toolchain.toml /app
 WORKDIR /app
 
@@ -43,8 +43,14 @@ COPY --from=cacher /root/.cargo /root/.cargo
 RUN cargo  build --release
 
 FROM alpine:3.20 AS runtime
-RUN apk add --no-cache kbd
+RUN apk add --no-cache kbd pciutils usbutils ncurses ncurses-terminfo
 COPY --from=builder /app/target/release/monitor /sbin/monitor
 COPY run-monitor.sh /sbin/run-monitor.sh
 
 CMD ["/sbin/run-monitor.sh"]
+
+#9448
+#30650
+#16169
+#12509
+#12147
