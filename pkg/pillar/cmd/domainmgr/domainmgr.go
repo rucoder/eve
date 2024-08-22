@@ -39,6 +39,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/kubeapi"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/sema"
+	"github.com/lf-edge/eve/pkg/pillar/serial"
 	"github.com/lf-edge/eve/pkg/pillar/sriov"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
@@ -2936,6 +2937,14 @@ func handlePhysicalIOAdapterListImpl(ctxArg interface{}, key string,
 				err := setupCAN(ib)
 				if err != nil {
 					err = fmt.Errorf("setupCAN: %w", err)
+					log.Error(err)
+					ib.Error = err.Error()
+					ib.ErrorTime = time.Now()
+				}
+			} else if ib.Type == types.IoCom {
+				err := serial.SetupSerial(ib)
+				if err != nil {
+					err = fmt.Errorf("setupCOM: %w", err)
 					log.Error(err)
 					ib.Error = err.Error()
 					ib.ErrorTime = time.Now()
