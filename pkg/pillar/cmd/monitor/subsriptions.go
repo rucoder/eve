@@ -1,0 +1,352 @@
+package monitor
+
+import (
+	"reflect"
+	"time"
+
+	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	"github.com/lf-edge/eve/pkg/pillar/types"
+)
+
+func handlePhysicalIOAdapterCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handlePhysicalIOAdapterUpdate(ctxArg, statusArg)
+}
+
+func handlePhysicalIOAdapterModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handlePhysicalIOAdapterUpdate(ctxArg, statusArg)
+}
+
+func handlePhysicalIOAdapterUpdate(ctxArg interface{}, statusArg interface{}) {
+	ctx := ctxArg.(*monitorContext)
+	status := statusArg.(types.PhysicalIOAdapterList)
+	ctx.IPCServer.SendIpcMessage("IOAdapters", status)
+}
+
+func handlePhysicalIOAdapterDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+}
+
+func handleNetworkStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleNetworStatusUpdate(statusArg, ctxArg)
+
+}
+func handleNetworkStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+}
+
+func handleNetworkStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleNetworStatusUpdate(statusArg, ctxArg)
+}
+
+func handleNetworStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.DeviceNetworkStatus)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("NetworkStatus", status)
+}
+
+func handleDownloaderStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleDownloaderStatusUpdate(statusArg, ctxArg)
+}
+
+func handleDownloaderStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleDownloaderStatusUpdate(statusArg, ctxArg)
+}
+
+func handleDownloaderStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.DownloaderStatus)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("DownloaderStatus", status)
+}
+
+func handleDownloaderStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+}
+
+func handleDPCCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleDPCUpdate(statusArg, ctxArg)
+
+}
+func handleDPCDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+}
+func handleDPCModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleDPCUpdate(statusArg, ctxArg)
+}
+
+func handleDPCUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.DevicePortConfigList)
+	if status.CurrentIndex == -1 {
+		return
+	}
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("DPCList", status)
+}
+
+func handleAppInstanceStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleAppInstanceStatusUpdate(statusArg, ctxArg)
+}
+
+func handleAppInstanceStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleAppInstanceStatusUpdate(statusArg, ctxArg)
+}
+
+func handleAppInstanceStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+}
+
+func handleAppInstanceStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.AppInstanceStatus)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("AppStatus", status)
+}
+
+func handleOnboardingStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleOnboardingStatusUpdate(statusArg, ctxArg)
+}
+
+func handleOnboardingStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleOnboardingStatusUpdate(statusArg, ctxArg)
+}
+
+func handleOnboardingStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.OnboardingStatus)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("OnboardingStatus", status)
+}
+
+func handleVaultStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleVaultStatusUpdate(statusArg, ctxArg)
+}
+
+func handleVaultStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleVaultStatusUpdate(statusArg, ctxArg)
+}
+
+func handleVaultStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.OnboardingStatus)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("VaultStatus", status)
+}
+
+func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
+	var err error
+
+	ctx.pubDevicePortConfig, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			TopicType:  types.DevicePortConfig{},
+			Persistent: true,
+		})
+	if err != nil {
+		log.Error("Cannot create DevicePortConfig publication")
+		return err
+	}
+	if err = ctx.pubDevicePortConfig.ClearRestarted(); err != nil {
+		log.Error("Cannot clear restarted for DevicePortConfig publication")
+		return err
+	}
+
+	// Look for PhysicalIOAdapter from zedagent
+	subPhysicalIOAdapter, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		MyAgentName:   agentName,
+		TopicImpl:     types.PhysicalIOAdapterList{},
+		Activate:      false,
+		Ctx:           ctx,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+		CreateHandler: handlePhysicalIOAdapterCreate,
+		ModifyHandler: handlePhysicalIOAdapterModify,
+		DeleteHandler: handlePhysicalIOAdapterDelete,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for PhysicalIOAdapter")
+		return err
+	}
+
+	subVaultStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "vaultmgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.VaultStatus{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleVaultStatusCreate,
+		ModifyHandler: handleVaultStatusModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
+	subOnboardStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedclient",
+		MyAgentName:   agentName,
+		TopicImpl:     types.OnboardingStatus{},
+		Activate:      true,
+		Persistent:    true,
+		Ctx:           ctx,
+		CreateHandler: handleOnboardingStatusCreate,
+		ModifyHandler: handleOnboardingStatusModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
+	subDeviceNetworkStatus, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "nim",
+			MyAgentName:   agentName,
+			TopicImpl:     types.DeviceNetworkStatus{},
+			Activate:      false,
+			Ctx:           ctx,
+			CreateHandler: handleNetworkStatusCreate,
+			ModifyHandler: handleNetworkStatusModify,
+			DeleteHandler: handleNetworkStatusDelete,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
+	if err != nil {
+		log.Error("Cannot create subscription for DeviceNetworkStatus")
+		return err
+	}
+
+	subDevicePortConfigList, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "nim",
+			MyAgentName:   agentName,
+			Persistent:    true,
+			TopicImpl:     types.DevicePortConfigList{},
+			Activate:      false,
+			Ctx:           ctx,
+			CreateHandler: handleDPCCreate,
+			ModifyHandler: handleDPCModify,
+			DeleteHandler: handleDPCDelete,
+		})
+	if err != nil {
+		log.Error("Cannot create subscription for DevicePortConfigList")
+		return err
+	}
+
+	// subAppInstanceSummary, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+	// 	AgentName:     "zedmanager",
+	// 	MyAgentName:   agentName,
+	// 	TopicImpl:     types.AppInstanceSummary{},
+	// 	Activate:      false,
+	// 	Ctx:           &ctx,
+	// 	CreateHandler: handleAppInstanceSummaryCreate,
+	// 	ModifyHandler: handleAppInstanceSummaryModify,
+	// 	WarningTime:   warningTime,
+	// 	ErrorTime:     errorTime,
+	// })
+	// if err != nil {
+	// 	return err
+	// }
+
+	// ctx.subscriptions = append(ctx.subscriptions, subAppInstanceSummary)
+
+	subAppInstanceStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedmanager",
+		MyAgentName:   agentName,
+		TopicImpl:     types.AppInstanceStatus{},
+		Activate:      true,
+		Ctx:           ctx,
+		CreateHandler: handleAppInstanceStatusCreate,
+		ModifyHandler: handleAppInstanceStatusModify,
+		DeleteHandler: handleAppInstanceStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for AppInstanceStatus")
+		return err
+	}
+
+	subDownloaderStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "downloader",
+		MyAgentName:   agentName,
+		TopicImpl:     types.DownloaderStatus{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleDownloaderStatusCreate,
+		ModifyHandler: handleDownloaderStatusModify,
+		DeleteHandler: handleDownloaderStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for DownloaderStatus")
+		return err
+	}
+
+	ctx.subscriptions["IOAdapters"] = subPhysicalIOAdapter
+	ctx.subscriptions["VaultStatus"] = subVaultStatus
+	ctx.subscriptions["OnboardingStatus"] = subOnboardStatus
+	ctx.subscriptions["NetworkStatus"] = subDeviceNetworkStatus
+	ctx.subscriptions["DPCList"] = subDevicePortConfigList
+	ctx.subscriptions["AppStatus"] = subAppInstanceStatus
+	ctx.subscriptions["DownloaderStatus"] = subDownloaderStatus
+	return nil
+}
+
+func (ctx *monitorContext) handleClientConnected() {
+	// go over all the subscriptions and process the current state
+	log.Noticef("Client connected. Activating subscriptions")
+	for _, sub := range ctx.subscriptions {
+		if err := sub.Activate(); err != nil {
+			log.Errorf("Failed to activate subscription %s", err)
+		}
+	}
+}
+
+func (ctx *monitorContext) process(ps *pubsub.PubSub) {
+	stillRunning := time.NewTicker(stillRunningInterval)
+
+	watches := make([]pubsub.ChannelWatch, 0)
+	for i := range ctx.subscriptions {
+		sub := ctx.subscriptions[i]
+		watches = append(watches, pubsub.ChannelWatch{
+			Chan: reflect.ValueOf(sub.MsgChan()),
+			Callback: func(value interface{}) {
+				change, ok := value.(pubsub.Change)
+				if !ok {
+					return
+				}
+				sub.ProcessChange(change)
+			},
+		})
+	}
+
+	watches = append(watches, pubsub.ChannelWatch{
+		Chan: reflect.ValueOf(stillRunning.C),
+		Callback: func(_ interface{}) {
+			ps.StillRunning(agentName, warningTime, errorTime)
+		},
+	})
+
+	watches = append(watches, pubsub.ChannelWatch{
+		Chan: reflect.ValueOf(ctx.clientConnected),
+		Callback: func(_ interface{}) {
+			ctx.handleClientConnected()
+		},
+	})
+
+	pubsub.MultiChannelWatch(watches)
+}
