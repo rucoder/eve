@@ -16,6 +16,8 @@ type VaultStatus struct {
 	Status             info.DataSecAtRestStatus
 	PCRStatus          info.PCRStatus
 	ConversionComplete bool
+	// only valid if TPM is enabled and Sealed key is used
+	MissmatchingPCRs []int
 	// ErrorAndTime provides SetErrorNow() and ClearError()
 	ErrorAndTime
 }

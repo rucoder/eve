@@ -882,7 +882,7 @@ func UnsealDiskKey(pcrSel tpm2.PCRSelection) ([]byte, error) {
 		}
 
 		// try to find out the mismatching PCR index
-		mismatch, errPcrMiss := findMismatchingPCRs()
+		mismatch, errPcrMiss := FindMismatchingPCRs()
 		if errPcrMiss != nil {
 			return nil, fmt.Errorf("UnsealWithSession failed: %w, %s, finding mismatching PCR failed: %v", err, evtLogStat, errPcrMiss)
 		}
@@ -1072,7 +1072,7 @@ func saveDiskKeySealingPCRs() error {
 	return fileutils.WriteRename(savedSealingPcrsFile, buff.Bytes())
 }
 
-func findMismatchingPCRs() ([]int, error) {
+func FindMismatchingPCRs() ([]int, error) {
 	frw, err := os.Open(savedSealingPcrsFile)
 	if err != nil {
 		return nil, err
