@@ -1,3 +1,6 @@
+// Copyright (c) 2024 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package monitor
 
 import (
@@ -138,9 +141,59 @@ func handleVaultStatusModify(ctxArg interface{}, key string,
 }
 
 func handleVaultStatusUpdate(statusArg interface{}, ctxArg interface{}) {
-	status := statusArg.(types.OnboardingStatus)
+	status := statusArg.(types.VaultStatus)
 	ctx := ctxArg.(*monitorContext)
 	ctx.IPCServer.SendIpcMessage("VaultStatus", status)
+}
+
+func handleAppInstanceSummaryCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleAppInstanceSummaryUpdate(statusArg, ctxArg)
+}
+
+func handleAppInstanceSummaryModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleAppInstanceSummaryUpdate(statusArg, ctxArg)
+}
+func handleAppInstanceSummaryUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.AppInstanceSummary)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("AppSummary", status)
+}
+
+func handleLedBlinkCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleLedBlinkUpdate(statusArg, ctxArg)
+}
+
+func handleLedBlinkModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleLedBlinkUpdate(statusArg, ctxArg)
+}
+func handleLedBlinkUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.LedBlinkCounter)
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("LedBlinkCounter", status)
+}
+
+func handleZedAgentStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleZedAgentStatusUpdate(statusArg, ctxArg)
+}
+
+func handleZedAgentStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleZedAgentStatusUpdate(statusArg, ctxArg)
+}
+
+func handleZedAgentStatusUpdate(statusArg interface{}, ctxArg interface{}) {
+	status := statusArg.(types.ZedAgentStatus)
+	// Ignore if ConfigGetStatus is 0 which is incorrect value
+	if status.ConfigGetStatus == 0 {
+		return
+	}
+	ctx := ctxArg.(*monitorContext)
+	ctx.IPCServer.SendIpcMessage("ZedAgentStatus", status)
 }
 
 func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
@@ -198,7 +251,7 @@ func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
 		AgentName:     "zedclient",
 		MyAgentName:   agentName,
 		TopicImpl:     types.OnboardingStatus{},
-		Activate:      true,
+		Activate:      false,
 		Persistent:    true,
 		Ctx:           ctx,
 		CreateHandler: handleOnboardingStatusCreate,
@@ -245,28 +298,27 @@ func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
 		return err
 	}
 
-	// subAppInstanceSummary, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-	// 	AgentName:     "zedmanager",
-	// 	MyAgentName:   agentName,
-	// 	TopicImpl:     types.AppInstanceSummary{},
-	// 	Activate:      false,
-	// 	Ctx:           &ctx,
-	// 	CreateHandler: handleAppInstanceSummaryCreate,
-	// 	ModifyHandler: handleAppInstanceSummaryModify,
-	// 	WarningTime:   warningTime,
-	// 	ErrorTime:     errorTime,
-	// })
-	// if err != nil {
-	// 	return err
-	// }
-
-	// ctx.subscriptions = append(ctx.subscriptions, subAppInstanceSummary)
+	subAppInstanceSummary, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedmanager",
+		MyAgentName:   agentName,
+		TopicImpl:     types.AppInstanceSummary{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleAppInstanceSummaryCreate,
+		ModifyHandler: handleAppInstanceSummaryModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for AppInstanceSummary")
+		return err
+	}
 
 	subAppInstanceStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "zedmanager",
 		MyAgentName:   agentName,
 		TopicImpl:     types.AppInstanceStatus{},
-		Activate:      true,
+		Activate:      false,
 		Ctx:           ctx,
 		CreateHandler: handleAppInstanceStatusCreate,
 		ModifyHandler: handleAppInstanceStatusModify,
@@ -296,6 +348,39 @@ func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
 		return err
 	}
 
+	subLedBlinkCounter, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "",
+			MyAgentName:   agentName,
+			TopicImpl:     types.LedBlinkCounter{},
+			Activate:      false,
+			Ctx:           ctx,
+			CreateHandler: handleLedBlinkCreate,
+			ModifyHandler: handleLedBlinkModify,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
+	if err != nil {
+		log.Error("Cannot create subscription for LedBlinkCounter")
+		return err
+	}
+
+	subZedAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		MyAgentName:   agentName,
+		TopicImpl:     types.ZedAgentStatus{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleZedAgentStatusCreate,
+		ModifyHandler: handleZedAgentStatusModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for ZedAgentStatus")
+		return err
+	}
+
 	ctx.subscriptions["IOAdapters"] = subPhysicalIOAdapter
 	ctx.subscriptions["VaultStatus"] = subVaultStatus
 	ctx.subscriptions["OnboardingStatus"] = subOnboardStatus
@@ -303,12 +388,19 @@ func (ctx *monitorContext) subscribe(ps *pubsub.PubSub) error {
 	ctx.subscriptions["DPCList"] = subDevicePortConfigList
 	ctx.subscriptions["AppStatus"] = subAppInstanceStatus
 	ctx.subscriptions["DownloaderStatus"] = subDownloaderStatus
+	ctx.subscriptions["AppSummary"] = subAppInstanceSummary
+	ctx.subscriptions["LedBlinkCounter"] = subLedBlinkCounter
+	ctx.subscriptions["ZedAgentStatus"] = subZedAgentStatus
 	return nil
 }
 
 func (ctx *monitorContext) handleClientConnected() {
 	// go over all the subscriptions and process the current state
 	log.Noticef("Client connected. Activating subscriptions")
+
+	ctx.sendNodeStatus()
+	ctx.sendAppsList()
+
 	for _, sub := range ctx.subscriptions {
 		if err := sub.Activate(); err != nil {
 			log.Errorf("Failed to activate subscription %s", err)
