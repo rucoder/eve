@@ -47,7 +47,7 @@ RUN cp /app/target/$CARGO_BUILD_TARGET/release/monitor /app/target/
 
 FROM alpine:3.20 AS runtime
 
-RUN apk add --no-cache kbd pciutils usbutils ncurses ncurses-terminfo
+RUN apk add --no-cache kbd pciutils usbutils ncurses-terminfo
 COPY --from=builder /app/target/monitor /sbin/monitor
 COPY --from=builder /app/sbom.spdx.json /sbin/sbom.spdx.json
 COPY run-monitor.sh /sbin/run-monitor.sh
