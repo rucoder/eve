@@ -281,6 +281,7 @@ func (n *nim) run(ctx context.Context) (err error) {
 		//    e.g. due to replacing or wiping the single disk where /persist lives, NIM will
 		//    notice that even after one minute of runtime (when dpcAvailTimer fires) there
 		//    is still no network config available and it will forcefully enable lastresort.
+		//&& !n.forceManualDPC
 		if !n.isDeviceOnboarded() &&
 			len(n.listPublishedDPCs(runDevicePortConfigDir)) == 0 &&
 			!fileutils.FileExists(n.Log, types.BootstrapConfFileName) {
@@ -803,6 +804,11 @@ func (n *nim) handleDPCImpl(key string, configArg interface{}, fromFile bool) {
 			return
 		}
 	}
+	if dpc.Key == dpcmanager.ManualDPCKey {
+		// Manual DPC is allowed to be forcefully used only until NIM receives
+		// any (proper) network configuration.
+		n.forceManualDPC = true
+	}
 	// Lastresort DPC is allowed to be forcefully used only until NIM receives
 	// any (proper) network configuration.
 	if dpc.Key != dpcmanager.LastResortKey {
@@ -1039,7 +1045,7 @@ func (n *nim) ingestDevicePortConfigFile(oldDirname string, newDirname string, n
 func (n *nim) reevaluateLastResortDPC() {
 	fallbackAnyEth := n.globalConfig.GlobalValueTriState(types.NetworkFallbackAnyEth)
 	enabledByConfig := fallbackAnyEth == types.TS_ENABLED
-	enableLastResort := enabledByConfig || n.forceLastResort
+	enableLastResort := (enabledByConfig || n.forceLastResort) //&& !n.forceManualDPC
 	if n.enabledLastResort != enableLastResort {
 		if enableLastResort {
 			reason := "lastresort enabled by global config"
@@ -1086,7 +1092,8 @@ func (n *nim) makeLastResortDPC() (types.DevicePortConfig, error) {
 	config.Key = dpcmanager.LastResortKey
 	config.Version = types.DPCIsMgmt
 	// Set to higher than all zero but lower than the hardware model derived one above
-	config.TimePriority = time.Unix(0, 0)
+	config.TimePriority = time.Date(1975,
+		time.January, 1, 0, 0, 0, 0, time.UTC)
 	ifNames, err := n.networkMonitor.ListInterfaces()
 	if err != nil {
 		err = fmt.Errorf("makeLastResortDPC: Failed to list interfaces: %v", err)

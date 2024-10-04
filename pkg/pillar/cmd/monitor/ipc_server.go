@@ -1,3 +1,6 @@
+// Copyright (c) 2024 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package monitor
 
 import (
@@ -89,12 +92,14 @@ func (s *IPCServer) HandleConnection(conn net.Conn) {
 	// the format of the frame is length + data
 	// where the length is 16 bit unsigned integer
 	s.codec = framed.NewReadWriteCloser(conn)
-	s.ctx.clientConnected <- true
 
 	go func() {
 		defer s.Close()
 		s.run()
 	}()
+
+	// notify the monitor that the client is connected
+	s.ctx.clientConnected <- true
 }
 
 // close the server
@@ -108,7 +113,9 @@ func (s *IPCServer) run() {
 	// other errors are logged and we continue
 	for {
 		// read request
+		log.Notice("IPCServer: wating for request")
 		req, err := s.readRequest()
+		log.Notice("IPCServer: got request")
 		if err != nil {
 			log.Warnf("Error reading request: %v", err)
 			// exit if EOF
@@ -205,7 +212,7 @@ func (r *Request) handleRequest(ctx *monitorContext) *Response {
 	case "SetDPC":
 		// Unmarshal the request data
 		var dpc types.DevicePortConfig
-		if err := json.Unmarshal(r.RequestData, &dpc); err != nil {
+		if err := json.Unmarshal(r.RequestData, &dpc); err == nil {
 			if err := ctx.IPCServer.validateDPC(dpc); err != nil {
 				return r.errResponse("Failed to validate DPC", err)
 			}
@@ -264,43 +271,6 @@ func (ctx *monitorContext) startIPCServer() error {
 
 			// handle remore requests
 			go ctx.IPCServer.HandleConnection(conn)
-
-			// go func() {
-			// 	for {
-			// 		ctx.dataUpdater = <-ctx.dataUpdaterChan
-			// 		log.Notice("[MON] Data for Monitor IPC is ready")
-			// 		if ctx.gotDPCList {
-			// 			log.Notice("[MON] Got DPC list")
-
-			// 			ctx.IPCServer.sendIpcMessage("DPCList", ctx.DevicePortConfigList)
-			// 		}
-			// 		if ctx.gotDNS {
-			// 			log.Notice("[MON] Got Device Network Status")
-
-			// 			ctx.IPCServer.sendIpcMessage("NetworkStatus", ctx.DeviceNetworkStatus)
-			// 		}
-			// 		if ctx.IOAdapters.Initialized {
-			// 			log.Notice("[MON] Got IO Adapters")
-			// 			ctx.IPCServer.sendIpcMessage("IOAdapters", ctx.IOAdapters)
-			// 		}
-
-			// 		// send info about downloads
-			// 		items := ctx.subDownloaderStatus.GetAll()
-			// 		for key, item := range items {
-			// 			ds := item.(types.DownloaderStatus)
-			// 			log.Noticef("[MON] Got Downloader Status %s/%v", key, item)
-			// 			ctx.IPCServer.sendIpcMessage("DownloaderStatus", ds)
-			// 		}
-
-			// 		// send info about apps
-			// 		items = ctx.subAppInstanceStatus.GetAll()
-			// 		for _, item := range items {
-			// 			ais := item.(types.AppInstanceStatus)
-			// 			ctx.IPCServer.sendIpcMessage("AppStatus", ais)
-			// 		}
-
-			// 	}
-			// }()
 		}
 	}()
 	return nil
