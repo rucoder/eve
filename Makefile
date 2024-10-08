@@ -364,8 +364,8 @@ ifeq ($(LINUXKIT_PKG_TARGET),push)
 endif
 
 # Though the partition size is set to 512MB lets check for ROOTFS_MAXSIZE_MB not exceeding 450MB for kubevirt.
-# That seems to be the direction taken for existing kvm systems where partition size is 300MB but
-# rootfs size is limited to 250MB. That helps in catching image size increases earlier than at later stage.
+# That seems to be the direction taken for existing kvm systems where partition size is 512MB but
+# rootfs size is limited to 350MB. That helps in catching image size increases earlier than at later stage.
 # We are currently filtering out a few packages from bulk builds
 # since they are not getting published in Docker HUB
 ifeq ($(HV),kubevirt)
@@ -378,7 +378,7 @@ else
         ifeq ($(PLATFORM),nvidia)
             ROOTFS_MAXSIZE_MB=450
         else
-            ROOTFS_MAXSIZE_MB=250
+            ROOTFS_MAXSIZE_MB=350
         endif
 endif
 
