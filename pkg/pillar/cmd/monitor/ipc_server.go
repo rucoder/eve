@@ -35,8 +35,8 @@ import (
 //   }
 
 type Request struct {
-	Id          uint64
-	RequestType string          `json:"RequestType"`
+	Id          uint64          `json:"id" validate:"required"`
+	RequestType string          `json:"RequestType" validate:"required"`
 	RequestData json.RawMessage `json:"RequestData"`
 }
 
@@ -116,6 +116,7 @@ func (s *IPCServer) run() {
 		log.Notice("IPCServer: wating for request")
 		req, err := s.readRequest()
 		log.Notice("IPCServer: got request")
+		log.Noticef("REQUEST: %v", req)
 		if err != nil {
 			log.Warnf("Error reading request: %v", err)
 			// exit if EOF
@@ -146,8 +147,14 @@ func (s *IPCServer) readRequest() (*Request, error) {
 	}
 	log.Noticef("Received frame: %v", string(frame))
 
+	// unmarshal IpcMessage first
+	var ipcMessage IpcMessage
+	if err := json.Unmarshal(frame, &ipcMessage); err != nil {
+		return nil, err
+	}
+
 	var request Request
-	if err := json.Unmarshal(frame, &request); err != nil {
+	if err := json.Unmarshal(ipcMessage.Message, &request); err != nil {
 		return nil, err
 	}
 	return &request, nil
@@ -155,9 +162,6 @@ func (s *IPCServer) readRequest() (*Request, error) {
 
 // send response
 func (s *IPCServer) sendResponse(resp *Response) error {
-	s.Lock()
-	defer s.Unlock()
-
 	return s.SendIpcMessage("Response", resp)
 }
 
