@@ -177,3 +177,7 @@ func (key EncryptedVaultKeyFromController) LogDelete(logBase *base.LogObject) {
 func (key EncryptedVaultKeyFromController) LogKey() string {
 	return string(base.EncryptedVaultKeyFromControllerLogType) + "-" + key.Key()
 }
+
+func (status VaultStatus) IsVaultInError() bool {
+	return (status.Status == info.DataSecAtRestStatus_DATASEC_AT_REST_ERROR) && len(status.MismatchingPCRs) > 0
+}

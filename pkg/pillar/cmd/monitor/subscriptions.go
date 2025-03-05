@@ -147,6 +147,10 @@ func handleVaultStatusUpdate(statusArg interface{}, ctxArg interface{}) {
 	status := statusArg.(types.VaultStatus)
 	ctx := ctxArg.(*monitor)
 	ctx.IPCServer.sendIpcMessage("VaultStatus", status)
+
+	if status.IsVaultInError() {
+		ctx.sendTpmLogs()
+	}
 }
 
 func handleAppInstanceSummaryCreate(ctxArg interface{}, key string,
@@ -196,6 +200,14 @@ func handleZedAgentStatusUpdate(statusArg interface{}, ctxArg interface{}) {
 		return
 	}
 	ctx := ctxArg.(*monitor)
+
+	// if status.DeviceState != ctx.deviceState {
+	// 	ctx.deviceState = status.DeviceState
+	// 	if status.MaintenanceMode {
+	// 		ctx.sendTpmLogs()
+	// 	}
+	// }
+
 	ctx.IPCServer.sendIpcMessage("ZedAgentStatus", status)
 }
 

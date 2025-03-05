@@ -40,6 +40,8 @@ type monitor struct {
 	serverNameAndPort   string
 	// cache last known data structures to avoid sending duplicate messages
 	lastNodeStatus *nodeStatus
+	// flag to indicate device state to avoid sending duplicate messages
+	//deviceState types.DeviceState
 
 	IPCServer *monitorIPCServer
 }
@@ -125,6 +127,7 @@ func newMonitorContext() *monitor {
 	ctx.IPCServer = newIPCServer(ctx)
 	ctx.clientConnected = ctx.IPCServer.c()
 	ctx.lastNodeStatus = nil
+	//ctx.deviceState = types.DEVICE_STATE_UNSPECIFIED
 
 	return ctx
 }
