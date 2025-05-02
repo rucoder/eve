@@ -11,7 +11,7 @@ if [ $# -lt 2 ] ; then
 fi
 
 REPO=${1:-lfedge/eve}
-CMD=${2:-"LINUXKIT_PKG_TARGET=push ; make pkgs ; make eve"}
+CMD=${2:-"REGISTRY=${LINUXKIT_ORG_TARGET} LINUXKIT_PKG_TARGET=push ; make pkgs ; make eve"}
 
 case $(uname -m) in
   x86_64) ARCH=-amd64

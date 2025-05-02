@@ -55,6 +55,12 @@ RUN rm -rf /tmp/zfs-out/usr/share && rm -rf /tmp/zfs-out/usr/src && \
 
 RUN cp -r /tmp/zfs-out/* /
 
+COPY domain.crt /tmp/domain.crt
+
+RUN mkdir -p /etc/docker/certs.d/10.208.13.132
+RUN cp /tmp/domain.crt /etc/docker/certs.d/10.208.13.132/ca.crt
+RUN cp /tmp/domain.crt /usr/local/share/ca-certificates/selfs.crt
+RUN update-ca-certificates
 
 RUN go install github.com/golang/protobuf/protoc-gen-go@v1.5.2
 RUN go install gotest.tools/gotestsum@v1.7.0
@@ -64,3 +70,4 @@ RUN mv /go/bin/* /usr/bin
 ENV HOME /home/${USER}
 ENV GOFLAGS=-mod=vendor
 ENV GO111MODULE=on
+ENV REGISTRY=${REGISTRY}
