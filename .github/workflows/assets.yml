@@ -94,12 +94,12 @@ jobs:
         run: |
           HV=${{ matrix.hv }}
           if [ "${{ github.event.repository.full_name }}" = "lf-edge/eve" ]; then
-             EVE=lfedge/eve:${TAG}-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
+             EVE=10.208.13.132/lfedge/eve:${TAG}-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
              docker pull "$EVE"
           else
              make pkgs
              make HV=${HV} ZARCH=${{ env.ARCH }} PLATFORM=${{ matrix.platform }} eve
-             EVE=lfedge/eve:$(make version)-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
+             EVE=10.208.13.132/lfedge/eve:$(make version)-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
           fi
           echo "EVE=$EVE" >> "$GITHUB_ENV"
       - name: Generate EVE binary assets
@@ -117,7 +117,7 @@ jobs:
         run: |
           if [ "${{ matrix.platform }}" != "evaluation" ]; then
             HV=${{ matrix.hv }}
-            EVE_SOURCES=lfedge/eve-sources:${TAG}-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
+            EVE_SOURCES=10.208.13.132/lfedge/eve-sources:${TAG}-${{ env.PLATFORMVER }}${HV}-${{ env.ARCH }}
             docker pull "$EVE_SOURCES"
             docker create --name eve_sources "$EVE_SOURCES" bash
             docker export --output assets/collected_sources.tar.gz eve_sources
