@@ -1,0 +1,106 @@
+name: PR Ready Gate
+
+on:
+  workflow_run:
+    workflows: ["PR build"]
+    types: [completed]
+
+  pull_request_review:
+    types: [submitted]
+
+# one gate run per PR; new workflow_run cancels the older run, reviews do not
+concurrency:
+  group: |
+    ${{ github.event.workflow_run.pull_requests[0].number || format('review-{0}-{1}', github.event.pull_request.number, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        hv: [kvm]
+        arch: [amd64]
+        platform: [generic]
+    if: >
+      (github.event_name == 'workflow_run') ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved')
+
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Collect metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            pr=$(gh api /search/issues -f q="type:pr is:open repo:${{ github.repository }} sha:${{ github.event.workflow_run.head_sha }}" -X GET -q '.items[0].number')
+            run_id="${{ github.event.workflow_run.id }}"
+            sha="${{ github.event.workflow_run.head_sha }}"
+          else # pull_request_review
+            pr="${{ github.event.pull_request.number }}"
+            sha="${{ github.event.pull_request.head.sha }}"
+            # Find the latest workflow run for this PR's HEAD SHA
+            run_id=$(gh api /repos/${{ github.repository }}/actions/runs \
+              -X GET \
+              -q ".workflow_runs[] | select(.head_sha==\"$sha\" and .name==\"PR build\") | .id" | head -n1)
+          fi
+          echo "pr=${pr}" >> $GITHUB_OUTPUT
+          echo "sha=${sha}" >> $GITHUB_OUTPUT
+          echo "run_id=${run_id}" >> $GITHUB_OUTPUT
+
+      - name: Check review decision
+        id: reviews
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR:       ${{ steps.meta.outputs.pr }}
+          GH_REPO:  ${{ github.repository }}
+        run: |
+          decision=$(gh pr view "$PR" --json reviewDecision -q .reviewDecision)
+          echo "approved=$([[ $decision == 'APPROVED' ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Check build result
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.meta.outputs.run_id }}
+          GH_REPO: ${{ github.repository }}
+          HV: ${{ matrix.hv }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Query every job in this workflow run, keep only the one we want
+          outcome=$(gh api \
+            /repos/$GH_REPO/actions/runs/$RUN_ID/jobs \
+            -X GET \
+            -q ".jobs[] | select(.name == \"eve (${ARCH}, ${HV}, ${PLATFORM})\") | .conclusion" )
+
+          echo "build_ok=$([[ "$outcome" == 'success' ]] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID"                                                     >>"$GITHUB_OUTPUT"
+
+      - name: Gate result
+        if: ${{ steps.reviews.outputs.approved == 'true' &&
+          steps.build.outputs.build_ok == 'true' }}
+        run: |
+          echo "🎉 Build passed and PR approved – gate satisfied"
+          echo '{ "pr":  "${{ steps.meta.outputs.pr }}",
+                  "run": "${{ steps.build.outputs.run_id }}",
+                  "sha": "${{ steps.meta.outputs.sha }}"
+            }' \
+            > gate-context.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.reviews.outputs.approved == 'true' &&
+          steps.build.outputs.build_ok == 'true' }}
+        with:
+          name: gate-context
+          path: gate-context.json
+
+      - name: Not ready yet
+        if: ${{ !(steps.reviews.outputs.approved == 'true' && steps.build.outputs.build_ok == 'true') }}
+        run: |
+          echo "Gate incomplete – build_ok=${{ steps.build.outputs.build_ok }}, approved=${{ steps.reviews.outputs.approved }}"
+          exit 1
+          

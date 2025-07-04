@@ -1,0 +1,147 @@
+name: Run Eden
+
+on:
+  workflow_run:
+    workflows: ["PR Ready Gate"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions:  read
+  statuses: write
+
+env:
+  STATUS_CONTEXT: Eden trusted tests
+  DETAILS_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  context:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      pr:     ${{ steps.extract.outputs.pr }}
+      run_id: ${{ steps.extract.outputs.run_id }}
+      sha:    ${{ steps.extract.outputs.sha }}
+    steps:
+      - name: Download gate-context
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-context
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print Debug Info
+        run: |
+          if [[ -z "${{ secrets.DOCKERHUB_PULL_USER }}" ]]; then
+            echo "Warning: DOCKERHUB_PULL_USER secret is not set. This may affect the ability to pull images from Docker Hub.";
+            exit 1
+          fi
+  
+
+      - name: Extract gate context
+        id: extract
+        run: |
+          ls -l gate-context.json
+          echo "Extracting PR, run_id, and sha from gate-context.json"
+          cat gate-context.json
+          if ! jq -e . gate-context.json > /dev/null; then
+            echo "gate-context.json is not a valid JSON file"
+            exit 1
+          fi
+          echo "pr=$(jq -r .pr  gate-context.json)"      >> $GITHUB_OUTPUT
+          echo "run_id=$(jq -r .run gate-context.json)"  >> $GITHUB_OUTPUT
+          echo "sha=$(jq -r .sha  gate-context.json)"    >> $GITHUB_OUTPUT
+
+      - name: Set pending status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner, repo,
+              sha:     '${{ steps.extract.outputs.sha }}',
+              state:   'pending',
+              context: process.env.STATUS_CONTEXT,
+              description: 'Eden tests running …',
+              target_url: process.env.DETAILS_URL
+            });
+
+  tests:
+    needs: context
+    uses: lf-edge/eden/.github/workflows/test.yml@1.0.4
+    secrets: inherit
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:     [amd64]
+        hv:       [kvm]
+        platform: ["generic"]
+    with:
+      eve_image:         "evebuild/pr:${{ needs.context.outputs.pr }}"
+      eve_log_level:     "debug"
+      eve_artifact_name: "eve-${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}"
+      artifact_run_id:   ${{ needs.context.outputs.run_id }}
+      eden_version:      "1.0.4"
+
+  finalize:
+    if: always()
+    needs: [context, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update commit status
+        uses: actions/github-script@v7
+        env:
+          SHA:        ${{ needs.context.outputs.sha }}
+          RESULT:     ${{ needs.tests.result }}    # success / failure / cancelled
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const map = { success:'success', failure:'failure', cancelled:'failure' };
+            const state = map[process.env.RESULT] || 'error';
+            await github.rest.repos.createCommitStatus({
+              owner, repo,
+              sha:     process.env.SHA,
+              state,
+              context: process.env.STATUS_CONTEXT,
+              description: `Eden tests ${state}`,
+              target_url: process.env.DETAILS_URL
+            });
+
+  subjob_statuses:
+    if: always()
+    needs: [context, tests]   # ensure Eden has finished
+    runs-on: ubuntu-latest
+    steps:
+      - name: Surface each Eden job as PR status
+        uses: actions/github-script@v7
+        env:
+          SHA: ${{ needs.context.outputs.sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = process.env.GITHUB_RUN_ID;
+
+            // 1. ask Actions API for all jobs in THIS Runner workflow run
+            const { data: jobs } = await github.rest.actions.listJobsForWorkflowRun({
+              owner, repo, run_id: runId, per_page: 100
+            });
+
+            for (const j of jobs.jobs) {
+              // Filter: we only care about Eden sub-jobs; skip “context” etc.
+              if (!/^Smoke|Networking|Storage|LPS|EVE|User|Virtualization/.test(j.name)) continue;
+
+              const state = j.conclusion === 'success'
+                            ? 'success'
+                            : j.conclusion === 'failure' ? 'failure'
+                            : 'error';   // cancelled / timed-out etc.
+
+              await github.rest.repos.createCommitStatus({
+                owner, repo,
+                sha:     process.env.SHA,
+                context: j.name,           // each row labelled with job name
+                state,
+                target_url: j.html_url,    // link straight to that sub-job log
+                description: `Eden sub-job ${state}`
+              });
+            }
+
