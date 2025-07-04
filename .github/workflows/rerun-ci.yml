@@ -66,43 +66,43 @@ jobs:
       - name: Find and act on workflow runs for this PR's latest commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BRANCH: ${{ steps.prinfo.outputs.branch }}
           SHA: ${{ steps.prinfo.outputs.sha }}
           REPO: ${{ github.repository }}
           MODE: ${{ steps.mode.outputs.mode }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          # Get all runs for the branch (could be for old commits, so we'll filter below)
-          RUNS=$(gh run list --repo "$REPO" --branch "$BRANCH" --json databaseId,status,conclusion,headSha,workflowName,displayTitle,event)
+          # Fetch all workflow runs for this SHA
+          echo "gh api /repos/$REPO/actions/runs | jq \".workflow_runs | map(select(.head_sha == \\\"$SHA\\\"))\""
+          RUNS=$(gh api /repos/$REPO/actions/runs | jq ".workflow_runs | map(select(.head_sha == \"$SHA\"))")
+          if [ -z "$RUNS" ]; then
+            echo "No workflow runs found for SHA $SHA in repository $REPO"
+            exit 0
+          fi
 
-          # Cancel all in-progress runs for this commit if requested
+          # Cancel in-progress or queued runs (yellow)
           if [[ "$MODE" == "yellow" ]]; then
-            echo "Cancelling all in-progress or queued runs for commit $SHA on branch $BRANCH..."
-            echo "$RUNS" | jq -r \
-              '.[] | select(.headSha == env.SHA and .status != "completed") | .databaseId' | while read -r run_id; do
-                [ -z "$run_id" ] && continue
-                echo "Canceling run $run_id"
-                gh run cancel "$run_id" --repo "$REPO"
-              done
+            echo "$RUNS" | jq -r '.[] | select(.status != "completed") | .id' | while read -r run_id; do
+              [ -z "$run_id" ] && continue
+              echo "Canceling run $run_id"
+              gh run cancel "$run_id" --repo "$REPO"
+            done
 
-            # Poll (with short backoff) until all in-progress/queued runs for this commit are done
-            # Max 15 iterations, summing to 120 seconds
+            # Wait for all to finish canceling
             for i in {1..15}; do
               sleep $((i))
-              RUNS_LEFT=$(gh run list --repo "$REPO" --branch "$BRANCH" --json databaseId,status,headSha | jq \
-                '[.[] | select(.headSha == env.SHA and .status != "completed")] | length')
+              RUNS_LEFT=$(gh api "/repos/$REPO/actions/runs?per_page=100" | jq "[.workflow_runs[] | select(.head_sha == env.SHA and .status != \"completed\")] | length")
               echo "Still running: $RUNS_LEFT"
               [ "$RUNS_LEFT" -eq 0 ] && break
             done
 
-            # Refresh RUNS after cancellation!
-            RUNS=$(gh run list --repo "$REPO" --branch "$BRANCH" --json databaseId,status,conclusion,headSha,workflowName,displayTitle,event)
+            # Refresh RUNS
+            RUNS=$(gh api "/repos/$REPO/actions/runs?per_page=100" | jq ".workflow_runs | map(select(.head_sha == env.SHA))")
           fi
 
-          # Now rerun all runs for this commit that are completed and not successful
-          echo "$RUNS" | jq -r \
-            '.[] | select(.headSha == env.SHA and .status == "completed" and (.conclusion != "success" and .conclusion != "skipped")) | .databaseId' \
+          # Rerun all failed/canceled/skipped runs (red)
+          echo "$RUNS" | jq -r '.[] | select(.status == "completed" and (.conclusion != "success" and .conclusion != "skipped")) | .id' \
             | while read -r run_id; do
                 [ -z "$run_id" ] && continue
                 echo "Re-running failed/canceled run $run_id"
