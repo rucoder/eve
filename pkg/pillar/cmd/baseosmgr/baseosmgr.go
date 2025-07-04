@@ -192,7 +192,7 @@ func handleBaseOsConfigDelete(ctxArg interface{}, key string,
 // base os config modify event
 func handleBaseOsConfigCreate(ctxArg interface{}, key string, configArg interface{}) {
 
-	log.Functionf("handleBaseOsConfigCreate(%s)", key)
+	log.Functionf("handleBaseOsConfigCreate(%s) for Rene", key)
 	ctx := ctxArg.(*baseOsMgrContext)
 	config := configArg.(types.BaseOsConfig)
 	status := types.BaseOsStatus{
