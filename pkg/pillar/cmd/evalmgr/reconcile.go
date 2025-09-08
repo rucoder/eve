@@ -11,7 +11,7 @@ import (
 )
 
 // reconcilePartitionStates checks for failed boots and cleans up partition states
-// This implements Phase 2 functionality - detecting slots that were marked "testing"
+// This implements Phase 2 functionality - detecting slots that were marked "inprogress"
 // but failed to boot (indicated by booting into a different partition)
 func (ctx *evalMgrContext) reconcilePartitionStates() error {
 	log.Functionf("Starting partition state reconciliation")
@@ -29,9 +29,9 @@ func (ctx *evalMgrContext) reconcilePartitionStates() error {
 	for _, slot := range types.AllSlots() {
 		partitionState := zboot.GetPartitionState(string(slot))
 
-		// If a slot is in "testing" state but we're not currently running from it,
+		// If a slot is in "inprogress" state but we're not currently running from it,
 		// then it failed to boot and GRUB fell back to the previous active partition
-		if partitionState == "testing" && slot != ctx.currentSlot {
+		if partitionState == "inprogress" && slot != ctx.currentSlot {
 			log.Noticef("Detected failed boot for slot %s (state=%s, current=%s)",
 				slot, partitionState, ctx.currentSlot)
 
@@ -77,14 +77,12 @@ func (ctx *evalMgrContext) validateCurrentSlotState() error {
 	log.Functionf("Current slot %s has partition state: %s", ctx.currentSlot, currentPartitionState)
 
 	// The currently running slot should typically be "active" or "inprogress"
-	// If it's "testing", that means we successfully booted into a test slot
+	// If it's "inprogress", that means we successfully booted into a test slot
 	switch currentPartitionState {
 	case "active":
 		log.Functionf("Current slot %s is active (normal operation)", ctx.currentSlot)
 	case "inprogress":
-		log.Functionf("Current slot %s is inprogress (normal during evaluation)", ctx.currentSlot)
-	case "testing":
-		log.Functionf("Current slot %s is testing (successful test boot)", ctx.currentSlot)
+		log.Functionf("Current slot %s is inprogress (successful test boot)", ctx.currentSlot)
 	case "updating":
 		log.Functionf("Current slot %s is updating (image installation)", ctx.currentSlot)
 	default:

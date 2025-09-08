@@ -38,14 +38,20 @@ type evalMgrContext struct {
 	globalConfig    *types.ConfigItemValueMap
 	GCInitialized   bool
 
+	// CLI flags can be added here if needed
+
 	// Current state
 	isEvaluationPlatform bool
 	currentSlot          types.SlotName
 	evalStatus           types.EvalStatus
+
+	// Scheduler state
+	schedulerState     SchedulerState
+	stabilityTimer     *time.Timer
+	stabilityStartTime time.Time
 }
 
 var debug = false
-var debugOverride bool // From command line arg
 
 // Run is the main entry point for evalmgr, matching types.AgentRunner signature
 func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, arguments []string, baseDir string) int {
@@ -67,10 +73,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		agentbase.WithWatchdog(ps, warningTime, errorTime),
 		agentbase.WithArguments(arguments))
 
-	// Parse arguments
-	if err := ctx.parseArgs(arguments); err != nil {
-		log.Fatal(err)
-	}
+	// Access CLI flags - debug flag provided by agentbase
+	debug = ctx.CLIParams().DebugOverride
 
 	// Initialize publications
 	if err := ctx.initPubSub(ps); err != nil {
@@ -90,16 +94,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	return 0
 }
 
-func (ctx *evalMgrContext) parseArgs(arguments []string) error {
-	flagSet := flag.NewFlagSet(agentName, flag.ContinueOnError)
-	flagSet.BoolVar(&debugOverride, "d", false, "Debug flag")
-	if err := flagSet.Parse(arguments[1:]); err != nil {
-		return fmt.Errorf("argument parsing failed: %w", err)
-	}
-
-	debug = debugOverride
-	log.Functionf("Debug flag set to %t", debug)
-	return nil
+// AddAgentSpecificCLIFlags adds CLI options
+func (ctx *evalMgrContext) AddAgentSpecificCLIFlags(flagSet *flag.FlagSet) {
+	// Debug flag is provided by agentbase automatically
+	// Add custom flags here if needed
 }
 
 func (ctx *evalMgrContext) initPubSub(ps *pubsub.PubSub) error {
@@ -159,6 +157,11 @@ func (ctx *evalMgrContext) run(ps *pubsub.PubSub) error {
 		return fmt.Errorf("failed to initialize evaluation: %w", err)
 	}
 
+	// Initialize scheduler (Phase 3)
+	if err := ctx.initializeScheduler(); err != nil {
+		return fmt.Errorf("failed to initialize scheduler: %w", err)
+	}
+
 	// Publish initial status
 	ctx.publishEvalStatus()
 
@@ -172,6 +175,9 @@ func (ctx *evalMgrContext) run(ps *pubsub.PubSub) error {
 
 		case change := <-ctx.subGlobalConfig.MsgChan():
 			ctx.subGlobalConfig.ProcessChange(change)
+
+		case <-ctx.getStabilityTimerChannel():
+			ctx.handleStabilityTimeout()
 		}
 	}
 }
@@ -236,4 +242,12 @@ func (ctx *evalMgrContext) publishPreliminaryStatus() {
 		log.Noticef("Published preliminary EvalStatus: allowOnboard=%t, platform=%t",
 			prelim.AllowOnboard, prelim.IsEvaluationPlatform)
 	}
+}
+
+// getStabilityTimerChannel returns the stability timer channel or nil if no timer
+func (ctx *evalMgrContext) getStabilityTimerChannel() <-chan time.Time {
+	if ctx.stabilityTimer == nil {
+		return nil
+	}
+	return ctx.stabilityTimer.C
 }

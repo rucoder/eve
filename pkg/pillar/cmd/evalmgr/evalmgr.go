@@ -85,9 +85,18 @@ func (ctx *evalMgrContext) shouldAllowOnboard() bool {
 		return true
 	}
 
-	// During evaluation phase, block onboarding by default
-	// This will be changed in later phases based on evaluation state
-	return false
+	// Check scheduler state - only allow onboarding when evaluation is finalized
+	switch ctx.schedulerState {
+	case SchedulerFinalized:
+		// Evaluation complete - allow onboarding
+		return true
+	case SchedulerIdle, SchedulerStabilityWait, SchedulerScheduled:
+		// Evaluation still in progress - block onboarding
+		return false
+	default:
+		// Unknown state - be conservative
+		return false
+	}
 }
 
 // hasOnboardOverride checks if manual onboard override is set
@@ -113,6 +122,23 @@ func (ctx *evalMgrContext) generateStatusNote() string {
 	// Add current partition state info
 	currentState := ctx.getCurrentSlotState()
 	notes = append(notes, fmt.Sprintf("state=%s", currentState))
+
+	// Add scheduler state information
+	switch ctx.schedulerState {
+	case SchedulerIdle:
+		notes = append(notes, "scheduler idle")
+	case SchedulerStabilityWait:
+		if !ctx.stabilityStartTime.IsZero() {
+			elapsed := time.Since(ctx.stabilityStartTime)
+			notes = append(notes, fmt.Sprintf("stability check (%v)", elapsed.Truncate(time.Second)))
+		} else {
+			notes = append(notes, "stability check")
+		}
+	case SchedulerScheduled:
+		notes = append(notes, "next slot scheduled")
+	case SchedulerFinalized:
+		notes = append(notes, "evaluation complete")
+	}
 
 	if ctx.shouldAllowOnboard() {
 		notes = append(notes, "onboard allowed")
