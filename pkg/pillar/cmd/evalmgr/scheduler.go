@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
@@ -42,10 +43,7 @@ func (ctx *evalMgrContext) initializeScheduler() error {
 	log.Functionf("initializeScheduler starting")
 
 	// Analyze previous boot to understand what happened
-	if err := ctx.analyzePreviousBoot(); err != nil {
-		log.Errorf("Failed to analyze previous boot: %v", err)
-		// Continue with initialization even if analysis fails
-	}
+	ctx.analyzePreviousBoot()
 
 	// Load persistent state to understand where we are in evaluation
 	state, err := ctx.loadEvalState()
@@ -53,6 +51,9 @@ func (ctx *evalMgrContext) initializeScheduler() error {
 		log.Errorf("Failed to load eval state: %v", err)
 		state = ctx.createDefaultEvalState()
 	}
+
+	// Check if current slot needs promotion from active/updating to testing
+	ctx.promoteCurrentSlotIfNeeded(state)
 
 	// Determine current scheduling state
 	ctx.updateSchedulingState(state)
@@ -209,6 +210,15 @@ func (ctx *evalMgrContext) classifyRebootReason(reason, stack string) BootAnalys
 
 // updateSchedulingState determines what state the scheduler should be in
 func (ctx *evalMgrContext) updateSchedulingState(state *types.EvalPersist) {
+	// Check if current slot needs stability validation FIRST
+	currentState := ctx.getSlotState(state, ctx.currentSlot)
+	if !currentState.Success && currentState.Tried {
+		// Current slot was tried but not yet marked successful
+		ctx.schedulerState = SchedulerStabilityWait
+		log.Noticef("Current slot %s needs stability validation", ctx.currentSlot)
+		return
+	}
+
 	// Check if all slots have been tried
 	allTried := true
 	for _, slot := range types.AllSlots() {
@@ -222,15 +232,6 @@ func (ctx *evalMgrContext) updateSchedulingState(state *types.EvalPersist) {
 	if allTried {
 		ctx.schedulerState = SchedulerFinalized
 		log.Noticef("All slots have been tried - evaluation ready for finalization")
-		return
-	}
-
-	// Check if current slot needs stability validation
-	currentState := ctx.getSlotState(state, ctx.currentSlot)
-	if !currentState.Success && currentState.Tried {
-		// Current slot was tried but not yet marked successful
-		ctx.schedulerState = SchedulerStabilityWait
-		log.Noticef("Current slot %s needs stability validation", ctx.currentSlot)
 		return
 	}
 
@@ -261,6 +262,11 @@ func (ctx *evalMgrContext) startStabilityTimer() {
 		ctx.stabilityTimer.Stop()
 	}
 
+	// Set phase to testing so timing info appears in diag
+	ctx.evalStatus.Phase = types.EvalPhaseTesting
+	ctx.evalStatus.TestStartTime = time.Now()
+	ctx.evalStatus.TestDuration = stabilityPeriod
+
 	ctx.stabilityTimer = time.NewTimer(stabilityPeriod)
 	ctx.stabilityStartTime = time.Now()
 }
@@ -280,6 +286,16 @@ func (ctx *evalMgrContext) handleStabilityTimeout() {
 	ctx.updateSlotState(state, ctx.currentSlot, true, true,
 		fmt.Sprintf("Stable for %v", DefaultStabilityPeriod))
 
+	// Promote current slot from testing to active if needed
+	// Check if current slot needs promotion from inprogress to active after stability
+	currentPartitionState := zboot.GetPartitionState(string(ctx.currentSlot))
+	if currentPartitionState == "inprogress" {
+		log.Noticef("Promoting slot %s from inprogress to active after stability validation", ctx.currentSlot)
+		// Use standard zboot function to set current partition to active
+		zboot.SetPartitionState(log, string(ctx.currentSlot), "active")
+		log.Noticef("Successfully promoted slot %s to active", ctx.currentSlot)
+	}
+
 	// Save state
 	if err := ctx.saveEvalState(state); err != nil {
 		log.Errorf("Failed to save state after stability validation: %v", err)
@@ -297,7 +313,7 @@ func (ctx *evalMgrContext) handleStabilityTimeout() {
 // scheduleNextSlotIfNeeded finds and schedules the next untried slot
 func (ctx *evalMgrContext) scheduleNextSlotIfNeeded(state *types.EvalPersist) {
 	nextSlot := ctx.findNextUntriedSlot(state)
-	if nextSlot == "" {
+	if nextSlot == types.SlotFinal {
 		log.Noticef("No more untried slots - evaluation complete")
 		ctx.schedulerState = SchedulerFinalized
 		ctx.finalizeEvaluation(state)
@@ -315,17 +331,15 @@ func (ctx *evalMgrContext) scheduleNextSlotIfNeeded(state *types.EvalPersist) {
 		return
 	}
 
-	// Set partition state to inprogress for testing
-	zboot.SetPartitionState(log, string(nextSlot), "inprogress")
-
-	// Write reboot reason
-	reasonStr := RebootReasonEvalNextSlot + "-" + string(nextSlot)
-	agentlog.RebootReason(reasonStr, types.BootReasonRebootCmd, "evalmgr", os.Getpid(), true)
+	// Set next partition to updating state for reboot (grub will auto-transition to inprogress)
+	log.Noticef("Setting slot %s to updating state for reboot", nextSlot)
+	zboot.SetPartitionState(log, string(nextSlot), "updating")
 
 	ctx.schedulerState = SchedulerScheduled
 
 	// Request reboot via nodeagent
-	if err := ctx.requestReboot("Testing slot " + string(nextSlot)); err != nil {
+	reasonStr := RebootReasonEvalNextSlot + "-" + string(nextSlot)
+	if err := ctx.requestReboot(reasonStr); err != nil {
 		log.Errorf("Failed to request reboot: %v", err)
 		return
 	}
@@ -334,16 +348,55 @@ func (ctx *evalMgrContext) scheduleNextSlotIfNeeded(state *types.EvalPersist) {
 
 // findNextUntriedSlot returns the next slot that hasn't been tried yet
 func (ctx *evalMgrContext) findNextUntriedSlot(state *types.EvalPersist) types.SlotName {
-	for _, slot := range types.AllSlots() {
-		if slot == ctx.currentSlot {
-			continue // Skip current slot
+	if !ctx.isEvaluationPlatform {
+		// For non-evaluation platforms, use simple logic
+		for _, slot := range types.AllSlots() {
+			if slot == ctx.currentSlot {
+				continue // Skip current slot
+			}
+			slotState := ctx.getSlotState(state, slot)
+			if !slotState.Tried {
+				return slot
+			}
 		}
-		slotState := ctx.getSlotState(state, slot)
-		if !slotState.Tried {
-			return slot
-		}
+		return types.SlotFinal
 	}
-	return ""
+
+	// For evaluation platforms, use simple loop-based partition selection
+	triedSlots := make(map[string]bool)
+	for _, slot := range types.AllSlots() {
+		slotState := ctx.getSlotState(state, slot)
+		triedSlots[string(slot)] = slotState.Tried
+	}
+
+	// Use simple loop partition selection - returns FINAL if no partitions left
+	nextPartition := zboot.GetNextEvaluationPartition(string(ctx.currentSlot), triedSlots)
+	if nextPartition == "FINAL" {
+		return types.SlotFinal
+	}
+	return types.SlotName(nextPartition)
+}
+
+// promoteCurrentSlotIfNeeded promotes current slot from active/updating to testing if needed
+func (ctx *evalMgrContext) promoteCurrentSlotIfNeeded(state *types.EvalPersist) {
+	currentPartitionState := zboot.GetPartitionState(string(ctx.currentSlot))
+
+	switch currentPartitionState {
+	case "active":
+		// First time after installation or previous successful evaluation - start new evaluation
+		log.Noticef("Current slot %s is active - starting evaluation", ctx.currentSlot)
+
+	case "updating":
+		// We rebooted into an updating slot - grub will auto-transition to inprogress
+		log.Noticef("Current slot %s is updating - will auto-transition to inprogress", ctx.currentSlot)
+
+	case "inprogress":
+		// We rebooted into an inprogress slot - this means we're testing it
+		log.Noticef("Current slot %s is inprogress - continuing evaluation", ctx.currentSlot)
+
+	default:
+		log.Warnf("Current slot %s has unexpected state %s", ctx.currentSlot, currentPartitionState)
+	}
 }
 
 // finalizeEvaluation selects the best slot and finalizes evaluation
@@ -373,12 +426,9 @@ func (ctx *evalMgrContext) finalizeEvaluation(state *types.EvalPersist) {
 			}
 		}
 
-		// Write reboot reason and request reboot
-		reasonStr := RebootReasonEvalFinalize + "-" + string(bestSlot)
-		agentlog.RebootReason(reasonStr, types.BootReasonRebootCmd, "evalmgr", os.Getpid(), true)
-
 		// Request reboot to best slot
-		if err := ctx.requestReboot("Finalizing to best slot " + string(bestSlot)); err != nil {
+		reasonStr := RebootReasonEvalFinalize + "-" + string(bestSlot)
+		if err := ctx.requestReboot(reasonStr); err != nil {
 			log.Errorf("Failed to request reboot to best slot: %v", err)
 			return
 		}
@@ -459,14 +509,39 @@ func (ctx *evalMgrContext) selectBestSlot(state *types.EvalPersist, inventories 
 	return bestSlot
 }
 
-// requestReboot requests a system reboot with the given reason
+// requestReboot requests a system reboot with the given reason after a countdown
 func (ctx *evalMgrContext) requestReboot(reason string) error {
-	// TODO: Implement proper reboot request via ZedAgentStatus publication
-	// For now, use direct system reboot as fallback
-	log.Warnf("TODO: Implement ZedAgentStatus publication for reboot request")
-	log.Warnf("Reason: %s", reason)
+	log.Noticef("Scheduling reboot in 15 seconds: %s", reason)
 
-	// Placeholder implementation - in production this should publish ZedAgentStatus
-	// with RebootCmd=true to trigger nodeagent reboot handling
-	return fmt.Errorf("reboot request not yet implemented - manual reboot required")
+	// Start 15-second countdown
+	ctx.rebootCountdown = 15
+	ctx.evalStatus.Note = "Rebooting: " + reason
+
+	// Store the reboot reason for later use in executeReboot
+	ctx.scheduledRebootReason = reason
+
+	// Update status immediately to show countdown
+	ctx.updateTimingFields()
+	ctx.publishEvalStatus()
+
+	return nil
+}
+
+// executeReboot performs the actual reboot when countdown expires
+func (ctx *evalMgrContext) executeReboot() error {
+	log.Noticef("Executing direct reboot (nodeagent may not be active before onboarding)")
+
+	// Save reboot reason before rebooting (nodeagent is not available pre-onboarding)
+	agentlog.RebootReason(ctx.scheduledRebootReason, types.BootReasonRebootCmd, "evalmgr", os.Getpid(), true)
+
+	// Sync filesystems before reboot
+	log.Noticef("Syncing filesystems before reboot")
+	syscall.Sync()
+
+	// Direct reboot via zboot (same as nodeagent would do)
+	log.Noticef("Calling zboot.Reset() for reboot, reason: %s", ctx.scheduledRebootReason)
+	zboot.Reset(log)
+
+	// Should not reach here
+	return fmt.Errorf("zboot.Reset() returned unexpectedly")
 }

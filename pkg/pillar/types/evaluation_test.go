@@ -181,7 +181,7 @@ func TestEvalStatus_OnboardingBlockReason(t *testing.T) {
 
 func TestEvalStatus_Key(t *testing.T) {
 	status := EvalStatus{}
-	expected := "global"
+	expected := "evalmgr"
 	result := status.Key()
 	if result != expected {
 		t.Errorf("Key() = %q, expected %q", result, expected)
@@ -190,7 +190,7 @@ func TestEvalStatus_Key(t *testing.T) {
 
 func TestEvalStatus_LogKey(t *testing.T) {
 	status := EvalStatus{}
-	expected := "eval_status-global"
+	expected := "eval_status-evalmgr"
 	result := status.LogKey()
 	if result != expected {
 		t.Errorf("LogKey() = %q, expected %q", result, expected)

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
-	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -33,10 +32,7 @@ var log *base.LogObject
 
 type evalMgrContext struct {
 	agentbase.AgentBase
-	pubEvalStatus   pubsub.Publication
-	subGlobalConfig pubsub.Subscription
-	globalConfig    *types.ConfigItemValueMap
-	GCInitialized   bool
+	pubEvalStatus pubsub.Publication
 
 	// CLI flags can be added here if needed
 
@@ -45,10 +41,16 @@ type evalMgrContext struct {
 	currentSlot          types.SlotName
 	evalStatus           types.EvalStatus
 
+	// Timing and periodic updates
+	statusUpdateTicker *time.Ticker
+	rebootTicker       *time.Ticker
+	rebootCountdown    int
+
 	// Scheduler state
-	schedulerState     SchedulerState
-	stabilityTimer     *time.Timer
-	stabilityStartTime time.Time
+	schedulerState        SchedulerState
+	stabilityTimer        *time.Timer
+	scheduledRebootReason string
+	stabilityStartTime    time.Time
 }
 
 var debug = false
@@ -64,9 +66,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	logf("Starting %s", agentName)
 
 	// Initialize context
-	ctx := evalMgrContext{
-		globalConfig: types.DefaultConfigItemValueMap(),
-	}
+	ctx := evalMgrContext{}
 	agentbase.Init(&ctx, logger, log, agentName,
 		agentbase.WithPidFile(),
 		agentbase.WithBaseDir(baseDir),
@@ -114,23 +114,10 @@ func (ctx *evalMgrContext) initPubSub(ps *pubsub.PubSub) error {
 		return fmt.Errorf("failed to create EvalStatus publication: %w", err)
 	}
 
-	// Subscribe to GlobalConfig
-	ctx.subGlobalConfig, err = ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:     agentName,
-		MyAgentName:   agentName,
-		TopicImpl:     types.ConfigItemValueMap{},
-		Activate:      false,
-		Ctx:           ctx,
-		CreateHandler: ctx.handleGlobalConfigCreate,
-		ModifyHandler: ctx.handleGlobalConfigModify,
-		DeleteHandler: ctx.handleGlobalConfigDelete,
-		WarningTime:   warningTime,
-		ErrorTime:     errorTime,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create GlobalConfig subscription: %w", err)
-	}
-	ctx.subGlobalConfig.Activate()
+	// Note: We don't subscribe to GlobalConfig because:
+	// 1. It only comes after onboarding to controller
+	// 2. evalmgr needs to run BEFORE onboarding to gate it
+	// 3. This creates a circular dependency
 
 	return nil
 }
@@ -140,17 +127,8 @@ func (ctx *evalMgrContext) run(ps *pubsub.PubSub) error {
 	stillRunning := time.NewTicker(stillRunningTime)
 	defer stillRunning.Stop()
 
-	// Wait for GlobalConfig initialization
-	for !ctx.GCInitialized {
-		log.Functionf("waiting for GCInitialized")
-		select {
-		case change := <-ctx.subGlobalConfig.MsgChan():
-			ctx.subGlobalConfig.ProcessChange(change)
-		case <-stillRunning.C:
-		}
-		ps.StillRunning(agentName, warningTime, errorTime)
-	}
-	log.Functionf("processed GlobalConfig")
+	// No need to wait for GlobalConfig - we operate independently
+	log.Noticef("Starting evaluation initialization (no GlobalConfig dependency)")
 
 	// Initialize and publish initial status
 	if err := ctx.initializeEvaluation(); err != nil {
@@ -165,6 +143,14 @@ func (ctx *evalMgrContext) run(ps *pubsub.PubSub) error {
 	// Publish initial status
 	ctx.publishEvalStatus()
 
+	// Setup periodic status updates (every 30 seconds)
+	ctx.statusUpdateTicker = time.NewTicker(30 * time.Second)
+	defer ctx.statusUpdateTicker.Stop()
+
+	// Setup reboot countdown ticker (every 1 second)
+	ctx.rebootTicker = time.NewTicker(1 * time.Second)
+	defer ctx.rebootTicker.Stop()
+
 	// Start main event loop
 	log.Noticef("Starting main event loop")
 
@@ -173,54 +159,68 @@ func (ctx *evalMgrContext) run(ps *pubsub.PubSub) error {
 		case <-stillRunning.C:
 			ps.StillRunning(agentName, warningTime, errorTime)
 
-		case change := <-ctx.subGlobalConfig.MsgChan():
-			ctx.subGlobalConfig.ProcessChange(change)
-
 		case <-ctx.getStabilityTimerChannel():
 			ctx.handleStabilityTimeout()
+
+		case <-ctx.statusUpdateTicker.C:
+			ctx.handlePeriodicStatusUpdate()
+
+		case <-ctx.rebootTicker.C:
+			ctx.handleRebootCountdown()
 		}
 	}
 }
 
-func (ctx *evalMgrContext) processGlobalConfigChange(change pubsub.Change) {
-	log.Functionf("processGlobalConfigChange")
-	if change.Operation == pubsub.Sync {
-		log.Functionf("GlobalConfig sync")
+func (ctx *evalMgrContext) handlePeriodicStatusUpdate() {
+	log.Functionf("handlePeriodicStatusUpdate")
+
+	// Update and publish current status with timing info
+	ctx.updateTimingFields()
+	ctx.publishEvalStatus()
+}
+
+func (ctx *evalMgrContext) handleRebootCountdown() {
+	// Update reboot countdown if we're in reboot phase
+	if ctx.rebootCountdown > 0 {
+		ctx.rebootCountdown--
+		if ctx.rebootCountdown <= 0 {
+			log.Noticef("Reboot countdown expired, executing reboot")
+			if err := ctx.executeReboot(); err != nil {
+				log.Errorf("Failed to execute reboot: %v", err)
+				// Reset countdown for retry in case of failure
+				ctx.rebootCountdown = 10
+			}
+		} else {
+			// Update status immediately during countdown to show progress
+			ctx.updateTimingFields()
+			ctx.publishEvalStatus()
+		}
 	}
 }
 
-func (ctx *evalMgrContext) handleGlobalConfigCreate(ctxArg interface{}, key string, statusArg interface{}) {
-	ctx.handleGlobalConfigImpl(ctxArg, key, statusArg)
-}
-
-func (ctx *evalMgrContext) handleGlobalConfigModify(ctxArg interface{}, key string, statusArg interface{}, oldStatusArg interface{}) {
-	ctx.handleGlobalConfigImpl(ctxArg, key, statusArg)
-}
-
-func (ctx *evalMgrContext) handleGlobalConfigDelete(ctxArg interface{}, key string, statusArg interface{}) {
-	log.Functionf("handleGlobalConfigDelete for %s", key)
-}
-
-func (ctx *evalMgrContext) handleGlobalConfigImpl(ctxArg interface{}, key string, statusArg interface{}) {
-	ctxPtr := ctxArg.(*evalMgrContext)
-	if key != "global" {
-		log.Functionf("handleGlobalConfigImpl: ignoring %s", key)
-		return
+func (ctx *evalMgrContext) updateTimingFields() {
+	// Update timing fields based on current state
+	if ctx.evalStatus.Phase == types.EvalPhaseTesting && !ctx.evalStatus.TestStartTime.IsZero() {
+		// Keep existing timing - already set when evaluation started
+	} else if ctx.evalStatus.Phase == types.EvalPhaseTesting && ctx.evalStatus.TestStartTime.IsZero() {
+		// Start timing if we just entered evaluation phase
+		ctx.evalStatus.TestStartTime = time.Now()
+		ctx.evalStatus.TestDuration = DefaultStabilityPeriod
 	}
-	gcp := agentlog.HandleGlobalConfig(log, ctxPtr.subGlobalConfig, agentName,
-		ctxPtr.CLIParams().DebugOverride, logger)
-	if gcp != nil {
-		ctxPtr.globalConfig = gcp
-		ctxPtr.GCInitialized = true
-	}
-	ctxPtr.updateEvalStatus()
-	log.Functionf("handleGlobalConfigImpl done for %s", key)
+
+	// Update reboot countdown in status
+	ctx.evalStatus.RebootCountdown = ctx.rebootCountdown
+	ctx.evalStatus.LastUpdated = time.Now()
 }
+
+// Note: GlobalConfig handlers removed - evalmgr operates independently
+// without requiring controller connectivity or onboarding completion
 
 // publishPreliminaryStatus publishes initial status immediately to prevent client race
 func (ctx *evalMgrContext) publishPreliminaryStatus() {
 	// Quick platform detection without full initialization
 	isEvalPlatform := utils.IsEvaluationPlatform()
+	log.Noticef("publishPreliminaryStatus: platform detection result=%t", isEvalPlatform)
 	currentSlot := types.SlotName(zboot.GetCurrentPartition())
 	if currentSlot == "" {
 		currentSlot = types.SlotIMGA // Default fallback
@@ -239,8 +239,8 @@ func (ctx *evalMgrContext) publishPreliminaryStatus() {
 	if err := ctx.pubEvalStatus.Publish(prelim.Key(), prelim); err != nil {
 		log.Errorf("Failed to publish preliminary EvalStatus: %v", err)
 	} else {
-		log.Noticef("Published preliminary EvalStatus: allowOnboard=%t, platform=%t",
-			prelim.AllowOnboard, prelim.IsEvaluationPlatform)
+		log.Noticef("Published preliminary EvalStatus: allowOnboard=%t, platform=%t, slot=%s, phase=%s",
+			prelim.AllowOnboard, prelim.IsEvaluationPlatform, prelim.CurrentSlot, prelim.Phase)
 	}
 }
 

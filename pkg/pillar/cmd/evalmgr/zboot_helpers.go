@@ -51,35 +51,32 @@ func (ctx *evalMgrContext) setPartitionState(slot types.SlotName, state string) 
 		// Use existing zboot functions for IMGA/IMGB
 		switch state {
 		case "unused":
-			if slot == types.SlotIMGA {
-				if string(slot) == zboot.GetCurrentPartition() {
-					return fmt.Errorf("cannot mark current partition %s as unused", slot)
-				}
-				if string(slot) == zboot.GetOtherPartition() {
-					zboot.SetOtherPartitionStateUnused(log)
-				}
-			} else if slot == types.SlotIMGB {
-				if string(slot) == zboot.GetCurrentPartition() {
-					return fmt.Errorf("cannot mark current partition %s as unused", slot)
-				}
-				if string(slot) == zboot.GetOtherPartition() {
-					zboot.SetOtherPartitionStateUnused(log)
-				}
+			if string(slot) == zboot.GetCurrentPartition() {
+				return fmt.Errorf("cannot mark current partition %s as unused", slot)
 			}
+			// Use standard zboot function - validatePartitionName handles IMGC on evaluation platforms
+			zboot.SetPartitionState(log, string(slot), "unused")
 		case "updating":
-			if string(slot) == zboot.GetOtherPartition() {
-				zboot.SetOtherPartitionStateUpdating(log)
-			}
+			// Use standard zboot function
+			zboot.SetPartitionState(log, string(slot), "updating")
 		default:
 			return fmt.Errorf("unsupported state %s for slot %s", state, slot)
 		}
 		// Note: "testing" and "active" states are typically managed by zboot internally
 
 	case types.SlotIMGC:
-		// For IMGC, we would need extended zboot API
-		// This is a platform-specific limitation
-		log.Warnf("Setting state for slot %s not fully supported by current zboot API", slot)
-		return fmt.Errorf("slot %s state management not supported", slot)
+		// For IMGC, use standard zboot functions - they work on evaluation platforms
+		switch state {
+		case "unused":
+			if string(slot) == zboot.GetCurrentPartition() {
+				return fmt.Errorf("cannot mark current partition %s as unused", slot)
+			}
+			zboot.SetPartitionState(log, string(slot), "unused")
+		case "updating":
+			zboot.SetPartitionState(log, string(slot), "updating")
+		default:
+			return fmt.Errorf("unsupported state %s for slot %s", state, slot)
+		}
 
 	default:
 		return fmt.Errorf("unknown slot %s", slot)
@@ -185,11 +182,9 @@ func (ctx *evalMgrContext) logZbootDiagnostics() {
 	current := zboot.GetCurrentPartition()
 	log.Functionf("zboot current partition: %s", current)
 
-	// Other partition (for 2-partition systems)
-	if current == "IMGA" || current == "IMGB" {
-		other := zboot.GetOtherPartition()
-		log.Functionf("zboot other partition: %s", other)
-	}
+	// Other partitions (for evaluation platform)
+	others := zboot.GetEvaluationOtherPartitions()
+	log.Functionf("zboot other partitions: %v", others)
 
 	// Partition states
 	states, err := ctx.getPartitionStates()

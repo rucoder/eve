@@ -4,6 +4,8 @@
 package types
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -31,6 +33,8 @@ const (
 	SlotIMGB SlotName = "IMGB"
 	// SlotIMGC - Image C partition
 	SlotIMGC SlotName = "IMGC"
+	// SlotFinal - Special value indicating no more slots to test (evaluation complete)
+	SlotFinal SlotName = "FINAL"
 )
 
 // AllSlots returns all valid slot names
@@ -76,11 +80,17 @@ type EvalStatus struct {
 	Note string
 	// LastUpdated timestamp when this status was last updated
 	LastUpdated time.Time
+	// TestStartTime when current test phase started
+	TestStartTime time.Time
+	// TestDuration total duration for current test phase
+	TestDuration time.Duration
+	// RebootCountdown seconds until reboot (0 if no reboot pending)
+	RebootCountdown int
 }
 
 // Key returns the key for pubsub (single instance)
 func (status EvalStatus) Key() string {
-	return "global"
+	return "evalmgr"
 }
 
 // LogCreate logs the creation of EvalStatus
@@ -95,6 +105,8 @@ func (status EvalStatus) LogCreate(logBase *base.LogObject) {
 		AddField("phase", string(status.Phase)).
 		AddField("allow-onboard", status.AllowOnboard).
 		AddField("note", status.Note).
+		AddField("test-duration", status.TestDuration).
+		AddField("reboot-countdown", status.RebootCountdown).
 		Noticef("EvalStatus create")
 }
 
@@ -137,7 +149,7 @@ func (status EvalStatus) LogDelete(logBase *base.LogObject) {
 
 // LogKey returns the log key for EvalStatus
 func (status EvalStatus) LogKey() string {
-	return string(base.EvalStatusLogType) + "-global"
+	return string(base.EvalStatusLogType) + "-evalmgr"
 }
 
 // IsOnboardingAllowed returns whether onboarding should be allowed based on the current evaluation status.
@@ -207,6 +219,82 @@ func (status EvalStatus) OnboardingBlockReason() string {
 	default:
 		return "evaluation platform in unknown state"
 	}
+}
+
+// RemainingTime returns the remaining time for current test phase
+func (status EvalStatus) RemainingTime() time.Duration {
+	if status.TestStartTime.IsZero() || status.TestDuration == 0 {
+		return 0
+	}
+	elapsed := time.Since(status.TestStartTime)
+	if elapsed >= status.TestDuration {
+		return 0
+	}
+	return status.TestDuration - elapsed
+}
+
+// ElapsedTime returns elapsed time since test started
+func (status EvalStatus) ElapsedTime() time.Duration {
+	if status.TestStartTime.IsZero() {
+		return 0
+	}
+	return time.Since(status.TestStartTime)
+}
+
+// ProgressPercent returns test progress as percentage (0-100)
+func (status EvalStatus) ProgressPercent() int {
+	if status.TestDuration == 0 {
+		return 0
+	}
+	elapsed := status.ElapsedTime()
+	if elapsed >= status.TestDuration {
+		return 100
+	}
+	return int((elapsed * 100) / status.TestDuration)
+}
+
+// TimeStatusString returns human-readable time status
+func (status EvalStatus) TimeStatusString() string {
+	if status.Phase != EvalPhaseTesting {
+		return ""
+	}
+
+	remaining := status.RemainingTime()
+	elapsed := status.ElapsedTime()
+	progress := status.ProgressPercent()
+
+	if remaining == 0 {
+		return fmt.Sprintf("Test complete (%v elapsed)", elapsed.Round(time.Second))
+	}
+
+	return fmt.Sprintf("Progress %d%% (%v/%v remaining: %v)",
+		progress,
+		elapsed.Round(time.Second),
+		status.TestDuration.Round(time.Second),
+		remaining.Round(time.Second))
+}
+
+// RebootStatusString returns reboot countdown status
+func (status EvalStatus) RebootStatusString() string {
+	if status.RebootCountdown <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("Requesting reboot in %d sec", status.RebootCountdown)
+}
+
+// DetailedNote returns comprehensive status with timing info
+func (status EvalStatus) DetailedNote() string {
+	parts := []string{status.Note}
+
+	if timeStatus := status.TimeStatusString(); timeStatus != "" {
+		parts = append(parts, timeStatus)
+	}
+
+	if rebootStatus := status.RebootStatusString(); rebootStatus != "" {
+		parts = append(parts, rebootStatus)
+	}
+
+	return strings.Join(parts, "; ")
 }
 
 // FaultAction represents different fault injection actions

@@ -98,29 +98,13 @@ func (ctx *evalMgrContext) markSlotUnused(slot types.SlotName) error {
 
 	// Use zboot to set the partition state to unused
 	// This calls the equivalent of: zboot set_partstate SLOT unused
-	if slot == types.SlotIMGA || slot == types.SlotIMGB {
-		// These are the standard slots that zboot supports
-		if slot == types.SlotIMGA {
-			if ctx.currentSlot == types.SlotIMGA {
-				return fmt.Errorf("cannot mark current slot %s as unused", slot)
-			}
-			// For now, we use the existing zboot API which works with IMGA/IMGB
-			if string(slot) == zboot.GetOtherPartition() {
-				zboot.SetOtherPartitionStateUnused(log)
-			}
-		} else if slot == types.SlotIMGB {
-			if ctx.currentSlot == types.SlotIMGB {
-				return fmt.Errorf("cannot mark current slot %s as unused", slot)
-			}
-			if string(slot) == zboot.GetOtherPartition() {
-				zboot.SetOtherPartitionStateUnused(log)
-			}
-		}
-	} else {
-		// For IMGC or future slots, we would need to extend zboot API
-		// For now, log this limitation
-		log.Warnf("Cannot mark slot %s as unused - zboot API limitation (only supports IMGA/IMGB)", slot)
+	// Check that we're not trying to mark current slot as unused
+	if ctx.currentSlot == slot {
+		return fmt.Errorf("cannot mark current slot %s as unused", slot)
 	}
+
+	// Use standard zboot function - validatePartitionName handles IMGC on evaluation platforms
+	zboot.SetPartitionState(log, string(slot), "unused")
 
 	log.Functionf("Successfully marked slot %s as unused", slot)
 	return nil

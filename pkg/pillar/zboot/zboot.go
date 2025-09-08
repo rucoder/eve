@@ -22,6 +22,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/cas"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/sirupsen/logrus" // Used for log.Fatal only
 )
 
@@ -47,8 +48,11 @@ func init() {
 		logrus.Fatal("Mutex Init")
 	}
 
-	// Initialize valid partition labels
+	// Initialize valid partition labels based on platform
 	validPartitionLabels = []string{"IMGA", "IMGB"}
+	if utils.IsEvaluationPlatform() {
+		validPartitionLabels = append(validPartitionLabels, "IMGC")
+	}
 	logrus.Infof("zboot: initialized valid partitions: %v", validPartitionLabels)
 }
 
@@ -185,6 +189,65 @@ func GetOtherPartition() string {
 		logrus.Fatalf("GetOtherPartition unknown partName %s\n", partName)
 	}
 	return partName
+}
+
+// GetNextEvaluationPartition returns the next partition for evaluation platforms
+// using intelligent A→B→C sequence with rollback detection.
+// This function should only be called on evaluation platforms.
+func GetNextEvaluationPartition(currentPartition string, triedSlots map[string]bool) string {
+	if !utils.IsEvaluationPlatform() {
+		logrus.Fatal("GetNextEvaluationPartition called on non-evaluation platform")
+	}
+
+	validatePartitionLabel(currentPartition)
+
+	// Simple loop: start from current partition, iterate through valid partitions
+	// Skip slots that have already been tried
+	slots := GetValidPartitionLabels()
+
+	// Find current slot index
+	currentIndex := -1
+	for i, slot := range slots {
+		if slot == currentPartition {
+			currentIndex = i
+			break
+		}
+	}
+
+	if currentIndex == -1 {
+		logrus.Fatalf("GetNextEvaluationPartition: unknown partition %s", currentPartition)
+	}
+
+	// Loop from current+1 to end, looking for untried slot
+	for i := currentIndex + 1; i < len(slots); i++ {
+		if !triedSlots[slots[i]] {
+			logrus.Infof("GetNextEvaluationPartition: %s→%s", currentPartition, slots[i])
+			return slots[i]
+		}
+	}
+
+	// No untried partitions found - return FINAL to indicate completion
+	logrus.Infof("GetNextEvaluationPartition: no more untried partitions after %s", currentPartition)
+	return "FINAL"
+}
+
+// GetEvaluationOtherPartitions returns all partitions except the current one for evaluation platforms
+func GetEvaluationOtherPartitions() []string {
+	if !utils.IsEvaluationPlatform() {
+		logrus.Fatal("GetEvaluationOtherPartitions called on non-evaluation platform")
+	}
+
+	currentPartition := GetCurrentPartition()
+	allPartitions := GetValidPartitionLabels()
+	var others []string
+
+	for _, partition := range allPartitions {
+		if partition != currentPartition {
+			others = append(others, partition)
+		}
+	}
+
+	return others
 }
 
 // IsValidPartitionLabel returns true if the partition name is valid for this platform

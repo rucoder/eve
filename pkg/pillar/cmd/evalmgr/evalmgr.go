@@ -25,7 +25,7 @@ func (ctx *evalMgrContext) initializeEvaluation() error {
 
 	// Detect if this is an evaluation platform
 	ctx.isEvaluationPlatform = utils.IsEvaluationPlatform()
-	log.Noticef("Evaluation platform detected: %t", ctx.isEvaluationPlatform)
+	log.Noticef("Evaluation platform detection: isEvaluationPlatform=%t", ctx.isEvaluationPlatform)
 
 	// Get current partition
 	currentPartStr := zboot.GetCurrentPartition()
@@ -52,12 +52,19 @@ func (ctx *evalMgrContext) initializeEvaluation() error {
 	}
 
 	// Initialize evaluation status
+	allowOnboard := ctx.shouldAllowOnboard()
+	statusNote := ctx.generateStatusNote()
+
+	log.Noticef("initializeEvaluation: key decisions - platform=%t, slot=%s, allowOnboard=%t",
+		ctx.isEvaluationPlatform, ctx.currentSlot, allowOnboard)
+	log.Noticef("initializeEvaluation: status note: %s", statusNote)
+
 	ctx.evalStatus = types.EvalStatus{
 		IsEvaluationPlatform: ctx.isEvaluationPlatform,
 		CurrentSlot:          ctx.currentSlot,
 		Phase:                types.EvalPhaseInit,
-		AllowOnboard:         ctx.shouldAllowOnboard(),
-		Note:                 ctx.generateStatusNote(),
+		AllowOnboard:         allowOnboard,
+		Note:                 statusNote,
 		LastUpdated:          time.Now(),
 	}
 
@@ -77,11 +84,13 @@ func (ctx *evalMgrContext) initializeEvaluation() error {
 func (ctx *evalMgrContext) shouldAllowOnboard() bool {
 	// If not an evaluation platform, always allow onboarding
 	if !ctx.isEvaluationPlatform {
+		log.Noticef("shouldAllowOnboard: not evaluation platform - allowing onboarding")
 		return true
 	}
 
 	// Check for manual override file
 	if ctx.hasOnboardOverride() {
+		log.Noticef("shouldAllowOnboard: manual override file present - allowing onboarding")
 		return true
 	}
 
@@ -89,12 +98,15 @@ func (ctx *evalMgrContext) shouldAllowOnboard() bool {
 	switch ctx.schedulerState {
 	case SchedulerFinalized:
 		// Evaluation complete - allow onboarding
+		log.Noticef("shouldAllowOnboard: scheduler finalized - allowing onboarding")
 		return true
 	case SchedulerIdle, SchedulerStabilityWait, SchedulerScheduled:
 		// Evaluation still in progress - block onboarding
+		log.Noticef("shouldAllowOnboard: scheduler state %v - blocking onboarding", ctx.schedulerState)
 		return false
 	default:
 		// Unknown state - be conservative
+		log.Warnf("shouldAllowOnboard: unknown scheduler state %v - blocking onboarding", ctx.schedulerState)
 		return false
 	}
 }
@@ -103,11 +115,14 @@ func (ctx *evalMgrContext) shouldAllowOnboard() bool {
 func (ctx *evalMgrContext) hasOnboardOverride() bool {
 	content, err := os.ReadFile(AllowOnboardOverrideFile)
 	if err != nil {
+		log.Functionf("hasOnboardOverride: %s not found or unreadable: %v", AllowOnboardOverrideFile, err)
 		return false
 	}
 
 	value := strings.TrimSpace(string(content))
-	return value == "1" || strings.ToLower(value) == "true" || strings.ToLower(value) == "yes"
+	result := value == "1" || strings.ToLower(value) == "true" || strings.ToLower(value) == "yes"
+	log.Noticef("hasOnboardOverride: file content='%s' -> override=%t", value, result)
+	return result
 }
 
 // generateStatusNote creates a human-readable status note
@@ -157,7 +172,7 @@ func (ctx *evalMgrContext) publishEvalStatus() {
 	if err := ctx.pubEvalStatus.Publish(ctx.evalStatus.Key(), ctx.evalStatus); err != nil {
 		log.Errorf("Failed to publish EvalStatus: %v", err)
 	} else {
-		log.Noticef("Published EvalStatus: %s", ctx.evalStatus.Note)
+		log.Noticef("Published EvalStatus: %s", ctx.evalStatus.DetailedNote())
 	}
 }
 

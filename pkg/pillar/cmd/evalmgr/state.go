@@ -81,10 +81,21 @@ func (ctx *evalMgrContext) createDefaultEvalState() *types.EvalPersist {
 
 	// Initialize all slots as untried
 	for _, slot := range types.AllSlots() {
-		state.Slots[slot] = types.SlotEvalState{
-			Tried:   false,
-			Success: false,
-			Note:    "Not yet attempted",
+		if slot == ctx.currentSlot {
+			// Mark current slot as tried since we're running it
+			state.Slots[slot] = types.SlotEvalState{
+				Tried:       true,
+				Success:     false, // Will be determined by stability timer
+				Note:        "Currently running - evaluating stability",
+				AttemptTime: time.Now(),
+			}
+			log.Functionf("Marked current slot %s as tried in default state", slot)
+		} else {
+			state.Slots[slot] = types.SlotEvalState{
+				Tried:   false,
+				Success: false,
+				Note:    "Not yet attempted",
+			}
 		}
 	}
 

@@ -224,7 +224,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	subEvalStatus.Activate()
 
 	// Check if we have existing EvalStatus
-	item, err = subEvalStatus.Get("global")
+	item, err = subEvalStatus.Get("evalmgr")
 	if err == nil {
 		evalStatus := item.(types.EvalStatus)
 		clientCtx.evalStatus = &evalStatus
@@ -254,33 +254,20 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
 	ps.StillRunning(agentName, warningTime, errorTime)
+	clientCtx.ctrlClient = ctrlClient
 
-	// Wait for initial EvalStatus from evalmgr to avoid race condition
-	// Use a timeout to prevent hanging if evalmgr doesn't start
-	log.Noticef("Waiting for initial EvalStatus from evalmgr before proceeding...")
-	evalTimeout := time.NewTimer(60 * time.Second) // 1 minute timeout
-	defer evalTimeout.Stop()
+	// Wait for initial EvalStatus from evalmgr if not already available
+	if clientCtx.evalStatus == nil {
+		log.Noticef("Waiting for initial EvalStatus from evalmgr before proceeding...")
+	}
 
 	for clientCtx.evalStatus == nil {
 		select {
 		case change := <-clientCtx.subEvalStatus.MsgChan():
 			clientCtx.subEvalStatus.ProcessChange(change)
 		case <-stillRunning.C:
-		case <-evalTimeout.C:
-			log.Errorf("Timeout waiting for EvalStatus from evalmgr, assuming non-evaluation platform")
-			// Create a default status for non-evaluation platform
-			defaultStatus := types.EvalStatus{
-				IsEvaluationPlatform: false,
-				CurrentSlot:          types.SlotIMGA,
-				Phase:                types.EvalPhaseInit,
-				AllowOnboard:         true,
-				Note:                 "Default status - evalmgr not responding",
-				LastUpdated:          time.Now(),
-			}
-			clientCtx.evalStatus = &defaultStatus
-			break
+			ps.StillRunning(agentName, warningTime, errorTime)
 		}
-		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 	log.Noticef("Received initial EvalStatus, proceeding with client logic")
 
