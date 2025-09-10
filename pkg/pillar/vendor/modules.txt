@@ -391,6 +391,8 @@ github.com/containerd/typeurl/v2
 # github.com/coreos/go-systemd/v22 v22.5.0
 ## explicit; go 1.12
 github.com/coreos/go-systemd/v22/dbus
+# github.com/creack/pty v1.1.21
+## explicit; go 1.13
 # github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 ## explicit
 github.com/davecgh/go-spew/spew
@@ -1001,6 +1003,9 @@ github.com/robertkrimen/otto/file
 github.com/robertkrimen/otto/parser
 github.com/robertkrimen/otto/registry
 github.com/robertkrimen/otto/token
+# github.com/robertmin1/u-root/v3 v3.0.0-20230320092305-66753cad62af
+## explicit; go 1.19
+github.com/robertmin1/u-root/v3/pkg/efivarfs
 # github.com/russross/blackfriday/v2 v2.1.0
 ## explicit
 github.com/russross/blackfriday/v2
@@ -1152,7 +1157,7 @@ golang.org/x/crypto/ocsp
 golang.org/x/crypto/sha3
 golang.org/x/crypto/ssh
 golang.org/x/crypto/ssh/internal/bcrypt_pbkdf
-# golang.org/x/mod v0.17.0
+# golang.org/x/mod v0.20.0
 ## explicit; go 1.18
 golang.org/x/mod/semver
 # golang.org/x/net v0.39.0
@@ -1229,6 +1234,8 @@ golang.org/x/text/unicode/norm
 # golang.org/x/time v0.5.0
 ## explicit; go 1.18
 golang.org/x/time/rate
+# golang.org/x/tools v0.24.0
+## explicit; go 1.19
 # google.golang.org/api v0.160.0
 ## explicit; go 1.19
 google.golang.org/api/googleapi
