@@ -21,53 +21,32 @@ jobs:
     yetus:
         runs-on: ubuntu-24.04
         container:
-            image: renezededa/yetus:latest # or ghcr.io/apache/yetus:main
+            image: ghcr.io/apache/yetus:0.15.1 # recent, known-good
         steps:
-            - name: Checkout base repo @ base branch
-              uses: actions/checkout@v4
+            - uses: actions/checkout@v4
               with:
-                  fetch-depth: 0
                   repository: ${{ github.event.pull_request.base.repo.full_name }}
                   ref: ${{ github.event.pull_request.base.ref }}
                   path: src
 
-            - name: Prepare output dir
-              run: mkdir -p out
+            - run: mkdir -p out
 
-            - name: Run Apache Yetus on PR patch URL
+            - name: "Run Yetus (GH: mode)"
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  PATCH_URL: ${{ github.server_url }}/${{ github.event.pull_request.base.repo.full_name }}/pull/${{ github.event.pull_request.number }}.patch
               run: |
                   test-patch \
                     --debug \
                     --robot \
-                    --basedir="src" \
-                    --patch-dir="out" \
-                    --build-tool="nobuild" \
-                    --continuous-improvement=true \
-                    --console-report-file="out/console.txt" \
-                    --brief-report-file="out/brief.txt" \
-                    --html-report-file="out/report.html" \
-                    --junit-report-xml="out/junit-report.xml" \
-                    --plugins="all,-gitlab,-jira" \
-                    --excludes=".yetus/excludes.txt" \
-                    --blanks-eol-ignore-file=".yetus/blanks-eol.txt" \
-                    --blanks-tabs-ignore-file=".yetus/blanks-tabs.txt" \
-                    --github-token="${GITHUB_TOKEN}" \
+                    --basedir=src \
+                    --patch-dir=out \
+                    --build-tool=nobuild \
                     --github-repo="${{ github.event.pull_request.base.repo.full_name }}" \
+                    --github-token="${GITHUB_TOKEN}" \
                     --github-base-url="${{ github.server_url }}" \
                     --github-api-url="${{ github.api_url }}" \
-                    --github-annotation-limit=50 \
-                    --github-status-use-htmlreport=true \
                     --linecomments=github \
+                    --github-annotation-limit=50 \
                     --branch="${{ github.event.pull_request.base.ref }}" \
                     --branch-default="${{ github.event.pull_request.base.ref }}" \
-                    "${PATCH_URL}"
-
-            - name: Upload Yetus artifacts
-              if: ${{ always() }}
-              uses: actions/upload-artifact@v4
-              with:
-                  name: yetus-scan
-                  path: out
+                    GH:${{ github.event.pull_request.number }}
