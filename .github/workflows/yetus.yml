@@ -24,7 +24,7 @@ jobs:
         # Run all steps directly inside the Yetus image (no docker-in-docker)
         container:
             # Use your image or switch to ghcr.io/apache/yetus:main
-            image: renezededa/yetus:eve-latest
+            image: renezededa/yetus:latest
 
         steps:
             - name: Checkout PR head (from fork)
