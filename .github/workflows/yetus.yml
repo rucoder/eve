@@ -60,7 +60,6 @@ jobs:
                     --github-api-url="${{ github.api_url }}" \
                     --github-annotation-limit=50 \
                     --github-status-use-htmlreport=true \
-                    --github-write-comment=true \
                     --linecomments=github \
                     --branch="${{ github.event.pull_request.base.ref }}" \
                     --branch-default="${{ github.event.pull_request.base.ref }}" \
