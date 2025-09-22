@@ -21,29 +21,37 @@ jobs:
     yetus:
         runs-on: ubuntu-24.04
 
-        # Run all steps directly inside the Yetus image (no docker-in-docker)
+        # Run steps directly inside the Yetus image (simplest).
         container:
-            # Use your image or switch to ghcr.io/apache/yetus:main
             image: renezededa/yetus:latest
+            # or: ghcr.io/apache/yetus:main
 
         steps:
-            - name: Checkout PR head (from fork)
+            # Checkout the *base* repo at the base branch (target of the PR).
+            - name: Checkout base repo @ base branch
               uses: actions/checkout@v4
               with:
-                  path: src
                   fetch-depth: 0
-                  repository: ${{ github.event.pull_request.head.repo.full_name }}
-                  ref: ${{ github.event.pull_request.head.ref }}
+                  repository: ${{ github.event.pull_request.base.repo.full_name }}
+                  ref: ${{ github.event.pull_request.base.ref }}
+                  path: src
 
             - name: Prepare output dir
               run: mkdir -p out
 
-            - name: Run Apache Yetus (GitHub PR mode)
+            - name: Run Apache Yetus on PR patch URL
               env:
-                  # passed to Yetus for GitHub API access
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PATCH_URL: ${{ github.server_url }}/${{ github.event.pull_request.base.repo.full_name }}/pull/${{ github.event.pull_request.number }}.patch
+                  # If you prefer to hardcode:
+                  # PATCH_URL: https://github.com/rene/eve/pull/${{ github.event.pull_request.number }}.patch
               run: |
-                  # Run Yetus directly (no docker run). Everything is inside the container already.
+                  # Sanity: show what we're testing
+                  echo "Repo: ${{ github.event.pull_request.base.repo.full_name }}"
+                  echo "Base branch: ${{ github.event.pull_request.base.ref }}"
+                  echo "Patch URL: ${PATCH_URL}"
+
+                  # Run Yetus. Last arg is the .patch URL (no GH: mode).
                   test-patch \
                     --debug \
                     --robot \
@@ -63,7 +71,7 @@ jobs:
                     --github-repo="${{ github.event.pull_request.base.repo.full_name }}" \
                     --branch="${{ github.event.pull_request.base.ref }}" \
                     --branch-default="${{ github.event.pull_request.base.ref }}" \
-                    GH:${{ github.event.pull_request.number }}
+                    "${PATCH_URL}"
 
             - name: Upload Yetus artifacts
               if: ${{ always() }}
