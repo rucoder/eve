@@ -63,7 +63,7 @@ jobs:
                     --brief-report-file="out/brief.txt" \
                     --html-report-file="out/report.html" \
                     --junit-report-xml="out/junit-report.xml" \
-                    --plugins="all,-gitlab,-jira" \
+                    --plugins="all,-gitlab,-jira,-ansiblelint,-ant,-bugzilla" \
                     --excludes=".yetus/excludes.txt" \
                     --blanks-eol-ignore-file=".yetus/blanks-eol.txt" \
                     --blanks-tabs-ignore-file=".yetus/blanks-tabs.txt" \
@@ -71,6 +71,8 @@ jobs:
                     --github-repo="${{ github.event.pull_request.base.repo.full_name }}" \
                     --branch="${{ github.event.pull_request.base.ref }}" \
                     --branch-default="${{ github.event.pull_request.base.ref }}" \
+                    --linecomments=github \
+                    --github-annotations-limit=50 \
                     "${PATCH_URL}"
 
             - name: Upload Yetus artifacts
