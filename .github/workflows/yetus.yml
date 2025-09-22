@@ -4,7 +4,7 @@ name: Apache Yetus
 on:
     pull_request_target:
         branches:
-            - "master"
+            - master
             - "[0-9]+.[0-9]+"
             - "[0-9]+.[0-9]+-stable"
             - "feature/*"
@@ -20,6 +20,12 @@ permissions:
 jobs:
     yetus:
         runs-on: ubuntu-24.04
+
+        # Run all steps directly inside the Yetus image (no docker-in-docker)
+        container:
+            # Use your image or switch to ghcr.io/apache/yetus:main
+            image: renezededa/yetus:eve-latest
+
         steps:
             - name: Checkout PR head (from fork)
               uses: actions/checkout@v4
@@ -29,44 +35,41 @@ jobs:
                   repository: ${{ github.event.pull_request.head.repo.full_name }}
                   ref: ${{ github.event.pull_request.head.ref }}
 
-            - name: Prepare dirs
+            - name: Prepare output dir
               run: mkdir -p out
 
             - name: Run Apache Yetus (GitHub PR mode)
+              env:
+                  # passed to Yetus for GitHub API access
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
-                  docker run --rm \
-                    -e GITHUB_TOKEN="${{ github.token }}" \
-                    -e GH_TOKEN="${{ github.token }}" \
-                    -e GITHUB_REPOSITORY="${{ github.event.pull_request.base.repo.full_name }}" \
-                    -e GITHUB_SERVER_URL="${{ github.server_url }}" \
-                    -e GITHUB_API_URL="${{ github.api_url }}" \
-                    -e GITHUB_GRAPHQL_URL="${{ github.graphql_url }}" \
-                    -e GITHUB_RUN_ID="${{ github.run_id }}" \
-                    -e GITHUB_RUN_NUMBER="${{ github.run_number }}" \
-                    -e GITHUB_WORKFLOW="${{ github.workflow }}" \
-                    -e GITHUB_ACTOR="${{ github.actor }}" \
-                    -v "$PWD/src":/workspace \
-                    -v "$PWD/out":/out \
-                    renezededa/yetus:main \
-                    test-patch \
-                      --debug \
-                      --robot \
-                      --basedir=/workspace \
-                      --patch-dir=/out \
-                      --build-tool=nobuild \
-                      --continuous-improvement=true \
-                      --console-report-file=/out/console.txt \
-                      --brief-report-file=/out/brief.txt \
-                      --html-report-file=/out/report.html \
-                      --junit-report-xml=/out/junit-report.xml \
-                      --plugins=all,-gitlab,-jira \
-                      --excludes=.yetus/excludes.txt \
-                      --blanks-eol-ignore-file=.yetus/blanks-eol.txt \
-                      --blanks-tabs-ignore-file=.yetus/blanks-tabs.txt \
-                      --branch="${{ github.event.pull_request.base.ref }}" \
-                      --branch-default="${{ github.event.pull_request.base.ref }}" \
-                      --github-repo="${{ github.event.pull_request.base.repo.full_name }}" \
-                      GH:${{ github.event.pull_request.number }}
+                  set -euxo pipefail
+
+                  # Optional: show where we are (GitHub mounts the workspace automatically)
+                  pwd
+                  ls -la
+
+                  # Run Yetus directly (no docker run). Everything is inside the container already.
+                  test-patch \
+                    --debug \
+                    --robot \
+                    --basedir="src" \
+                    --patch-dir="out" \
+                    --build-tool="nobuild" \
+                    --continuous-improvement=true \
+                    --console-report-file="out/console.txt" \
+                    --brief-report-file="out/brief.txt" \
+                    --html-report-file="out/report.html" \
+                    --junit-report-xml="out/junit-report.xml" \
+                    --plugins="all,-gitlab,-jira" \
+                    --excludes=".yetus/excludes.txt" \
+                    --blanks-eol-ignore-file=".yetus/blanks-eol.txt" \
+                    --blanks-tabs-ignore-file=".yetus/blanks-tabs.txt" \
+                    --github-token="${GITHUB_TOKEN}" \
+                    --github-repo="${{ github.event.pull_request.base.repo.full_name }}" \
+                    --branch="${{ github.event.pull_request.base.ref }}" \
+                    --branch-default="${{ github.event.pull_request.base.ref }}" \
+                    GH:${{ github.event.pull_request.number }}
 
             - name: Upload Yetus artifacts
               if: ${{ always() }}
