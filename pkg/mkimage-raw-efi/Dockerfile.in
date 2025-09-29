@@ -5,6 +5,9 @@
 #   /EFI/BOOT/grub.cfg - Chainloads main bootloader
 #   /UsbInvocationScript.txt - Enables USB boot on Dell 3000 series
 #
+
+FROM KERNEL_TAG as kernel
+
 FROM lfedge/eve-alpine:745ae9066273c73b0fd879c4ba4ff626a8392d04 AS build
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ENV BUILD_PKGS="grep patch git make gcc linux-headers musl-dev autoconf automake pkgconfig kmod-dev util-linux-dev cryptsetup-dev lddtree libgcc mkinitfs"
@@ -31,17 +34,30 @@ WORKDIR /
 COPY initramfs-init.patch /tmp/
 RUN patch -p1 < /tmp/initramfs-init.patch
 
+# copy modules to the expected location so that mkinitfs can find them
+COPY --from=kernel /kernel.tar /tmp
+RUN tar -xf /tmp/kernel.tar -C /
+
 # from https://git.alpinelinux.org/aports/tree/main/mkinitfs/mkinitfs.post-install?id=7b64ec6e904040bd75ea21529b4fce61c908a553
 # we need to simulate mkinitfs.post-install from the original APK file
 # --- Quote ---
 # safety. if nlplug-findfs is missing in the initramfs image we may end up
 # with an unbootable system.
 RUN if ! grep -q -w /sbin/nlplug-findfs  /etc/mkinitfs/features.d/base.files; then \
-        echo "/sbin/nlplug-findfs" >> /etc/mkinitfs/features.d/base.files; \
+    echo "/sbin/nlplug-findfs" >> /etc/mkinitfs/features.d/base.files; \
     fi
 
 RUN echo /bin/grep >> /etc/mkinitfs/features.d/base.files
-RUN mkinitfs -n -o /out/initrd.img
+
+RUN set -eux; \
+    tar -xf /tmp/kernel.tar -C /; \
+    # discover version from /lib/modules/<ver>
+    kver="$(basename /lib/modules/*)"; \
+    echo "mkinitfs: using KERNELRELEASE=${kver}"; \
+    # (optional) show modules present
+    test -e "/lib/modules/${kver}/modules.dep.bin"; \
+    # build initramfs for that kernel version
+    mkinitfs -c /etc/mkinitfs/mkinitfs.conf -o /out/initrd.img "${kver}"
 
 FROM scratch
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
