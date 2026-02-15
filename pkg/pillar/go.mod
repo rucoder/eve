@@ -29,6 +29,7 @@ require (
 	github.com/gorilla/websocket v1.5.0
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/hashicorp/go-envparse v0.1.0
+	github.com/intel/intel-cmt-cat/lib/go v0.0.0
 	github.com/jackwakefield/gopac v1.0.2
 	github.com/k8snetworkplumbingwg/network-attachment-definition-client v1.5.0
 	github.com/lf-edge/edge-containers v0.0.0-20251107072102-46bed3192170
@@ -295,6 +296,7 @@ require (
 )
 
 replace (
+	github.com/intel/intel-cmt-cat/lib/go => ./intel-cmt-cat/lib/go
 	github.com/openshift/api => github.com/openshift/api v0.0.0-20210105115604-44119421ec6b
 
 	k8s.io/api => k8s.io/api v0.26.3

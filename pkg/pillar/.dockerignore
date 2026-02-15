@@ -1,0 +1,9 @@
+# Exclude pre-built binaries from intel-cmt-cat to avoid glibc/musl conflicts
+intel-cmt-cat/lib/*.so*
+intel-cmt-cat/lib/*.a
+intel-cmt-cat/lib/*.o
+intel-cmt-cat/pqos/pqos
+intel-cmt-cat/pqos/*.o
+intel-cmt-cat/pqos/obj/
+intel-cmt-cat/rdtset/rdtset
+intel-cmt-cat/rdtset/*.o

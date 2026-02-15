@@ -466,6 +466,7 @@ func (s *ociSpec) UpdateFromDomain(dom *types.DomainConfig, status *types.Domain
 		s.Linux.Resources.Memory.Limit = &m
 		s.Linux.Resources.CPU.Period = &p
 		s.Linux.Resources.CPU.Quota = &q
+
 		if len(status.VmConfig.CPUs) != 0 {
 			cpusAsString := make([]string, len(status.VmConfig.CPUs))
 			for i, cpu := range status.VmConfig.CPUs {
@@ -481,6 +482,35 @@ func (s *ociSpec) UpdateFromDomain(dom *types.DomainConfig, status *types.Domain
 		s.Hostname = dom.UUIDandVersion.UUID.String()
 	}
 	s.Annotations[EVEOCIVNCPasswordLabel] = dom.VncPasswd
+
+	// RT containers get CAP_SYS_NICE so the workload can adjust its own
+	// RT priorities via sched_setscheduler() / chrt.
+	//
+	// NOTE: We do NOT set Process.Scheduler here because runc rejects the
+	// combination of Process.Scheduler + Linux.Resources.CPU.Cpus (cpuset
+	// pinning) with: "process scheduler can't be used together with
+	// AllowedCPUs".  Since all RT containers have CPU pinning, SCHED_FIFO
+	// is applied post-create via sched_setscheduler() on the container's
+	// init PID — see setRTScheduler() in domainmgr.go.
+	if dom.VmConfig.RTIntent {
+		capSysNice := "CAP_SYS_NICE"
+		if s.Process != nil && s.Process.Capabilities != nil {
+			s.Process.Capabilities.Bounding = appendCapIfMissing(s.Process.Capabilities.Bounding, capSysNice)
+			s.Process.Capabilities.Effective = appendCapIfMissing(s.Process.Capabilities.Effective, capSysNice)
+			s.Process.Capabilities.Permitted = appendCapIfMissing(s.Process.Capabilities.Permitted, capSysNice)
+			s.Process.Capabilities.Ambient = appendCapIfMissing(s.Process.Capabilities.Ambient, capSysNice)
+		}
+	}
+}
+
+// appendCapIfMissing appends a capability string to a slice if it is not already present.
+func appendCapIfMissing(caps []string, cap string) []string {
+	for _, c := range caps {
+		if c == cap {
+			return caps
+		}
+	}
+	return append(caps, cap)
 }
 
 // UpdateFromVolume updates values in the OCI spec based on the location

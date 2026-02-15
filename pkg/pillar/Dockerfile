@@ -108,6 +108,13 @@ COPY --from=zfs /out /
 
 COPY ./  /pillar/
 
+# Build intel-cmt-cat library for RDT support
+# Must happen before go vet/build so pqos.h is available for CGO
+WORKDIR /pillar/intel-cmt-cat
+RUN make clean || true
+RUN make -C ./lib -j "$(getconf _NPROCESSORS_ONLN)" && make -C ./lib install PREFIX=/usr NOLDCONFIG=y
+RUN make -C ./pqos -j "$(getconf _NPROCESSORS_ONLN)" && make -C ./pqos install PREFIX=/usr NOLDCONFIG=y
+
 # go vet/format and go install
 WORKDIR /pillar
 
@@ -177,6 +184,12 @@ COPY --from=dnsmasq /usr/sbin/dnsmasq /out/opt/zededa/bin/dnsmasq
 COPY --from=build /final /out
 COPY --from=build /usr/lib/dhcpcd /out/usr/lib/dhcpcd
 COPY --from=build /sbin/dhcpcd /out/sbin/dhcpcd
+# Copy libpqos shared library and pqos CLI tool for RDT support
+COPY --from=build /usr/lib/libpqos.so.6.0.1 /out/usr/lib/libpqos.so.6.0.1
+COPY --from=build /usr/bin/pqos /out/sbin/pqos
+RUN cd /out/usr/lib && \
+    ln -f -s libpqos.so.6.0.1 libpqos.so.6 && \
+    ln -f -s libpqos.so.6 libpqos.so
 
 COPY scripts/device-steps.sh \
     scripts/onboot.sh \
