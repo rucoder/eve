@@ -8,10 +8,10 @@ ARG BUILD_PKGS_BASE="git gcc linux-headers libc-dev make linux-pam-dev m4 findut
                      libintl libuuid libtirpc libblkid libcrypto3 zlib tar"
 
 # we use the same image in several places
-ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:a6a101a68aa7269506dbcb8a0a45c0d69e4f851b
+ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:ab798ccee75f48f5a3be7027f70dc5f63843ddde
 
-FROM lfedge/eve-uefi:1a89ea30ce9057c50ce6650f44bd5b89716e6dd3 AS uefi-build
-FROM lfedge/eve-dom0-ztools:b7524a395418e34f7e7238d50ac34ce3e583dbb8 AS zfs
+FROM lfedge/eve-uefi:af57189b4962f488a94df422a60a33dadacb7e40 AS uefi-build
+FROM lfedge/eve-dom0-ztools:6f82aedaed00c7ed603c6c705f05cbb534398d45 AS zfs
 RUN mkdir /out
 # copy zfs-related files from dom0-ztools using prepared list of files
 RUN while read -r x; do \
@@ -33,7 +33,7 @@ ARG BUILD_PKGS_BASE
 RUN BUILD_PKGS="${BUILD_PKGS_BASE}" eve-alpine-deploy.sh
 
 # hadolint ignore=DL3029
-FROM --platform=${BUILDPLATFORM} mikemzed/eve-cross-compilers:gcc-14.2.0-alpine-3.22-c9e635b54 AS cross-compilers
+FROM --platform=${BUILDPLATFORM} mikemzed/eve-cross-compilers:gcc-14.2.0-alpine-3.22-eab107665 AS cross-compilers
 
 # pull target-arch eve-alpine for its mirror (no RUN = no QEMU needed)
 # hadolint ignore=DL3006
@@ -151,9 +151,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build if [ "${TEST_TOOLS}" = "y" ]
     GOBIN=/final/opt/ GOFLAGS="" go install gotest.tools/gotestsum@v1.7.0; \
 fi
 
-FROM lfedge/eve-fscrypt:f5808e5982cc0042adfbdc36e9e5df237540cdca AS fscrypt
-FROM lfedge/eve-dnsmasq:3f17c7ab5bfeec6ff7134b61451d033bc2cd10bf AS dnsmasq
-FROM lfedge/eve-gpt-tools:8e3656be68b35662ba3eba09d5a5959afb58e89a AS gpttools
+FROM lfedge/eve-fscrypt:b157b6062bf5f351857a2887129c9d1877b9ee8f AS fscrypt
+FROM lfedge/eve-dnsmasq:fc10908bb1d83be8146db7b78774535a21867de9 AS dnsmasq
+FROM lfedge/eve-gpt-tools:f8728ac47a2a530ed70f75e4dc2cb9aaeacdd1b1 AS gpttools
 
 # collector collects everything together and then does any processing like stripping binaries.
 # We use this interim "collector" so that we can do processing.

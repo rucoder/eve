@@ -1,6 +1,6 @@
 # Copyright (c) 2023 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
-FROM lfedge/eve-alpine:a6a101a68aa7269506dbcb8a0a45c0d69e4f851b AS build
+FROM lfedge/eve-alpine:ab798ccee75f48f5a3be7027f70dc5f63843ddde AS build
 ENV BUILD_PKGS cairo-dev jpeg-dev libpng-dev gcc make libc-dev openssl-dev libvncserver-dev file patch
 ENV PKGS alpine-baselayout musl-utils libtasn1-progs p11-kit cairo jpeg libpng libvncserver
 RUN eve-alpine-deploy.sh
