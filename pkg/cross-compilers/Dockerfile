@@ -19,6 +19,7 @@ USER builder
 RUN git config --global user.email 'builder@projecteve.dev'
 RUN git config --global user.name 'Project EVE'
 RUN abuild-keygen -a -n -i
+RUN echo "JOBS=$(nproc)" >> ~/.abuild/abuild.conf
 RUN mkdir /home/builder/packages
 
 ADD --chown=builder:abuild https://gitlab.alpinelinux.org/alpine/aports/-/archive/"v${ALPINE_VERSION}"/aports-"v${ALPINE_VERSION}".tar.gz "${APORTS}"/aports.tar.gz
