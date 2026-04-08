@@ -1,7 +1,9 @@
 # Copyright (c) 2023 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM lfedge/eve-alpine:7b892c4653d567eb3b6a306064c3bc7fc14f6bab AS build
+# hadolint ignore=DL3029
+FROM --platform=$BUILDPLATFORM lfedge/eve-alpine:7b892c4653d567eb3b6a306064c3bc7fc14f6bab AS build
+ARG TARGETARCH
 
 # build the tpm-recovery tool
 WORKDIR /
@@ -10,10 +12,10 @@ COPY src/ recover-tpm/
 WORKDIR /recover-tpm
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # hadolint ignore=SC2046
-RUN echo "Running go vet" && go vet ./... && echo "Running go fmt" && \
+RUN echo "Running go vet" && GOARCH=${TARGETARCH} go vet ./... && echo "Running go fmt" && \
     ERR=$(gofmt -e -l -s $(find . -name \*.go | grep -v /vendor/)) && \
     if [ -n "$ERR" ] ; then echo "go fmt Failed - ERR: $ERR"; exit 1 ; fi
-RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o recovertpm .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o recovertpm .
 
 FROM scratch
 WORKDIR /
