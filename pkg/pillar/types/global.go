@@ -428,6 +428,15 @@ const (
 	// passthrough on q35; virtio-gpu-pci is preferred for UEFI VMs.
 	VNCDriverLegacy GlobalSettingKey = "vnc.driver.legacy"
 
+	// EnableEFIDebug: when true, OVMF DEBUG() output is captured to
+	// /run/hypervisor/kvm/<dom>/efi-debug.log via QEMU's isa-debugcon at
+	// I/O port 0x402.  Off by default.  Note that DEBUG() macros are
+	// compiled out in a TARGET=RELEASE OVMF build (EVE's current
+	// default); enabling this knob on a RELEASE OVMF creates the log
+	// file but it stays empty.  Useful primarily for diagnosing iGPU
+	// passthrough firmware-side issues with a TARGET=DEBUG OVMF rebuild.
+	EnableEFIDebug GlobalSettingKey = "debug.enable.efi"
+
 	// MsrvPrometheusMetricsRequestPerSecond: limit the number of requests per second
 	MsrvPrometheusMetricsRequestPerSecond GlobalSettingKey = "msrv.prometheus.metrics.rps"
 	// MsrvPrometheusMetricsBurst: limit the burst of requests
@@ -1112,6 +1121,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddBoolItem(NetworkLocalLegacyMACAddress, false)
 	configItemSpecMap.AddBoolItem(MemoryMonitorEnabled, false)
 	configItemSpecMap.AddBoolItem(VNCDriverLegacy, false)
+	configItemSpecMap.AddBoolItem(EnableEFIDebug, false)
 
 	// Add TriState Items
 	configItemSpecMap.AddTriStateItem(NetworkFallbackAnyEth, TS_DISABLED)
