@@ -423,6 +423,21 @@ const (
 	// TUIMonitorLogLevel: log level for TUI monitor
 	TUIMonitorLogLevel GlobalSettingKey = "debug.tui.loglevel"
 
+	// IGPUGOPFile: filename (basename only) of a proprietary Intel GOP
+	// Option ROM placed under /persist/vault/gop/.  Used for iGPU
+	// passthrough to provide a pre-OS UEFI framebuffer.  Empty (default)
+	// or a missing file falls back to the bundled VfioIgdPkg ROM (OS
+	// display still works; just no pre-OS framebuffer).
+	IGPUGOPFile GlobalSettingKey = "igpu.gop"
+
+	// VNCDriverLegacy: when true, force the legacy virtio-vga GPU device
+	// for VNC instead of the new default virtio-gpu-pci.  Applies to the
+	// eve-kvm hypervisor; ignored on kubevirt (which uses virtio-gpu-pci
+	// already).  virtio-vga adds a stub VGA controller for BIOS-mode boot,
+	// but takes more PCI legacy resources and conflicts with iGPU
+	// passthrough on q35; virtio-gpu-pci is preferred for UEFI VMs.
+	VNCDriverLegacy GlobalSettingKey = "vnc.driver.legacy"
+
 	// MsrvPrometheusMetricsRequestPerSecond: limit the number of requests per second
 	MsrvPrometheusMetricsRequestPerSecond GlobalSettingKey = "msrv.prometheus.metrics.rps"
 	// MsrvPrometheusMetricsBurst: limit the burst of requests
@@ -1136,6 +1151,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddBoolItem(NetworkLocalLegacyMACAddress, false)
 	configItemSpecMap.AddBoolItem(MemoryMonitorEnabled, false)
 	configItemSpecMap.AddBoolItem(DHCPEnableVendorClassID, true)
+	configItemSpecMap.AddBoolItem(VNCDriverLegacy, false)
 
 	// Add TriState Items
 	configItemSpecMap.AddTriStateItem(NetworkFallbackAnyEth, TS_DISABLED)
@@ -1153,6 +1169,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddStringItem(FmlCustomResolution, FmlResolutionUnset, blankValidator)
 	configItemSpecMap.AddStringItem(AppBootOrder, "", validateBootOrder)
 	configItemSpecMap.AddStringItem(TUIMonitorLogLevel, "info", blankValidator)
+	configItemSpecMap.AddStringItem(IGPUGOPFile, "", validateGOPRomFilename)
 	configItemSpecMap.AddStringItem(EdgeviewPublicKeys, "", blankValidator)
 
 	// Log deduplication and filtering settings
@@ -1219,6 +1236,19 @@ func validateBootOrder(bootOrder string) error {
 	default:
 		return fmt.Errorf("validateBootOrder: invalid boot order '%s', must be '', 'usb', or 'nousb'", bootOrder)
 	}
+}
+
+// validateGOPRomFilename - require a plain basename with no path separators
+// or traversal components.  Empty is allowed and means "use the bundled
+// VfioIgdPkg ROM".  The file is loaded from /persist/vault/gop/ at runtime.
+func validateGOPRomFilename(filename string) error {
+	if filename == "" {
+		return nil
+	}
+	if strings.ContainsAny(filename, `/\`) || filename == ".." || filename == "." {
+		return fmt.Errorf("validateGOPRomFilename: %q must be a basename under /persist/vault/gop (no path separators)", filename)
+	}
+	return nil
 }
 
 // validateSyslogKernelLevel - Wrapper for validating syslog and kernel
