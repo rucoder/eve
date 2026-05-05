@@ -1612,7 +1612,7 @@ func domConfigAmd64FML() string {
   to = "99"
   password = "on"
 [device "video0"]
-  driver = "virtio-vga"
+  driver = "virtio-gpu-pci"
   bus = "pcie.0"
   addr = "0x1"
 [device "pci.2"]
@@ -1904,7 +1904,7 @@ func domConfigAmd64Legacy() string {
   to = "99"
   password = "on"
 [device "video0"]
-  driver = "virtio-vga"
+  driver = "virtio-gpu-pci"
   bus = "pcie.0"
   addr = "0x1"
 [device "pci.2"]
@@ -2184,7 +2184,7 @@ func domConfigAmd64() string {
   to = "99"
   password = "on"
 [device "video0"]
-  driver = "virtio-vga"
+  driver = "virtio-gpu-pci"
   bus = "pcie.0"
   addr = "0x1"
 [device "pci.2"]
@@ -2482,7 +2482,7 @@ func domConfigContainerVNC() string {
   to = "99"
   password = "on"
 [device "video0"]
-  driver = "virtio-vga"
+  driver = "virtio-gpu-pci"
   bus = "pcie.0"
   addr = "0x1"
 [device "pci.2"]
