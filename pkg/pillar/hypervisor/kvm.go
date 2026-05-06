@@ -1740,8 +1740,10 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	hasIntelIGPU := detectIntelIGPU(config.IoAdapterList, aa)
 
 	var efiDebug bool
+	var gopRomFilename string
 	if globalConfig != nil {
 		efiDebug = globalConfig.GlobalValueBool(types.EnableEFIDebug)
+		gopRomFilename = globalConfig.GlobalValueString(types.IGPUGOPFile)
 	}
 
 	// id.json (LPC device ID spoof) only applies on the proprietary GOP
@@ -1751,7 +1753,7 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	// break the Windows display driver on RPL-P.
 	var igpuLpcID string
 	if hasIntelIGPU && gopRomFilename != "" {
-		if _, missing := gopRomPath(gopRomFilename); !missing {
+		if _, err := os.Stat(filepath.Join(gopRomDir, gopRomFilename)); err == nil {
 			igpuLpcID = loadIgpuIDs()
 			if igpuLpcID != "" {
 				logrus.Warnf("iGPU passthrough: applying LPC device ID "+
