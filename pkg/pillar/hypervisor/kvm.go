@@ -733,7 +733,7 @@ func newKvm() Hypervisor {
 	case "amd64":
 		return KvmContext{
 			ctrdContext:  *ctrdCtx,
-			devicemodel:  "pc-q35-3.1",
+			devicemodel:  "pc-q35-10.2",
 			dmExec:       "/usr/lib/xen/bin/qemu-system-x86_64",
 			dmArgs:       []string{"-display", "none", "-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0", "-machine", "hpet=off"},
 			dmCPUArgs:    []string{"-cpu", "host"},
