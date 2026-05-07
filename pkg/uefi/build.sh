@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TARGET=RELEASE
+TARGET=DEBUG
 
 # Debug knob: override OVMF's PcdPlatformBootTimeOut (in seconds).
 # Stock value is 0, which makes the UEFI splash / boot-menu phase
@@ -59,6 +59,53 @@ case $(uname -m) in
              cp Build/OvmfXen/${TARGET}_*/FV/OVMF.fd OVMF_PVH.fd
              # Build VfioIgdPkg open-source IGD Option ROM (IgdAssignmentDxe only).
              # Handles Gen11+ 64-bit BDSM at PCI config 0xC0, unlike classic IgdAssignmentDxe.
+             #
+             # Two upstream-VfioIgdPkg.dsc problems we patch in place:
+             #
+             # 1. Default MdePkg debug PCDs filter DEBUG_INFO/DEBUG_VERBOSE at
+             #    compile time even with -b DEBUG.  Add a [PcdsFixedAtBuild]
+             #    block so IgdAssignment.c's "OpRegion @ ..." / "stolen memory
+             #    @ ..." lines reach the debugcon (port 0x402, captured via
+             #    isa-debugcon when pillar's debug.enable.efi is true).
+             #
+             #    PcdDebugPropertyMask = 0x0F: ASSERT + PRINT + CODE +
+             #    CLEAR_MEMORY enabled, but NOT ASSERT_BREAKPOINT (BIT4) and
+             #    NOT ASSERT_DEADLOOP (BIT5).  Asserts print and continue
+             #    instead of halting — critical because BaseHobLibNull (see
+             #    below) and other Null libs assert on every call.
+             #
+             # 2. Upstream binds HobLib -> MdeModulePkg/.../BaseHobLibNull,
+             #    which is a stub: every function is ASSERT(FALSE) + return 0.
+             #    In RELEASE this silently corrupts; in DEBUG with the assert
+             #    deadloop enabled it bricks boot.  Replace with the real
+             #    DxeHobLib for DXE_DRIVER context.  IgdAssignmentDxe pulls
+             #    in HobLib transitively via QemuFwCfgDxeLib /
+             #    UefiBootServicesTableLib, so this is load-bearing.
+             if ! grep -q PcdFixedDebugPrintErrorLevel VfioIgdPkg/VfioIgdPkg.dsc; then
+                 sed -i 's#^\[Components\]#[PcdsFixedAtBuild]\n  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F\n  gEfiMdePkgTokenSpaceGuid.PcdFixedDebugPrintErrorLevel|0x804F004F\n\n[Components]#' VfioIgdPkg/VfioIgdPkg.dsc
+                 echo "VfioIgdPkg.dsc PcdsFixedAtBuild patched for DEBUG output:"
+                 grep -A2 PcdsFixedAtBuild VfioIgdPkg/VfioIgdPkg.dsc
+             fi
+             # Apply our diagnostic patches to VfioIgdPkg (paths inside
+             # patches are a/VfioIgdPkg/...).  Idempotent: re-running the
+             # build skips any patch that has already been applied.
+             if [ -d /vfio-igd-patches ] && ls /vfio-igd-patches/*.patch >/dev/null 2>&1 ; then
+                 for patch in /vfio-igd-patches/*.patch ; do
+                     if git apply --check -p1 < "$patch" 2>/dev/null ; then
+                         echo "Applying $patch" ; git apply -p1 < "$patch"
+                     else
+                         echo "Skipping $patch (already applied or stale)"
+                     fi
+                 done
+             fi
+             if grep -q 'HobLib|MdeModulePkg/Library/BaseHobLibNull/BaseHobLibNull.inf' VfioIgdPkg/VfioIgdPkg.dsc; then
+                 # DxeHobLib drags in UefiLib (for gBS-based protocol lookup)
+                 # and UefiLib drags in DevicePathLib.  Add the cascade in
+                 # one shot so the link resolves with no further surprises.
+                 sed -i 's#^\(\s*HobLib\)|MdeModulePkg/Library/BaseHobLibNull/BaseHobLibNull.inf#\1|MdePkg/Library/DxeHobLib/DxeHobLib.inf\n  UefiLib|MdePkg/Library/UefiLib/UefiLib.inf\n  DevicePathLib|MdePkg/Library/UefiDevicePathLib/UefiDevicePathLib.inf#' VfioIgdPkg/VfioIgdPkg.dsc
+                 echo "VfioIgdPkg.dsc HobLib swapped Null -> DxeHobLib (+ UefiLib + DevicePathLib cascade):"
+                 grep -E 'HobLib|UefiLib|DevicePathLib' VfioIgdPkg/VfioIgdPkg.dsc
+             fi
              build -b ${TARGET} -t GCC5 -a X64 -n "$(nproc)" -p VfioIgdPkg/VfioIgdPkg.dsc
              EfiRom -f 0x8086 -i 0xffff \
                  -e Build/VfioIgdPkg/${TARGET}_GCC5/X64/IgdAssignmentDxe.efi \
