@@ -475,10 +475,13 @@ const qemuPCIPassthruTemplate = `
   bus = "{{.Bus}}"
   addr = "{{.Addr}}"
 {{- if .Xvga }}
-  x-vga = "on"
+  x-vga = "{{.Xvga}}"
 {{- end -}}
 {{- if .Xopregion }}
-  x-igd-opregion = "on"
+  x-igd-opregion = "{{.Xopregion}}"
+{{- end -}}
+{{- if .Rombar }}
+  rombar = "{{.Rombar}}"
 {{- end}}
 {{- if .Romfile }}
   romfile = "{{.Romfile}}"
@@ -562,10 +565,19 @@ type tQemuSwtpmContext struct {
 }
 
 // Context for qemuPCIPassthruTemplate.
+//
+// Xvga, Xopregion and Rombar are emitted verbatim as the corresponding
+// vfio-pci device options when non-empty; empty values are not emitted.
+// Accepted: Xvga / Xopregion ∈ {"on","off"}; Rombar ∈ {"0","1"}.
+//
+// Defaults when no /persist/vault/gop/id.json overrides are set:
+// Xvga = "on" if pa.isVGA() else ""; Xopregion = "on" for Intel iGPU
+// else ""; Rombar = "" (qemu default — exposes the device's own ROM BAR).
 type tQemuPCIPassthruContext struct {
 	PciShortAddr string
-	Xvga         bool
-	Xopregion    bool
+	Xvga         string
+	Xopregion    string
+	Rombar       string
 	Romfile      string // non-empty path to GOP ROM (e.g. /persist/gop/3ea0.rom); omitted if empty
 	Bus          string
 	Addr         string
@@ -1495,16 +1507,17 @@ func (f *pciAssignmentsTemplateFiller) do(pciAssignments []pciDevice) error {
 	for _, pa := range pciAssignments {
 		pciPTContext := tQemuPCIPassthruContext{
 			PciShortAddr: types.PCILongToShort(pa.ioBundle.PciLong),
-			Xvga:         pa.isVGA(),
-			Xopregion:    false,
+		}
+		if pa.isVGA() {
+			pciPTContext.Xvga = "on"
 		}
 
 		isIntelIGPU := false
 		if vendor, err := pa.vid(); err == nil && vendor == "0x8086" {
-			if pciPTContext.Xvga {
+			if pciPTContext.Xvga != "" {
 				// Enable OpRegion passthrough for Intel iGPU — writes etc/igd-opregion to fw_cfg.
 				// https://github.com/qemu/qemu/blob/stable-5.0/docs/igd-assign.txt#L91-L96
-				pciPTContext.Xopregion = true
+				pciPTContext.Xopregion = "on"
 				isIntelIGPU = true
 				logrus.Infof("iGPU passthrough: detected Intel GPU at host PCI %s for domain %s",
 					pa.ioBundle.PciLong, f.domainUUID)
@@ -1534,6 +1547,27 @@ func (f *pciAssignmentsTemplateFiller) do(pciAssignments []pciDevice) error {
 				pa.ioBundle.PciLong, f.domainUUID)
 			pciPTContext.Bus = "pcie.0"
 			pciPTContext.Addr = "0x2"
+			// DEV-ONLY overrides from /persist/vault/gop/id.json.  Empty
+			// values in the loaded struct mean "use the default we just
+			// computed".  Non-empty values override.  Logged loud so the
+			// override is obvious in `IGD:`-style triage output.
+			if ov := loadIgpuOverrides(); ov != (igpuIDOverride{}) {
+				if ov.XVGA != "" && ov.XVGA != pciPTContext.Xvga {
+					logrus.Warnf("iGPU passthrough [DEV id.json]: overriding x-vga "+
+						"%q → %q for domain %s", pciPTContext.Xvga, ov.XVGA, f.domainUUID)
+					pciPTContext.Xvga = ov.XVGA
+				}
+				if ov.XIGDOpRegion != "" && ov.XIGDOpRegion != pciPTContext.Xopregion {
+					logrus.Warnf("iGPU passthrough [DEV id.json]: overriding x-igd-opregion "+
+						"%q → %q for domain %s", pciPTContext.Xopregion, ov.XIGDOpRegion, f.domainUUID)
+					pciPTContext.Xopregion = ov.XIGDOpRegion
+				}
+				if ov.ROMBar != "" {
+					logrus.Warnf("iGPU passthrough [DEV id.json]: applying rombar=%q "+
+						"for domain %s", ov.ROMBar, f.domainUUID)
+					pciPTContext.Rombar = ov.ROMBar
+				}
+			}
 			if err := tQemuPCIPassthru.Execute(f.file, pciPTContext); err != nil {
 				return logError("can't write iGPU passthrough to config file (%v)", err)
 			}
@@ -1610,10 +1644,14 @@ func (f *virtNetworkTemplateFiller) do(virtualNetworks []virtualNetwork,
 	return nil
 }
 
-// gopRomDir is where proprietary Intel GOP Option ROMs can be placed for display output.
-// ROMs are named by PCI device ID, e.g. /persist/gop/3ea0.rom for device 0x3ea0.
-// The 0x-prefixed form (0x3ea0.rom) is also accepted as a fallback.
-const gopRomDir = "/persist/gop"
+// gopRomDir is where proprietary Intel GOP Option ROMs and the operator-
+// supplied id.json overrides live.  ROMs are named by PCI device ID,
+// e.g. /persist/vault/gop/3ea0.rom for device 0x3ea0.  The 0x-prefixed
+// form (0x3ea0.rom) is also accepted as a fallback.  Lives under
+// /persist/vault so it inherits TPM-bound vault encryption — the GOP
+// ROM is operator-supplied per platform and treated as sensitive
+// firmware data.
+const gopRomDir = "/persist/vault/gop"
 
 // igdRomPath is the bundled open-source IGD Option ROM built from VfioIgdPkg.
 // It provides IgdAssignmentDxe which sets ASLS and BDSM (including Gen11+ 64-bit
@@ -1652,46 +1690,91 @@ func gopRomPath(devid string) string {
 //
 //	{"lpc_device_id": "0xa082"}
 //
-// WARNING — applying this on the OSS-GOP path actively breaks the
-// Windows display driver on at least RPL-P (different PCH ID changes
-// its quirk-table path → tile-mode mismatch on scanout).  The loader
+// WARNING — applying lpc_device_id on the OSS-GOP path actively breaks
+// the Windows display driver on at least RPL-P (different PCH ID changes
+// its quirk-table path → tile-mode mismatch on scanout).  The LPC spoof
 // is therefore gated to fire only when a proprietary GOP ROM is in use.
+//
+// XVGA / XIGDOpRegion / ROMBar — *DEV-ONLY* overrides for the qemu
+// vfio-pci device options on the iGPU passthrough device.  Empty string
+// or omitted = pillar's default behaviour.  When set, applied always
+// (regardless of proprietary-GOP path).  Used for triage of iGPU
+// passthrough display issues without re-flashing.  Schema:
+//
+//	{
+//	  "lpc_device_id":   "0xa082",  // proprietary-GOP only (existing)
+//	  "x_vga":           "off",     // dev: "on" / "off" / omit=default "on"
+//	  "x_igd_opregion":  "off",     // dev: "on" / "off" / omit=default "on"
+//	  "rombar":          "1"        // dev: "0" / "1" / omit=qemu default
+//	}
+//
+// Each value is forwarded verbatim into the QEMU vfio-pci device line.
+// Validate accepted values (loaders below) to keep typos from emitting
+// garbage qemu options that would prevent the VM from starting.
 type igpuIDOverride struct {
-	LpcDeviceID string `json:"lpc_device_id"`
+	LpcDeviceID  string `json:"lpc_device_id,omitempty"`
+	XVGA         string `json:"x_vga,omitempty"`
+	XIGDOpRegion string `json:"x_igd_opregion,omitempty"`
+	ROMBar       string `json:"rombar,omitempty"`
 }
 
-// loadIgpuIDs reads /persist/vault/gop/id.json and returns the configured
-// LPC device ID spoof string (suitable for emission as a QEMU value), or
-// "" if the file is missing, unreadable, malformed, or empty.  Errors
-// are logged and ignored — id.json is an operator-supplied diagnostic
-// override, not a critical config.
-func loadIgpuIDs() (lpcDeviceID string) {
+// loadIgpuOverrides reads /persist/vault/gop/id.json and returns the
+// parsed + validated overrides struct.  Missing or malformed file ⇒
+// zero-value struct.  Field-level validation errors are logged and
+// the offending field is left empty in the returned value (so it
+// falls back to pillar defaults rather than crashing the VM).
+func loadIgpuOverrides() igpuIDOverride {
+	var out igpuIDOverride
 	path := filepath.Join(gopRomDir, "id.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			logrus.Warnf("loadIgpuIDs: %s: %v", path, err)
+			logrus.Warnf("loadIgpuOverrides: %s: %v", path, err)
 		}
-		return ""
+		return out
 	}
-	var ids igpuIDOverride
-	if err := json.Unmarshal(data, &ids); err != nil {
-		logrus.Warnf("loadIgpuIDs: %s: malformed JSON: %v", path, err)
-		return ""
+	var raw igpuIDOverride
+	if err := json.Unmarshal(data, &raw); err != nil {
+		logrus.Warnf("loadIgpuOverrides: %s: malformed JSON: %v", path, err)
+		return out
 	}
-	parse := func(s string) string {
-		s = strings.TrimSpace(s)
+
+	// lpc_device_id: hex/decimal uint16, normalised to "0x%04x".
+	if s := strings.TrimSpace(raw.LpcDeviceID); s != "" {
+		v, err := strconv.ParseUint(s, 0, 16)
+		if err != nil {
+			logrus.Warnf("loadIgpuOverrides: %s: bad lpc_device_id %q: %v", path, s, err)
+		} else {
+			out.LpcDeviceID = fmt.Sprintf("0x%04x", v)
+		}
+	}
+
+	// x_vga / x_igd_opregion: only "on" or "off".
+	checkOnOff := func(field, val string) string {
+		s := strings.TrimSpace(strings.ToLower(val))
 		if s == "" {
 			return ""
 		}
-		v, err := strconv.ParseUint(s, 0, 16)
-		if err != nil {
-			logrus.Warnf("loadIgpuIDs: %s: bad value %q: %v", path, s, err)
+		if s != "on" && s != "off" {
+			logrus.Warnf("loadIgpuOverrides: %s: bad %s %q (want \"on\" or \"off\"); ignoring",
+				path, field, val)
 			return ""
 		}
-		return fmt.Sprintf("0x%04x", v)
+		return s
 	}
-	return parse(ids.LpcDeviceID)
+	out.XVGA = checkOnOff("x_vga", raw.XVGA)
+	out.XIGDOpRegion = checkOnOff("x_igd_opregion", raw.XIGDOpRegion)
+
+	// rombar: only "0" or "1".
+	if s := strings.TrimSpace(raw.ROMBar); s != "" {
+		if s != "0" && s != "1" {
+			logrus.Warnf("loadIgpuOverrides: %s: bad rombar %q (want \"0\" or \"1\"); ignoring",
+				path, raw.ROMBar)
+		} else {
+			out.ROMBar = s
+		}
+	}
+	return out
 }
 
 // detectIntelIGPU returns true if any adapter in the passthrough list is
@@ -1761,7 +1844,7 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	var igpuLpcID string
 	if hasIntelIGPU && gopRomFilename != "" {
 		if _, err := os.Stat(filepath.Join(gopRomDir, gopRomFilename)); err == nil {
-			igpuLpcID = loadIgpuIDs()
+			igpuLpcID = loadIgpuOverrides().LpcDeviceID
 			if igpuLpcID != "" {
 				logrus.Warnf("iGPU passthrough: applying LPC device ID "+
 					"spoof %s for domain %s (proprietary GOP path; risks "+
