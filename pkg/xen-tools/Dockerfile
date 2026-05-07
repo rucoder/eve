@@ -27,7 +27,10 @@ ENV BUILD_PKGS="\
     pixman-dev libaio-dev yajl-dev argp-standalone \
     linux-headers git patch texinfo tar libcap-ng-dev \
     attr-dev flex bison cmake libusb-dev zstd-dev \
-    python3 build-base ninja gnutls-dev agetty"
+    python3 py3-tomli build-base ninja gnutls-dev agetty"
+# py3-tomli — needed by qemu 10.x's mkvenv when building under
+# Python < 3.11 (Alpine 3.16 ships Python 3.10).  Python 3.11+
+# has `tomllib` built-in and doesn't need this.
 
 ENV BUILD_PKGS_arm64=dtc-dev
 
@@ -58,12 +61,80 @@ RUN make src && make install DESTDIR=/out && make install
 RUN rm -rf /out/usr/man
 RUN strip /out/usr/lib/* || :
 
+#
+# Build upstream QEMU (v10.2.2) and stage it at /qemu-upstream/usr.
+# Wired into Xen's build below via --with-system-qemu=PATH.
+#
+# Why: Xen 4.19 bundles qemu-xen 9.1.0 (xenbits.xen.org/git-http/qemu-xen.git
+# master is still at 9.1.0 + Xen-PV patches as of 2026).  9.1.0 predates
+# the major hw/vfio/igd.c refactor that landed in qemu 10.0 (BAR0 BDSM
+# mirror, GMCH passthrough, ASLS clear, fw_cfg DSM-only, etc.) — exactly
+# the code we need for clean Intel iGPU passthrough on Display 13
+# (RPL-P / ADL-P).  Rather than backporting ~22 commits, swap in
+# upstream qemu via the Xen-supported `--with-system-qemu=` mechanism.
+#
+ENV QEMU_VERSION v10.2.2
+ENV QEMU_URL https://gitlab.com/qemu-project/qemu.git
+WORKDIR /
+ADD --keep-git-dir=true ${QEMU_URL}#${QEMU_VERSION} /qemu
+
+# Local patches on top of upstream qemu — currently:
+#   00012 — passive OpRegion dump (diagnostic)
+#   00013 — ICH9-LPC x-device-id property (proprietary GOP whitelist spoof)
+COPY qemu-upstream-patches /qemu-upstream-patches
+WORKDIR /qemu
+RUN set -e ; \
+    if [ -d /qemu-upstream-patches ] && ls /qemu-upstream-patches/*.patch >/dev/null 2>&1 ; then \
+        for patch in /qemu-upstream-patches/*.patch ; do \
+            echo "Applying $patch" ; \
+            git apply -p1 < "$patch" || exit 1 ; \
+        done ; \
+    fi
+
+# QEMU configure flags chosen to match the feature set of the bundled
+# qemu-xen build (linux-aio, libusb, vhost-net/kernel/user, vhost-vsock/scsi,
+# linux-io-uring, zstd) plus KVM + GTK-less defaults.  Targets limited to
+# x86_64-softmmu; qemu-system-i386 is symlinked to the x86_64 binary
+# below to satisfy Xen's historical naming expectation.
+RUN ./configure --prefix=/usr \
+    --target-list=x86_64-softmmu \
+    --enable-kvm \
+    --enable-libusb \
+    --enable-linux-aio \
+    --enable-linux-io-uring \
+    --enable-vhost-net --enable-vhost-kernel --enable-vhost-user \
+    --enable-zstd \
+    --disable-werror \
+    --disable-docs \
+    --disable-xen \
+    --disable-tools \
+    --disable-virglrenderer \
+    --disable-spice \
+    --disable-sdl --disable-gtk --disable-curses --disable-vnc-jpeg \
+    --disable-rdma \
+    --disable-fdt
+# Notes on flags removed for qemu 10.x:
+#   --enable-vhost-vsock / --enable-vhost-scsi — both auto-detected from
+#       kernel uapi headers in qemu 10.x; explicit flags removed upstream.
+#   --disable-blobs — renamed to --disable-install-blobs in 10.x.  Do
+#       NOT pass it: qemu needs the bundled firmware blobs (vgabios,
+#       efi-virtio.rom, kvmvapic, pvh, etc.) at runtime to boot guests.
+#       The cleanup rm -f below trims arch-specific blobs we don't
+#       need (slof / openbios / opensbi / hppa / s390 / skiboot).
+RUN make -j "$(getconf _NPROCESSORS_ONLN)"
+RUN make install DESTDIR=/qemu-upstream
+# Xen historically refers to qemu-system-i386 even on x86_64 hosts; symlink it.
+RUN cd /qemu-upstream/usr/bin && \
+    [ -e qemu-system-i386 ] || ln -s qemu-system-x86_64 qemu-system-i386 && \
+    ls -la qemu-system-*
+
 # When changing this version, also update SEABIOS_UPSTREAM_REVISION to whatever is in `Config.mk` in the xen source
 ENV XEN_VERSION=4.19.0
 ENV XEN_SOURCE=https://downloads.xenproject.org/release/xen/${XEN_VERSION}/xen-${XEN_VERSION}.tar.gz
-ENV EXTRA_QEMUU_CONFIGURE_ARGS="--enable-libusb --enable-linux-aio \
-    --enable-vhost-net --enable-vhost-kernel \
-    --enable-vhost-user --enable-linux-io-uring --enable-zstd"
+# EXTRA_QEMUU_CONFIGURE_ARGS used to be forwarded by Xen to qemu-xen's
+# configure.  With --with-system-qemu= we provide our own pre-built upstream
+# qemu (above) and Xen no longer builds qemu, so this is unused.
+# ENV EXTRA_QEMUU_CONFIGURE_ARGS="..."
 
 WORKDIR /
 
@@ -97,12 +168,20 @@ WORKDIR /xen
 # disable golang as it does not play well together with musl (stderr is defined as FILE* const and fails to compile)
 RUN ./configure --prefix=/usr --disable-xen --disable-golang --disable-qemu-traditional --disable-docs --enable-9pfs \
     --with-system-ovmf=/usr/lib/xen/boot/ovmf.bin --disable-stubdom --disable-openbios \
-    --enable-vhost-vsock --enable-vhost-scsi \
-    --disable-microblaze --disable-mips --disable-ppc \
-    --disable-sparc --disable-tricore --disable-alpha --disable-hppa \
-    --disable-storage-daemon
+    --with-system-qemu=/usr/lib/xen/bin/qemu-system-i386
 RUN make -j "$(getconf _NPROCESSORS_ONLN)" && make dist
 RUN dist/install.sh /out
+
+# Stage the upstream qemu binary into the Xen install layout where
+# --with-system-qemu= told Xen to look for it.  This puts qemu-system-i386
+# / qemu-system-x86_64 next to xenstored / xenconsoled so the runtime
+# image gets a single coherent /usr/lib/xen/bin tree.
+RUN mkdir -p /out/usr/lib/xen/bin /out/usr/share/qemu && \
+    cp -a /qemu-upstream/usr/bin/qemu-system-x86_64 /out/usr/lib/xen/bin/ && \
+    ln -sf qemu-system-x86_64 /out/usr/lib/xen/bin/qemu-system-i386 && \
+    if [ -d /qemu-upstream/usr/share/qemu ]; then \
+        cp -a /qemu-upstream/usr/share/qemu/. /out/usr/share/qemu/ ; \
+    fi
 
 # Filter out a few things that we don't currently need
 RUN rm -rf /out/usr/share/qemu-xen/qemu/edk2-* /out/var/run /usr/include /usr/lib/*.a
@@ -118,17 +197,21 @@ RUN mkdir -p /out/usr/lib/xen/boot && cp /uefi/OVMF.fd /out/usr/lib/xen/boot/ovm
     [ -f /uefi/OVMF_CODE.fd ] && cp /uefi/OVMF_CODE.fd /out/usr/lib/xen/boot/OVMF_CODE.fd || : && \
     [ -f /uefi/igd.rom ] && cp /uefi/igd.rom /out/usr/lib/xen/boot/igd.rom || :
 
-# We need to keep a slim profile, which means removing things we don't need
+# We need to keep a slim profile, which means removing things we don't need.
+# Some of the historical paths under /usr/share/qemu-xen/qemu/ no longer
+# exist with --with-system-qemu= (Xen builds nothing under tools/qemu-xen/),
+# so rm uses -f.  Equivalent files from upstream qemu live in
+# /out/usr/share/qemu/ — drop them too.
 RUN rm -rf /out/usr/lib/libxen*.a /out/usr/lib/libxl*.a /out/usr/lib/debug /out/usr/lib/python*
 RUN rm -rf /out/usr/share/man
-RUN rm -rf /out/usr/share/qemu-xen/qemu/openbios-*
-RUN rm -rf /out/usr/lib/xen/bin/qemu-storage-daemon
-RUN rm /out/usr/share/qemu-xen/qemu/skiboot.lid
-RUN rm /out/usr/share/qemu-xen/qemu/hppa-firmware.img
-RUN rm /out/usr/share/qemu-xen/qemu/s390-netboot.img
-RUN rm /out/usr/share/qemu-xen/qemu/opensbi-riscv32-generic-fw_dynamic.bin
-RUN rm /out/usr/share/qemu-xen/qemu/opensbi-riscv64-generic-fw_dynamic.bin
-RUN rm /out/usr/share/qemu-xen/qemu/slof.bin
+RUN rm -rf /out/usr/share/qemu-xen /out/usr/lib/xen/bin/qemu-storage-daemon
+RUN rm -f /out/usr/share/qemu/openbios-* \
+          /out/usr/share/qemu/skiboot.lid \
+          /out/usr/share/qemu/hppa-firmware.img \
+          /out/usr/share/qemu/s390-netboot.img \
+          /out/usr/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin \
+          /out/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+          /out/usr/share/qemu/slof.bin
 
 FROM scratch
 COPY --from=build /out/ /

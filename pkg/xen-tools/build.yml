@@ -1,5 +1,12 @@
 image: eve-xen-tools
 org: lfedge
+# Build-time network access required: qemu 10.x's meson build clones
+# the `dtc` subproject git repo via `git fetch` when libfdt isn't
+# detected.  We `--disable-fdt` for x86_64 to avoid needing dtc, but
+# keep network on as a safety net for any other pulled-at-build-time
+# dependencies (qemu's submodule pulls / pip if mkvenv ever needs to
+# download).
+network: yes
 config:
   binds:
     - /run:/run
