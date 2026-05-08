@@ -176,11 +176,21 @@ RUN dist/install.sh /out
 # --with-system-qemu= told Xen to look for it.  This puts qemu-system-i386
 # / qemu-system-x86_64 next to xenstored / xenconsoled so the runtime
 # image gets a single coherent /usr/lib/xen/bin tree.
-RUN mkdir -p /out/usr/lib/xen/bin /out/usr/share/qemu && \
+#
+# Install qemu's data files (vgabios*, kvmvapic.bin, efi-virtio.rom, etc.)
+# at /usr/lib/xen/share/qemu, which is where qemu-system-x86_64 looks at
+# runtime: its compiled-in datadir is <bindir>/../share/qemu, relative to
+# the binary location at /usr/lib/xen/bin/qemu-system-x86_64.  Without
+# this, qemu fails at -readconfig with 'failed to find romfile "..."'
+# for whichever blob the cfg references first.
+RUN mkdir -p /out/usr/lib/xen/bin /out/usr/lib/xen/share/qemu && \
     cp -a /qemu-upstream/usr/bin/qemu-system-x86_64 /out/usr/lib/xen/bin/ && \
     ln -sf qemu-system-x86_64 /out/usr/lib/xen/bin/qemu-system-i386 && \
     if [ -d /qemu-upstream/usr/share/qemu ]; then \
-        cp -a /qemu-upstream/usr/share/qemu/. /out/usr/share/qemu/ ; \
+        cp -a /qemu-upstream/usr/share/qemu/. /out/usr/lib/xen/share/qemu/ ; \
+    fi && \
+    if [ -d /qemu-upstream/usr/share/qemu-firmware ]; then \
+        cp -a /qemu-upstream/usr/share/qemu-firmware /out/usr/lib/xen/share/qemu-firmware ; \
     fi
 
 # Filter out a few things that we don't currently need
@@ -201,17 +211,17 @@ RUN mkdir -p /out/usr/lib/xen/boot && cp /uefi/OVMF.fd /out/usr/lib/xen/boot/ovm
 # Some of the historical paths under /usr/share/qemu-xen/qemu/ no longer
 # exist with --with-system-qemu= (Xen builds nothing under tools/qemu-xen/),
 # so rm uses -f.  Equivalent files from upstream qemu live in
-# /out/usr/share/qemu/ — drop them too.
+# /out/usr/lib/xen/share/qemu/ — drop the non-x86 ones too.
 RUN rm -rf /out/usr/lib/libxen*.a /out/usr/lib/libxl*.a /out/usr/lib/debug /out/usr/lib/python*
 RUN rm -rf /out/usr/share/man
 RUN rm -rf /out/usr/share/qemu-xen /out/usr/lib/xen/bin/qemu-storage-daemon
-RUN rm -f /out/usr/share/qemu/openbios-* \
-          /out/usr/share/qemu/skiboot.lid \
-          /out/usr/share/qemu/hppa-firmware.img \
-          /out/usr/share/qemu/s390-netboot.img \
-          /out/usr/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin \
-          /out/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
-          /out/usr/share/qemu/slof.bin
+RUN rm -f /out/usr/lib/xen/share/qemu/openbios-* \
+          /out/usr/lib/xen/share/qemu/skiboot.lid \
+          /out/usr/lib/xen/share/qemu/hppa-firmware.img \
+          /out/usr/lib/xen/share/qemu/s390-netboot.img \
+          /out/usr/lib/xen/share/qemu/opensbi-riscv32-generic-fw_dynamic.bin \
+          /out/usr/lib/xen/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+          /out/usr/lib/xen/share/qemu/slof.bin
 
 FROM scratch
 COPY --from=build /out/ /
