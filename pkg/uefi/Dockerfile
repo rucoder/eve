@@ -51,6 +51,10 @@ FROM build-edk2 AS build-amd64
 ENV VFIOIGD_COMMIT 348860da70ca3a9ed6c1d95c30a97c757f54336b
 ADD --keep-git-dir=true https://github.com/tomitamoeko/VfioIgdPkg.git#${VFIOIGD_COMMIT} /edk2/VfioIgdPkg
 
+# Local diagnostic patches on top of upstream VfioIgdPkg, applied in
+# build.sh from /edk2.  Patch paths use a/VfioIgdPkg/...
+COPY vfio-igd-patches /vfio-igd-patches
+
 FROM build-edk2 AS build-arm64
 
 FROM build AS build-riscv64
