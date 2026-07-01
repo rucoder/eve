@@ -27,6 +27,10 @@ type PinningEntry struct {
 	Mode string `json:"mode"`
 	// NUMA: "local" (default) or "allow-cross".
 	NUMA string `json:"numa"`
+	// IOPlacement: "dedicated" (default) keeps the QEMU main-loop + iothread on
+	// the VM's dedicated cores; "housekeeping" pins them to the shared non-VM
+	// pool (off the hot vCPU cores).
+	IOPlacement string `json:"io_placement"`
 }
 
 // PinningConfig is the on-disk structure keyed by VM UUID.
@@ -94,6 +98,7 @@ func ensureDomainInPinningConfig(config types.DomainConfig) {
 		VCpus:       config.VCpus,
 		Mode:        "shared",
 		NUMA:        "local",
+		IOPlacement: "dedicated",
 	}
 	if err := savePinningConfig(cfg); err != nil {
 		log.Errorf("ensureDomainInPinningConfig: save failed: %v", err)
@@ -133,4 +138,16 @@ func mapNUMAPolicy(s string) cpuallocator.NUMAPolicy {
 		return cpuallocator.NUMAAllowCross
 	}
 	return cpuallocator.NUMALocal
+}
+
+// lookupIOPlacement returns "housekeeping" or "dedicated" (default) for a VM.
+func lookupIOPlacement(id uuid.UUID) string {
+	cfg, err := loadPinningConfig()
+	if err != nil {
+		return "dedicated"
+	}
+	if e, ok := cfg.Domains[id.String()]; ok && e.IOPlacement == "housekeeping" {
+		return "housekeeping"
+	}
+	return "dedicated"
 }

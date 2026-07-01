@@ -1520,9 +1520,18 @@ func assignCPUs(ctx *domainContext, config *types.DomainConfig, status *types.Do
 				Cores:   a.Guest.Cores,
 				Threads: a.Guest.Threads,
 			}
-			// Emulator/IO threads run on the housekeeping set (all CPUs not
-			// dedicated to any topology-pinned VM).
-			status.EmulatorCPUs = housekeepingCPUs(ctx)
+			// Place the QEMU main-loop + iothread per the VM's io_placement.
+			// "housekeeping" pins them off the hot vCPU cores (and widens the
+			// cgroup cpuset so that pool is reachable); "dedicated" (default)
+			// leaves them on the VM's dedicated cores (EmulatorCPUs stays nil,
+			// so Task-10 pinning skips them).
+			if lookupIOPlacement(config.UUIDandVersion.UUID) == "housekeeping" {
+				hk := housekeepingCPUs(ctx)
+				status.EmulatorCPUs = hk
+				for _, c := range hk {
+					status.VmConfig.CPUs = append(status.VmConfig.CPUs, c)
+				}
+			}
 			return nil
 		}
 		// Legacy pinning (no policy): unchanged behavior.

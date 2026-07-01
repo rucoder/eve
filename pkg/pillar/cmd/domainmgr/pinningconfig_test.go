@@ -65,3 +65,33 @@ func TestPinningPolicy_AbsentIsLegacy(t *testing.T) {
 		t.Fatalf("absent VM must be legacy (found=false)")
 	}
 }
+
+func TestIOPlacement(t *testing.T) {
+	dir := t.TempDir()
+	pinConfigDir = dir
+	pinConfigFile = filepath.Join(dir, "config.json")
+
+	id := uuid.NewV5(uuid.NamespaceOID, "iovm")
+	// absent entry => default dedicated
+	if got := lookupIOPlacement(id); got != "dedicated" {
+		t.Fatalf("absent => dedicated, got %q", got)
+	}
+	// write explicit housekeeping
+	cfg := &PinningConfig{Domains: map[string]*PinningEntry{
+		id.String(): {UUID: id.String(), Mode: "whole-core-smt", NUMA: "local", IOPlacement: "housekeeping"},
+	}}
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(pinConfigFile, data, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := lookupIOPlacement(id); got != "housekeeping" {
+		t.Fatalf("explicit housekeeping, got %q", got)
+	}
+	// entry present but io_placement empty => default dedicated
+	cfg.Domains[id.String()].IOPlacement = ""
+	data, _ = json.MarshalIndent(cfg, "", "  ")
+	_ = os.WriteFile(pinConfigFile, data, 0644)
+	if got := lookupIOPlacement(id); got != "dedicated" {
+		t.Fatalf("empty io_placement => dedicated, got %q", got)
+	}
+}
