@@ -186,6 +186,9 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -244,6 +247,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -278,6 +282,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -455,6 +460,9 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -513,6 +521,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -547,6 +556,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -689,6 +699,9 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -752,6 +765,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -786,6 +800,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -1287,6 +1302,9 @@ func domConfigArm64() string {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -1356,6 +1374,7 @@ func domConfigArm64() string {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -1390,6 +1409,7 @@ func domConfigArm64() string {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -1579,6 +1599,9 @@ func domConfigAmd64FML() string {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -1645,6 +1668,7 @@ func domConfigAmd64FML() string {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -1679,6 +1703,7 @@ func domConfigAmd64FML() string {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -1868,6 +1893,9 @@ func domConfigAmd64Legacy() string {
   sockets = "1"
   cores = "2"
   threads = "1"
+
+[object "iothread0"]
+  qom-type = "iothread"
 
 [device]
   driver = "virtio-serial"
@@ -2149,6 +2177,9 @@ func domConfigAmd64() string {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -2215,6 +2246,7 @@ func domConfigAmd64() string {
   driver = "virtio-blk-pci"
   bus = "pci.4"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk0"
 
 
@@ -2249,6 +2281,7 @@ func domConfigAmd64() string {
   driver = "virtio-blk-pci"
   bus = "pci.6"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk2"
 
 
@@ -2425,6 +2458,9 @@ func domConfigContainerVNC() string {
   cores = "2"
   threads = "1"
 
+[object "iothread0"]
+  qom-type = "iothread"
+
 [device]
   driver = "virtio-serial"
   addr = "3"
@@ -2524,6 +2560,7 @@ func domConfigContainerVNC() string {
   driver = "virtio-blk-pci"
   bus = "pci.5"
   addr = "0x0"
+  iothread = "iothread0"
   drive = "drive-virtio-disk1"
 
 
