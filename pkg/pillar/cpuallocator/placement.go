@@ -4,6 +4,7 @@
 package cpuallocator
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
@@ -138,4 +139,116 @@ func (p *Placer) dedicatedLookup() map[cputopology.LCPU]bool {
 		}
 	}
 	return m
+}
+
+// Allocate performs topology-aware placement for one VM.
+func (p *Placer) Allocate(r Request) Result {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.dedicated[r.UUID]; ok {
+		return Result{Status: InvalidRequest, Message: fmt.Sprintf("already allocated for %s", r.UUID)}
+	}
+	if r.NumVCPUs <= 0 {
+		return Result{Status: InvalidRequest, Message: "NumVCPUs must be > 0"}
+	}
+
+	var coresNeeded, threads int
+	switch r.Mode {
+	case ModeWholeCoreSMT:
+		if r.NumVCPUs%2 != 0 {
+			return Result{Status: InvalidRequest, Message: "whole-core-smt requires an even vCPU count"}
+		}
+		coresNeeded = r.NumVCPUs / 2
+		threads = 2
+	case ModeOnePerCore:
+		coresNeeded = r.NumVCPUs
+		threads = 1
+	default:
+		return Result{Status: InvalidRequest, Message: "Allocate is only for pinned modes"}
+	}
+
+	dedicated := p.dedicatedLookup()
+
+	// Free cores grouped by NUMA node, preserving deterministic order.
+	freeByNUMA := map[uint][]*cputopology.PhysicalCore{}
+	numaOrder := []uint{}
+	totalFree := 0
+	for i := range p.topo.Cores {
+		pc := &p.topo.Cores[i]
+		if !p.coreIsFree(pc, dedicated) {
+			continue
+		}
+		if _, ok := freeByNUMA[pc.NUMA]; !ok {
+			numaOrder = append(numaOrder, pc.NUMA)
+		}
+		freeByNUMA[pc.NUMA] = append(freeByNUMA[pc.NUMA], pc)
+		totalFree++
+	}
+	sort.Slice(numaOrder, func(i, j int) bool { return numaOrder[i] < numaOrder[j] })
+
+	if totalFree < coresNeeded {
+		return Result{Status: Insufficient, Message: fmt.Sprintf("need %d free cores, have %d", coresNeeded, totalFree)}
+	}
+
+	var chosen []*cputopology.PhysicalCore
+	if r.NUMA == NUMALocal {
+		for _, n := range numaOrder {
+			cand := freeByNUMA[n]
+			if len(cand) >= coresNeeded {
+				chosen = pickCores(cand, coresNeeded)
+				break
+			}
+		}
+		if chosen == nil {
+			return Result{Status: NeedsRebalance, Message: fmt.Sprintf("need %d cores in one NUMA node; none has enough (total free %d)", coresNeeded, totalFree)}
+		}
+	} else {
+		all := []*cputopology.PhysicalCore{}
+		for _, n := range numaOrder {
+			all = append(all, freeByNUMA[n]...)
+		}
+		chosen = pickCores(all, coresNeeded)
+	}
+
+	var ordered, parked []cputopology.LCPU
+	nodeSet := map[uint]bool{}
+	for _, pc := range chosen {
+		nodeSet[pc.NUMA] = true
+		switch r.Mode {
+		case ModeWholeCoreSMT:
+			ordered = append(ordered, pc.Siblings...)
+		case ModeOnePerCore:
+			ordered = append(ordered, pc.Siblings[0])
+			if len(pc.Siblings) > 1 {
+				parked = append(parked, pc.Siblings[1:]...)
+			}
+		}
+	}
+
+	nodes := make([]uint, 0, len(nodeSet))
+	for n := range nodeSet {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i] < nodes[j] })
+
+	full := append(append([]cputopology.LCPU{}, ordered...), parked...)
+	p.dedicated[r.UUID] = full
+
+	return Result{
+		Status: Success,
+		Assignment: &Assignment{
+			OrderedHostCPUs: ordered,
+			Guest:           GuestTopology{Sockets: 1, Cores: coresNeeded, Threads: threads},
+			ParkedCPUs:      parked,
+			NUMANodes:       nodes,
+		},
+	}
+}
+
+// pickCores returns the first n cores from an already-deterministic slice.
+func pickCores(cores []*cputopology.PhysicalCore, n int) []*cputopology.PhysicalCore {
+	out := make([]*cputopology.PhysicalCore, n)
+	copy(out, cores[:n])
+	return out
 }
