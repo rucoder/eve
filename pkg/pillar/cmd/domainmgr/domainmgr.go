@@ -38,6 +38,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/containerd"
 	"github.com/lf-edge/eve/pkg/pillar/cpuallocator"
+	"github.com/lf-edge/eve/pkg/pillar/cputopology"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/hypervisor"
 	"github.com/lf-edge/eve/pkg/pillar/kubeapi"
@@ -151,7 +152,7 @@ type domainContext struct {
 	// cli options
 	hypervisorPtr *string
 	// CPUs management
-	cpuAllocator        *cpuallocator.CPUAllocator
+	placer              *cpuallocator.Placer
 	cpuPinningSupported bool
 	// Is it EVE 'k'
 	hvTypeKube bool
@@ -608,10 +609,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	domainCtx.cpuPinningSupported = caps.CPUPinning
 
 	// Need to wait for things to get started
-	var resources types.HostMemory
 	for i := 0; true; i++ {
 		delay := 10
-		resources, err = hyper.GetHostCPUMem()
+		_, err = hyper.GetHostCPUMem()
 		if err == nil {
 			break
 		}
@@ -628,9 +628,17 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Warnf("Failed to get reserved CPU number, use 1 by default: %s", err)
 	}
 
-	if domainCtx.cpuAllocator, err = cpuallocator.Init(resources.Ncpus, uint32(cpusReserved)); err != nil {
-		log.Fatal(err)
+	topo, terr := cputopology.DiscoverTopology()
+	if terr != nil {
+		log.Warnf("CPU topology discovery degraded to flat: %v", terr)
 	}
+	domainCtx.placer = cpuallocator.NewPlacer(topo, uint32(cpusReserved))
+	log.Noticef("CPU topology: %d physical cores", len(topo.Cores))
+	// Reseed the allocator with cores already held by running VMs. DomainStatus
+	// is ephemeral (/run), so this only matters across a domainmgr process
+	// restart (not a device reboot); it prevents handing a running VM's
+	// dedicated cores to another VM before the existing status is reconciled.
+	seedPlacerFromStatus(&domainCtx)
 
 	// Wait until we have been onboarded aka know our own UUID however we do not use the UUID
 	if _, err := wait.WaitForOnboarded(ps, log, agentName, warningTime, errorTime); err != nil {
@@ -1466,7 +1474,7 @@ func setCgroupCpuset(config *types.DomainConfig, status *types.DomainStatus) err
 }
 
 func updateNonPinnedCPUs(ctx *domainContext, config *types.DomainConfig, status *types.DomainStatus) error {
-	status.VmConfig.CPUs = ctx.cpuAllocator.GetAllFree()
+	status.VmConfig.CPUs = housekeepingCPUs(ctx)
 	err := setCgroupCpuset(config, status)
 	if err != nil {
 		return errors.New("failed to redistribute CPUs between VMs, can affect the inter-VM isolation")
@@ -1480,36 +1488,125 @@ func updateNonPinnedCPUs(ctx *domainContext, config *types.DomainConfig, status 
 func assignCPUs(ctx *domainContext, config *types.DomainConfig, status *types.DomainStatus) error {
 	if config.VmConfig.CPUsPinned { // Pin the CPU
 		// CPUs may already be allocated for this UUID from a prior
-		// doActivate that returned early (e.g. kubevirt cluster-trust path
-		// after a version bump). The cpuAllocator records one allocation
-		// per UUID and would error with "multiple allocations for UUID"
-		// on a second Allocate call, leaving the app permanently broken.
-		// Reuse the existing allocation when present.
+		// doActivate that returned early. Reuse the existing allocation.
 		if len(status.VmConfig.CPUs) > 0 {
 			return nil
 		}
-		cpusToAssign, err := ctx.cpuAllocator.Allocate(config.UUIDandVersion.UUID, config.VCpus)
+		// Topology-aware placement when a /persist pinning policy is set.
+		mode, numa, policyFound := lookupPinningPolicy(config.UUIDandVersion.UUID)
+		if policyFound && ctx.placer != nil {
+			log.Noticef("CPU pinning: %s requesting %d vCPUs, mode=%s numa=%s",
+				config.DisplayName, config.VCpus, mode, numa)
+			res := ctx.placer.Allocate(cpuallocator.Request{
+				UUID:     config.UUIDandVersion.UUID,
+				NumVCPUs: config.VCpus,
+				Mode:     mode,
+				NUMA:     numa,
+			})
+			if res.Status != cpuallocator.Success {
+				return fmt.Errorf("topology pinning for %s: %s", config.DisplayName, res.Message)
+			}
+			a := res.Assignment
+			log.Noticef("CPU pinning: %s allocated host CPUs %v (parked %v), guest topology sockets=%d cores=%d threads=%d",
+				config.DisplayName, a.OrderedHostCPUs, a.ParkedCPUs, a.Guest.Sockets, a.Guest.Cores, a.Guest.Threads)
+			for _, c := range a.OrderedHostCPUs {
+				status.VmConfig.CPUs = append(status.VmConfig.CPUs, uint32(c))
+			}
+			for _, c := range a.ParkedCPUs {
+				status.VmConfig.CPUs = append(status.VmConfig.CPUs, uint32(c))
+			}
+			for _, c := range a.OrderedHostCPUs {
+				status.OrderedCPUs = append(status.OrderedCPUs, uint32(c))
+			}
+			status.VMTopology = types.CPUTopology{
+				Sockets: a.Guest.Sockets,
+				Cores:   a.Guest.Cores,
+				Threads: a.Guest.Threads,
+			}
+			// Place the QEMU main-loop + iothread per the VM's io_placement.
+			// "housekeeping" pins them off the hot vCPU cores (and widens the
+			// cgroup cpuset so that pool is reachable); "dedicated" (default)
+			// leaves them on the VM's dedicated cores (EmulatorCPUs stays nil,
+			// so Task-10 pinning skips them).
+			if lookupIOPlacement(config.UUIDandVersion.UUID) == "housekeeping" {
+				hk := housekeepingCPUs(ctx)
+				status.EmulatorCPUs = hk
+				for _, c := range hk {
+					status.VmConfig.CPUs = append(status.VmConfig.CPUs, c)
+				}
+			}
+			return nil
+		}
+		// Legacy pinning (no policy): unchanged behavior.
+		cpusToAssign, err := ctx.placer.AllocateShared(config.UUIDandVersion.UUID, config.VCpus)
 		if err != nil {
 			return err
 		}
+		log.Noticef("CPU pinning: %s allocated shared host CPUs %v (legacy, no policy)",
+			config.DisplayName, cpusToAssign)
 		for _, cpu := range cpusToAssign {
-			status.VmConfig.CPUs = append(status.VmConfig.CPUs, cpu)
+			status.VmConfig.CPUs = append(status.VmConfig.CPUs, uint32(cpu))
 		}
 	} else { // VM has no pinned CPUs, assign all the CPUs from the shared set
-		status.VmConfig.CPUs = ctx.cpuAllocator.GetAllFree()
+		status.VmConfig.CPUs = housekeepingCPUs(ctx)
 	}
 	return nil
 }
 
+// housekeepingCPUs returns all logical CPUs not dedicated to any VM
+// (topology or shared), used for non-pinned VM cpusets and emulator pinning.
+func housekeepingCPUs(ctx *domainContext) []uint32 {
+	var out []uint32
+	for _, c := range ctx.placer.FreeCPUs() {
+		out = append(out, uint32(c))
+	}
+	return out
+}
+
 // releaseCPUs releases the CPUs that were previously assigned to the VM.
-// The cpumask in the *status* is updated accordingly, and the CPUs are released in the CPUAllocator context.
-func releaseCPUs(ctx *domainContext, config *types.DomainConfig, status *types.DomainStatus) {
-	if ctx.cpuPinningSupported && config.VmConfig.CPUsPinned && status.VmConfig.CPUs != nil {
-		if err := ctx.cpuAllocator.Free(config.UUIDandVersion.UUID); err != nil {
-			log.Errorf("Failed to free CPUs for %s: %s", config.DisplayName, err)
-		}
+// The cpumask in the *status* is updated accordingly, and the CPUs are released in the Placer.
+func releaseCPUs(ctx *domainContext, status *types.DomainStatus) {
+	if ctx.placer != nil {
+		ctx.placer.Free(status.UUIDandVersion.UUID)
 	}
 	status.VmConfig.CPUs = nil
+	status.OrderedCPUs = nil
+	status.EmulatorCPUs = nil
+	status.VMTopology = types.CPUTopology{}
+}
+
+// seedPlacerFromStatus reseeds the allocator with cores already held by running,
+// pinned VMs, taken from persisted DomainStatus at startup. A Placer created
+// fresh on a domainmgr restart otherwise knows nothing of running VMs (the
+// re-activate path reuses their existing status without re-running placement),
+// and could hand their dedicated cores to another VM. Only the exclusive set is
+// reserved: assigned CPUs minus the shared housekeeping/emulator pool.
+func seedPlacerFromStatus(ctx *domainContext) {
+	if ctx.placer == nil {
+		return
+	}
+	for _, st := range ctx.pubDomainStatus.GetAll() {
+		status := st.(types.DomainStatus)
+		if !status.VmConfig.CPUsPinned || len(status.VmConfig.CPUs) == 0 {
+			continue
+		}
+		emu := make(map[uint32]bool, len(status.EmulatorCPUs))
+		for _, c := range status.EmulatorCPUs {
+			emu[c] = true
+		}
+		var owned []uint32
+		for _, c := range status.VmConfig.CPUs {
+			if !emu[c] {
+				owned = append(owned, c)
+			}
+		}
+		if len(owned) == 0 {
+			continue
+		}
+		ctx.placer.Reserve(status.UUIDandVersion.UUID, owned)
+		log.Noticef("CPU pinning: reseeded %s with dedicated CPUs %v after domainmgr restart",
+			status.DisplayName, owned)
+	}
 }
 
 func handleCreate(ctx *domainContext, key string, config *types.DomainConfig) {
@@ -1782,6 +1879,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 		config.UUIDandVersion, config.DisplayName)
 
 	if ctx.cpuPinningSupported {
+		ensureDomainInPinningConfig(config)
 		if err := assignCPUs(ctx, &config, status); err != nil {
 			log.Warnf("failed to assign CPUs for %s err %v", config.DisplayName, err)
 			errDescription := types.ErrorDescription{Error: err.Error()}
@@ -1798,7 +1896,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 		status.PendingAdd = false
 		status.SetErrorDescription(*errDescription)
 		status.AdaptersFailed = true
-		releaseCPUs(ctx, &config, status)
+		releaseCPUs(ctx, status)
 		publishDomainStatus(ctx, status)
 		releaseAdapters(ctx, config.IoAdapterList, config.UUIDandVersion.UUID,
 			nil)
@@ -1822,7 +1920,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 		status.PendingAdd = false
 		status.SetErrorNow(err.Error())
 		status.AdaptersFailed = true
-		releaseCPUs(ctx, &config, status)
+		releaseCPUs(ctx, status)
 		publishDomainStatus(ctx, status)
 		releaseAdapters(ctx, config.IoAdapterList, config.UUIDandVersion.UUID,
 			nil)
@@ -1846,7 +1944,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 					snapshotID, config.UUIDandVersion.UUID, err)
 				log.Error(err.Error())
 				status.SetErrorNow(err.Error())
-				releaseCPUs(ctx, &config, status)
+				releaseCPUs(ctx, status)
 				return
 			}
 
@@ -1875,7 +1973,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 					err := fmt.Errorf("doActivate: Failed to write cloud-init metadata file. Error %s", err)
 					log.Error(err.Error())
 					status.SetErrorNow(err.Error())
-					releaseCPUs(ctx, &config, status)
+					releaseCPUs(ctx, status)
 					return
 				}
 
@@ -1886,7 +1984,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 						err := fmt.Errorf("doActivate: Failed to apply cloud-init config. Error %s", err)
 						log.Error(err.Error())
 						status.SetErrorNow(err.Error())
-						releaseCPUs(ctx, &config, status)
+						releaseCPUs(ctx, status)
 						return
 					}
 				}
@@ -1902,7 +2000,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 			if err != nil {
 				log.Errorf("Failed to check disk format: %v", err.Error())
 				status.SetErrorNow(err.Error())
-				releaseCPUs(ctx, &config, status)
+				releaseCPUs(ctx, status)
 				return
 			}
 		}
@@ -1957,7 +2055,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 		log.Errorf("Failed to create DomainStatus from %+v: %s",
 			config, err)
 		status.SetErrorNow(err.Error())
-		releaseCPUs(ctx, &config, status)
+		releaseCPUs(ctx, status)
 		return
 	}
 
@@ -1977,7 +2075,7 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 			log.Errorf("DomainCreate for %s: %s", status.DomainName, err)
 			status.BootFailed = true
 			status.SetErrorNow(err.Error())
-			releaseCPUs(ctx, &config, status)
+			releaseCPUs(ctx, status)
 			publishDomainStatus(ctx, status)
 			return
 		}
@@ -2272,13 +2370,15 @@ func doCleanup(ctx *domainContext, status *types.DomainStatus) {
 	}
 
 	if ctx.cpuPinningSupported {
-		if status.VmConfig.CPUsPinned {
-			if err := ctx.cpuAllocator.Free(status.UUIDandVersion.UUID); err != nil {
-				log.Warnf("Failed to free for %s: %s", status.DisplayName, err)
-			}
+		wasPinned := status.VmConfig.CPUsPinned
+		// Release every CPU field (dedicated set, ordered vCPU map, emulator
+		// set, guest topology) through the single release path so a later
+		// re-activation starts from a clean slate and cannot accumulate stale
+		// pin state.
+		releaseCPUs(ctx, status)
+		if wasPinned {
 			triggerCPUNotification()
 		}
-		status.VmConfig.CPUs = nil
 	}
 	releaseAdapters(ctx, status.IoAdapterList, status.UUIDandVersion.UUID,
 		status)
