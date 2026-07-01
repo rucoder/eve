@@ -301,6 +301,17 @@ type VmConfig struct {
 	BootOrder zcommon.BootOrder
 }
 
+// CPUTopology is the guest-visible CPU topology emitted to QEMU -smp.
+type CPUTopology struct {
+	Sockets int
+	Cores   int
+	Threads int
+}
+
+// IsSet reports whether a non-legacy (computed) topology is present.
+// Zero value means "fall back to the legacy flat VCpus topology".
+func (t CPUTopology) IsSet() bool { return t.Sockets > 0 && t.Cores > 0 && t.Threads > 0 }
+
 // VmMode is the type for the virtualization mode
 type VmMode uint8
 
@@ -385,6 +396,15 @@ type DomainStatus struct {
 	// emitted the "trusting cluster to recover" log line. Used to deduplicate
 	// that log to state transitions only. Zero = not yet logged. KubeVirt only.
 	KubeTrustLoggedState SwState `json:"-"`
+	// VMTopology is the guest CPU topology to expose via QEMU -smp.
+	// Zero value (see CPUTopology.IsSet) means legacy flat VCpus topology.
+	VMTopology CPUTopology
+	// OrderedCPUs maps guest vCPU index -> host logical CPU for strict 1:1
+	// pinning (populated only for topology-pinned VMs).
+	OrderedCPUs []uint32
+	// EmulatorCPUs is the housekeeping CPU set that QEMU emulator/IO threads
+	// are pinned to (populated only for topology-pinned VMs).
+	EmulatorCPUs []uint32
 }
 
 func (status DomainStatus) Key() string {
