@@ -936,11 +936,17 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 		"-readconfig", file.Name(),
 		"-pidfile", kvmStateDir+domainName+"/pid")
 
+	// Topology-pinned VMs are pinned post-launch in Start() (QMP + affinity),
+	// which needs the running vCPU thread IDs. Record the request here.
+	if len(status.OrderedCPUs) > 0 {
+		setPinRequest(domainName, status.OrderedCPUs, status.EmulatorCPUs)
+	}
+
 	// Add CPUs affinity as a parameter to qemu.
 	// It's not supported to be configured in the .ini file so we need to add it here.
 	// The arguments are in the format of: -object thread-context,id=tc1,cpu-affinity=0-1,cpu-affinity=6-7
 	// The thread-context object is introduced in qemu 7.2
-	if config.CPUsPinned {
+	if config.CPUsPinned && len(status.OrderedCPUs) == 0 {
 		// Create the thread-context object string
 		threadContext := "thread-context,id=tc1"
 		for _, cpu := range status.CPUs {
@@ -1894,6 +1900,10 @@ func (ctx KvmContext) Start(domainName string) error {
 		}
 	}
 
+	if err := ctx.pinDomainThreads(domainName, qmpFile); err != nil {
+		return logError("failed to pin vCPUs for domain %s: %v", domainName, err)
+	}
+
 	if err := execContinue(qmpFile); err != nil {
 		return logError("failed to start domain that is stopped %v", err)
 	}
@@ -1914,6 +1924,10 @@ func (ctx KvmContext) Stop(domainName string, _ bool) error {
 
 // Delete deletes a domain
 func (ctx KvmContext) Delete(domainName string) (result error) {
+	// Ensure any recorded (but not yet applied/consumed) pin request for this
+	// domain is discarded so entries can't accumulate over device lifetime.
+	clearPinRequest(domainName)
+
 	//Sending a stop signal to then domain before quitting. This is done to freeze the domain before quitting it.
 	_, err := os.Stat(GetQmpExecutorSocket(domainName))
 	if err == nil {
