@@ -59,7 +59,6 @@ const (
 	Success Status = iota
 	NeedsRebalance
 	Insufficient
-	WouldStarveHousekeeping
 	InvalidRequest
 )
 
@@ -139,6 +138,63 @@ func (p *Placer) dedicatedLookup() map[cputopology.LCPU]bool {
 		}
 	}
 	return m
+}
+
+// AllocateShared allocates n lowest-numbered free logical CPUs for a legacy
+// (non-topology) pinned VM. Recorded in the same bookkeeping as topology
+// allocations, so the two can never overlap. Skips the EVE-reserved low range.
+func (p *Placer) AllocateShared(id uuid.UUID, n int) ([]cputopology.LCPU, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.dedicated[id]; ok {
+		return nil, fmt.Errorf("multiple allocations for %s", id)
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("AllocateShared: n must be > 0")
+	}
+	ded := p.dedicatedLookup()
+	var picked []cputopology.LCPU
+	for _, c := range p.allLCPUsSorted() {
+		if uint32(c) < p.numReservedForEVE || ded[c] {
+			continue
+		}
+		picked = append(picked, c)
+		if len(picked) == n {
+			break
+		}
+	}
+	if len(picked) < n {
+		return nil, fmt.Errorf("insufficient CPUs: need %d, have %d free", n, len(picked))
+	}
+	p.dedicated[id] = picked
+	return picked, nil
+}
+
+// FreeCPUs returns all logical CPUs not dedicated to any VM (topology OR
+// shared), INCLUDING the EVE-reserved low range — matching the legacy
+// GetAllFree semantics used for non-pinned VM cpusets and emulator housekeeping.
+func (p *Placer) FreeCPUs() []cputopology.LCPU {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ded := p.dedicatedLookup()
+	var out []cputopology.LCPU
+	for _, c := range p.allLCPUsSorted() {
+		if !ded[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// allLCPUsSorted returns every logical CPU in the topology, ascending.
+// Caller must hold p.mu.
+func (p *Placer) allLCPUsSorted() []cputopology.LCPU {
+	var all []cputopology.LCPU
+	for i := range p.topo.Cores {
+		all = append(all, p.topo.Cores[i].Siblings...)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	return all
 }
 
 // Allocate performs topology-aware placement for one VM.

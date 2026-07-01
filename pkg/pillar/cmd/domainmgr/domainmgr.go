@@ -152,7 +152,6 @@ type domainContext struct {
 	// cli options
 	hypervisorPtr *string
 	// CPUs management
-	cpuAllocator        *cpuallocator.CPUAllocator
 	placer              *cpuallocator.Placer
 	cpuPinningSupported bool
 	// Is it EVE 'k'
@@ -610,10 +609,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	domainCtx.cpuPinningSupported = caps.CPUPinning
 
 	// Need to wait for things to get started
-	var resources types.HostMemory
 	for i := 0; true; i++ {
 		delay := 10
-		resources, err = hyper.GetHostCPUMem()
+		_, err = hyper.GetHostCPUMem()
 		if err == nil {
 			break
 		}
@@ -630,16 +628,12 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Warnf("Failed to get reserved CPU number, use 1 by default: %s", err)
 	}
 
-	if domainCtx.cpuAllocator, err = cpuallocator.Init(resources.Ncpus, uint32(cpusReserved)); err != nil {
-		log.Fatal(err)
+	topo, terr := cputopology.DiscoverTopology()
+	if terr != nil {
+		log.Warnf("CPU topology discovery degraded to flat: %v", terr)
 	}
-
-	if topo, terr := cputopology.DiscoverTopology(); terr != nil {
-		log.Errorf("CPU topology discovery failed: %v; topology pinning disabled", terr)
-	} else {
-		domainCtx.placer = cpuallocator.NewPlacer(topo, uint32(cpusReserved))
-		log.Noticef("CPU topology discovered: %d physical cores", len(topo.Cores))
-	}
+	domainCtx.placer = cpuallocator.NewPlacer(topo, uint32(cpusReserved))
+	log.Noticef("CPU topology: %d physical cores", len(topo.Cores))
 
 	// Wait until we have been onboarded aka know our own UUID however we do not use the UUID
 	if _, err := wait.WaitForOnboarded(ps, log, agentName, warningTime, errorTime); err != nil {
@@ -1535,47 +1529,34 @@ func assignCPUs(ctx *domainContext, config *types.DomainConfig, status *types.Do
 			return nil
 		}
 		// Legacy pinning (no policy): unchanged behavior.
-		cpusToAssign, err := ctx.cpuAllocator.Allocate(config.UUIDandVersion.UUID, config.VCpus)
+		cpusToAssign, err := ctx.placer.AllocateShared(config.UUIDandVersion.UUID, config.VCpus)
 		if err != nil {
 			return err
 		}
 		for _, cpu := range cpusToAssign {
-			status.VmConfig.CPUs = append(status.VmConfig.CPUs, cpu)
+			status.VmConfig.CPUs = append(status.VmConfig.CPUs, uint32(cpu))
 		}
 	} else { // VM has no pinned CPUs, assign all the CPUs from the shared set
-		status.VmConfig.CPUs = ctx.cpuAllocator.GetAllFree()
+		status.VmConfig.CPUs = housekeepingCPUs(ctx)
 	}
 	return nil
 }
 
-// housekeepingCPUs returns all logical CPUs not dedicated to any
-// topology-pinned VM (used for non-pinned VM cpusets and emulator pinning).
+// housekeepingCPUs returns all logical CPUs not dedicated to any VM
+// (topology or shared), used for non-pinned VM cpusets and emulator pinning.
 func housekeepingCPUs(ctx *domainContext) []uint32 {
-	dedicated := map[uint32]bool{}
-	if ctx.placer != nil {
-		for _, c := range ctx.placer.DedicatedSet() {
-			dedicated[uint32(c)] = true
-		}
-	}
 	var out []uint32
-	for _, c := range ctx.cpuAllocator.GetAllFree() {
-		if !dedicated[c] {
-			out = append(out, c)
-		}
+	for _, c := range ctx.placer.FreeCPUs() {
+		out = append(out, uint32(c))
 	}
 	return out
 }
 
 // releaseCPUs releases the CPUs that were previously assigned to the VM.
-// The cpumask in the *status* is updated accordingly, and the CPUs are released in the CPUAllocator context.
+// The cpumask in the *status* is updated accordingly, and the CPUs are released in the Placer.
 func releaseCPUs(ctx *domainContext, config *types.DomainConfig, status *types.DomainStatus) {
-	if ctx.cpuPinningSupported && config.VmConfig.CPUsPinned && status.VmConfig.CPUs != nil {
-		if err := ctx.cpuAllocator.Free(config.UUIDandVersion.UUID); err != nil {
-			log.Errorf("Failed to free CPUs for %s: %s", config.DisplayName, err)
-		}
-	}
 	if ctx.placer != nil {
-		ctx.placer.Free(config.UUIDandVersion.UUID) // no-op if not topology-pinned
+		ctx.placer.Free(config.UUIDandVersion.UUID)
 	}
 	status.VmConfig.CPUs = nil
 	status.OrderedCPUs = nil
@@ -2345,9 +2326,7 @@ func doCleanup(ctx *domainContext, status *types.DomainStatus) {
 
 	if ctx.cpuPinningSupported {
 		if status.VmConfig.CPUsPinned {
-			if err := ctx.cpuAllocator.Free(status.UUIDandVersion.UUID); err != nil {
-				log.Warnf("Failed to free for %s: %s", status.DisplayName, err)
-			}
+			ctx.placer.Free(status.UUIDandVersion.UUID)
 			triggerCPUNotification()
 		}
 		status.VmConfig.CPUs = nil

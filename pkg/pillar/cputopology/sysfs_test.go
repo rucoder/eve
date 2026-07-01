@@ -324,3 +324,49 @@ func TestReadSysfsCoreInfos_MultiRangeOnline(t *testing.T) {
 		}
 	}
 }
+
+// TestFlatTopology asserts the degraded fallback topology has the requested
+// number of single-thread physical cores and logical CPUs.
+func TestFlatTopology(t *testing.T) {
+	topo := flatTopology(4)
+	if topo == nil {
+		t.Fatal("flatTopology returned nil")
+	}
+	if len(topo.Cores) != 4 {
+		t.Fatalf("expected 4 cores, got %d", len(topo.Cores))
+	}
+	if topo.NumLCPUs != 4 {
+		t.Fatalf("expected 4 LCPUs, got %d", topo.NumLCPUs)
+	}
+	for _, pc := range topo.Cores {
+		if len(pc.Siblings) != 1 {
+			t.Fatalf("expected single-thread core, got siblings %v", pc.Siblings)
+		}
+	}
+}
+
+// TestFlatTopology_MinimumOne guards against a non-positive core count.
+func TestFlatTopology_MinimumOne(t *testing.T) {
+	topo := flatTopology(0)
+	if topo == nil || len(topo.Cores) != 1 {
+		t.Fatalf("expected 1 core fallback, got %+v", topo)
+	}
+}
+
+// TestDiscoverTopology_NeverNil confirms that even when sysfs discovery
+// fails (default root doesn't exist in the test sandbox in some CI setups,
+// but we force it here), DiscoverTopology degrades to a flat topology
+// rather than returning nil.
+func TestDiscoverTopology_NeverNil(t *testing.T) {
+	saved := defaultSysfsRoot
+	defaultSysfsRoot = filepath.Join(t.TempDir(), "does-not-exist")
+	defer func() { defaultSysfsRoot = saved }()
+
+	topo, err := DiscoverTopology()
+	if topo == nil {
+		t.Fatalf("DiscoverTopology returned nil topology (err=%v)", err)
+	}
+	if topo.NumLCPUs == 0 {
+		t.Fatalf("expected NumLCPUs>0, got 0")
+	}
+}

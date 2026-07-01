@@ -209,3 +209,77 @@ func TestAllocate_ParkedSiblingBlocksReuse(t *testing.T) {
 		t.Fatalf("parked sibling must block core reuse -> Insufficient, got %v (%s)", r.Status, r.Message)
 	}
 }
+
+func TestAllocateShared_Basic(t *testing.T) {
+	p := NewPlacer(twoSocketTopo(), 0)
+	got, err := p.AllocateShared(u("legacy"), 3)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("want 3 cpus, got %v err %v", got, err)
+	}
+	if len(p.DedicatedSet()) != 3 {
+		t.Fatalf("shared alloc must be in dedicated set")
+	}
+}
+
+func TestAllocateShared_SkipsReserved(t *testing.T) {
+	p := NewPlacer(twoSocketTopo(), 2) // reserve lcpus 0,1
+	got, _ := p.AllocateShared(u("legacy"), 1)
+	if got[0] < 2 {
+		t.Fatalf("must skip reserved cpus 0,1, got %v", got)
+	}
+}
+
+func TestMixed_NoOverlap_TopologyThenShared(t *testing.T) {
+	p := NewPlacer(twoSocketTopo(), 0)
+	r := p.Allocate(Request{UUID: u("vm1"), NumVCPUs: 4, Mode: ModeWholeCoreSMT, NUMA: NUMALocal})
+	if r.Status != Success {
+		t.Fatal(r.Message)
+	}
+	// collect vm1's cpus
+	vm1 := map[uint32]bool{}
+	for _, c := range p.dedicated[u("vm1")] {
+		vm1[uint32(c)] = true
+	}
+	got, err := p.AllocateShared(u("legacy"), 8)
+	if err != nil {
+		t.Fatalf("legacy alloc should fit remaining cores: %v", err)
+	}
+	for _, c := range got {
+		if vm1[uint32(c)] {
+			t.Fatalf("shared alloc reused topology-dedicated cpu %d", c)
+		}
+	}
+}
+
+func TestMixed_NoOverlap_SharedThenTopology(t *testing.T) {
+	p := NewPlacer(twoSocketTopo(), 0)
+	shared, _ := p.AllocateShared(u("legacy"), 2)
+	sharedSet := map[uint32]bool{}
+	for _, c := range shared {
+		sharedSet[uint32(c)] = true
+	}
+	r := p.Allocate(Request{UUID: u("vm1"), NumVCPUs: 4, Mode: ModeWholeCoreSMT, NUMA: NUMALocal})
+	if r.Status != Success {
+		t.Fatal(r.Message)
+	}
+	for _, c := range r.Assignment.OrderedHostCPUs {
+		if sharedSet[uint32(c)] {
+			t.Fatalf("topology alloc reused shared cpu %d", c)
+		}
+	}
+}
+
+func TestFreeCPUs_ExcludesBoth(t *testing.T) {
+	p := NewPlacer(twoSocketTopo(), 0)                                                            // 16 lcpus total
+	_ = p.Allocate(Request{UUID: u("vm1"), NumVCPUs: 4, Mode: ModeWholeCoreSMT, NUMA: NUMALocal}) // 4 lcpus
+	_, _ = p.AllocateShared(u("legacy"), 2)                                                       // 2 lcpus
+	free := p.FreeCPUs()
+	if len(free) != 16-4-2 {
+		t.Fatalf("FreeCPUs should exclude both allocations: got %d", len(free))
+	}
+	p.Free(u("vm1"))
+	p.Free(u("legacy"))
+	if len(p.FreeCPUs()) != 16 {
+		t.Fatalf("after Free all cpus should be free")
+	}
+}

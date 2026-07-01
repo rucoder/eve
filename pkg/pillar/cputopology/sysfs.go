@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,13 +17,27 @@ import (
 // node topology information.
 var defaultSysfsRoot = "/sys/devices/system"
 
-// DiscoverTopology reads CPU topology from sysfs and builds the model.
+// DiscoverTopology reads CPU topology from sysfs; on failure it degrades to a
+// flat single-thread-per-core topology so callers always get a usable model.
 func DiscoverTopology() (*Topology, error) {
 	infos, err := readSysfsCoreInfos(defaultSysfsRoot)
-	if err != nil {
-		return nil, err
+	if err != nil || len(infos) == 0 {
+		return flatTopology(runtime.NumCPU()), err
 	}
 	return BuildTopology(infos), nil
+}
+
+// flatTopology builds a degraded topology of n single-thread physical
+// cores, all on socket 0 / NUMA node 0. Used when sysfs discovery fails.
+func flatTopology(n int) *Topology {
+	if n < 1 {
+		n = 1
+	}
+	infos := make([]CoreInfo, n)
+	for i := 0; i < n; i++ {
+		infos[i] = CoreInfo{LCore: uint(i), Socket: 0, CoreID: uint(i), NUMA: 0, L3ID: 0}
+	}
+	return BuildTopology(infos)
 }
 
 // readSysfsCoreInfos reads per-logical-CPU topology coordinates from a
