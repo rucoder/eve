@@ -7,8 +7,7 @@
 image: eve-fw
 org: lfedge
 tag: "{{.Hash}}-generic-k"
-# Installing the Ubuntu firmware/microcode via apt needs network during the build.
-network: true
+network: false
 buildArgs:
   - PLATFORM=generic
   - FW_SOURCE=ubuntu
