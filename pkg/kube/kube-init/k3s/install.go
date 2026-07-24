@@ -47,6 +47,15 @@ var loadBearingBinaries = map[string]struct{}{
 	"crictl":  {},
 }
 
+// k3sSubcommands are the multi-call subcommands reached via a basename
+// symlink next to the k3s binary (k3s dispatches on argv[0]). The
+// upstream k3s install.sh creates these; kube-init installs only the
+// bare k3s binary, so it must create them itself — otherwise only
+// /usr/bin/k3s exists after symlinkAllBinaries and every standalone
+// `kubectl`/`ctr`/`crictl` invocation (eden tests, `eve exec kube
+// kubectl`, interactive debugging) fails with "No such file".
+var k3sSubcommands = []string{"kubectl", "ctr", "crictl"}
+
 // EnsureInstalled makes sure the k3s binary is unpacked and every
 // runtime symlink kube-init relies on is in place. Idempotent and
 // safe to call on every boot.
@@ -147,6 +156,9 @@ func rebuildRuntimeSymlinks() error {
 
 // rebuildRuntimeSymlinksAt is the path-parameterised seam.
 func rebuildRuntimeSymlinksAt(binDir, usrBinDir, dataBinDir string) error {
+	if err := ensureK3sSubcommandLinks(binDir); err != nil {
+		return fmt.Errorf("k3s subcommand links in %s: %w", binDir, err)
+	}
 	if err := symlinkAllBinaries(binDir, usrBinDir); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", binDir, usrBinDir, err)
 	}
@@ -263,6 +275,21 @@ func symlinkAllBinaries(srcDir, dstDir string) error {
 				continue
 			}
 			log.Printf("warning: symlink %s -> %s: %v", dst, src, err)
+		}
+	}
+	return joined
+}
+
+// ensureK3sSubcommandLinks creates the kubectl/ctr/crictl -> k3s
+// multi-call symlinks inside binDir so symlinkAllBinaries can then
+// propagate them into /usr/bin. The target is the relative name "k3s"
+// so the links stay valid wherever binDir is mounted. Failures are
+// aggregated and returned because these names are load-bearing.
+func ensureK3sSubcommandLinks(binDir string) error {
+	var joined error
+	for _, name := range k3sSubcommands {
+		if err := ensureSymlink("k3s", filepath.Join(binDir, name)); err != nil {
+			joined = errors.Join(joined, fmt.Errorf("link %s -> k3s: %w", name, err))
 		}
 	}
 	return joined

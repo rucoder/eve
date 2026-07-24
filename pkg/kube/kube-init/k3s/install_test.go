@@ -161,6 +161,48 @@ func TestSymlinkAllBinaries(t *testing.T) {
 	}
 }
 
+// TestEnsureK3sSubcommandLinks reproduces the production condition
+// (only the bare k3s binary installed) and asserts the kubectl/ctr/
+// crictl multi-call links get created, then propagate to /usr/bin via
+// symlinkAllBinaries. Before the fix, only /usr/bin/k3s appeared.
+func TestEnsureK3sSubcommandLinks(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "k3s"), []byte("bin"), 0755); err != nil {
+		t.Fatalf("seed k3s: %v", err)
+	}
+
+	if err := ensureK3sSubcommandLinks(binDir); err != nil {
+		t.Fatalf("ensureK3sSubcommandLinks: %v", err)
+	}
+	for _, name := range []string{"kubectl", "ctr", "crictl"} {
+		target, err := os.Readlink(filepath.Join(binDir, name))
+		if err != nil {
+			t.Errorf("readlink %s: %v", name, err)
+			continue
+		}
+		if target != "k3s" {
+			t.Errorf("link %s -> %s, want k3s", name, target)
+		}
+	}
+
+	// Idempotent on a second pass.
+	if err := ensureK3sSubcommandLinks(binDir); err != nil {
+		t.Fatalf("ensureK3sSubcommandLinks (second pass): %v", err)
+	}
+
+	// Composed with the propagation step, /usr/bin ends up with all
+	// four names though only k3s was installed.
+	usrBin := t.TempDir()
+	if err := symlinkAllBinaries(binDir, usrBin); err != nil {
+		t.Fatalf("symlinkAllBinaries: %v", err)
+	}
+	for _, name := range []string{"k3s", "kubectl", "ctr", "crictl"} {
+		if _, err := os.Lstat(filepath.Join(usrBin, name)); err != nil {
+			t.Errorf("/usr/bin/%s missing: %v", name, err)
+		}
+	}
+}
+
 func TestSymlinkAllBinariesMissingSource(t *testing.T) {
 	err := symlinkAllBinaries("/nonexistent/"+t.Name(), t.TempDir())
 	if err == nil {
