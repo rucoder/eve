@@ -19,13 +19,37 @@
 # hadolint ignore=DL3029
 FROM --platform=linux/amd64 ghcr.io/k8snetworkplumbingwg/sriov-cni@sha256:fce504e683275ab59215065ddf6433ca80d1b4b53f0d4b0cdf037da6701c7cb4 AS sriov-cni-bin
 
-FROM lfedge/eve-alpine:d075dd224fa7a7540817d224cc28d3cd998ad04c AS build
+FROM lfedge/eve-alpine:50ced2233a6937511c76aa320dfea7ac712aba8d AS build
 
 ARG TARGETARCH
 ENV PKGS="alpine-baselayout musl-utils iproute2 iptables curl openrc \
          open-iscsi libvirt libvirt-client util-linux grep findutils jq \
-         cni-plugins nfs-utils inotify-tools sqlite"
+         cni-plugins nfs-utils inotify-tools erofs-utils sqlite"
+# Build-stage-only deps (installed into the build root, not /out) for
+# compiling patched erofs-utils from source below.
+ENV BUILD_PKGS="build-base autoconf automake libtool pkgconf lz4-dev \
+         zlib-dev xz-dev util-linux-dev git"
 RUN eve-alpine-deploy.sh
+
+# Alpine 3.22 ships erofs-utils 1.8.6, whose mkfs.erofs --tar mangles
+# usr-merge base layers (files under a symlinked dir like lib64 -> usr/lib64)
+# into a bogus ~2TiB image and fails. Build 1.9.2 + our symlink-traversal fix
+# from source and install it over the apk binary; the erofs snapshotter's
+# differ execs mkfs.erofs at containerd startup, so it must be the runtime
+# one. Source via ADD (BuildKit fetches it out-of-band, no build-sandbox
+# network); toolchain + lz4-dev come from the eve-alpine mirror. erofs-utils
+# stays in PKGS above only for the runtime libs (liblz4/libuuid/libz).
+ADD https://github.com/erofs/erofs-utils.git#v1.9.2 /erofs-src
+COPY 0001-erofs-utils-lib-follow-symlinks-on-intermediate-tar-.patch /erofs-src/
+RUN cd /erofs-src && \
+    git apply 0001-erofs-utils-lib-follow-symlinks-on-intermediate-tar-.patch && \
+    ./autogen.sh && ./configure --enable-lz4 && make -j"$(nproc)" && \
+    dst="$(find /out -name mkfs.erofs | head -1)" && \
+    install -m0755 mkfs/mkfs.erofs "${dst:-/out/usr/sbin/mkfs.erofs}" && \
+    "${dst:-/out/usr/sbin/mkfs.erofs}" --version
+# Reflect the patched build in the SBOM (apk-recorded erofs-utils is 1.8.6).
+RUN register-sbom-pkg.sh -n erofs-utils-patched -v 1.9.2 \
+        -l GPL-2.0-or-later -u https://github.com/erofs/erofs-utils
 
 ENV ETCDCTL_VERSION=v3.5.5
 ADD https://github.com/etcd-io/etcd/releases/download/${ETCDCTL_VERSION}/etcd-${ETCDCTL_VERSION}-linux-${TARGETARCH}.tar.gz /tmp/etcd.tar.gz
@@ -98,7 +122,11 @@ COPY cfg-manifests/04-multinode-watch-cache.yaml /etc/kube/
 COPY multus-daemonset.yaml /etc
 COPY kubevirt-operator.yaml /etc
 COPY kubevirt-features.yaml /etc
-COPY external-boot-image.tar /etc/
+
+# external-boot-image no longer lives in the kube container; it is
+# now part of the pkg/kube-images composefs payload (see
+# .claude/design/kube-images-composefs.md). kube-init reads it via
+# the same catalog that carries the upstream images.
 
 # Longhorn config
 COPY lh-cfg-v1.9.1.yaml /etc/
