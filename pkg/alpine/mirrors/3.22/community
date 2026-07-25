@@ -3,6 +3,7 @@ bcc-dev
 capstone
 cereal
 cni-plugins
+erofs-utils
 fio
 fuse
 hwinfo
