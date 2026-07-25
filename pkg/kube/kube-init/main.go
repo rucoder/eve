@@ -399,6 +399,7 @@ type daemon struct {
 
 	// FSM state.
 	state          State
+	stateEnteredAt time.Time // when the current state was entered, for phase timing
 	phase          Phase
 	pendingRestart *restartReason // queued restart reason, or nil
 	lastError      error          // last error, surfaced via status socket
@@ -1118,7 +1119,17 @@ func (d *daemon) transition(ctx context.Context, newState State, reason string) 
 		d.stopBackoffTimer()
 	}
 
-	log.Printf("%s → %s (reason: %s)", oldState, newState, reason)
+	// Phase timing: report how long the state we're leaving took. Skips
+	// the very first transition (stateEnteredAt still zero) so we don't
+	// print a bogus since-epoch duration for the initial state.
+	now := time.Now()
+	if !d.stateEnteredAt.IsZero() {
+		log.Printf("%s → %s (reason: %s) [%s took %s]", oldState, newState, reason,
+			oldState, now.Sub(d.stateEnteredAt).Truncate(time.Millisecond))
+	} else {
+		log.Printf("%s → %s (reason: %s)", oldState, newState, reason)
+	}
+	d.stateEnteredAt = now
 	d.state = newState
 	d.enterStateFn(ctx)
 }
