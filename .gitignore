@@ -22,7 +22,6 @@ conf/grub.cfg
 conf/device.cert.pem
 conf/device.key.pem
 conf/soft_serial
-pkg/kube/external-boot-image.tar
 pkg/eve/Dockerfile
 pkg/external-boot-image/Dockerfile
 pkg/external-boot-image/*.tar
@@ -35,3 +34,10 @@ pkg/installer/vendor/winapi-*/lib
 pkg/installer/vendor/windows-sys*/src/Windows/
 pkg/monitor/eve-monitor-rs
 pkg/pillar/lk-build-arg-COVER
+
+# kube-images build context: external-boot-image.tar, exported from the
+# linuxkit cache by the pkg/kube-images/external-boot-image.tar rule and
+# fed into pkg/kube-images's Dockerfile build stage via skopeo
+# docker-archive:, then discarded with the builder layer. Never committed.
+pkg/kube-images/*.tar
+__pycache__/

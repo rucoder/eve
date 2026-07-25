@@ -121,8 +121,9 @@ TAGPLAT=$(if $(filter-out generic,$(PLATFORM)),$(PLATFORM))
 # set this to the current tag only if we are building from a tag
 ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(REPO_DIRTY_TAG)$(DEV_TAG),$(REPO_TAG))
 
-#if KERNEL_TAG is set, append it to the ROOTFS_VERSION but replace docker.io/lfedge/eve-kernel:eve-kernel- part with k-
-SHORT_KERNEL_TAG=$(subst docker.io/lfedge/eve-kernel:eve-kernel-,k-,$(KERNEL_TAG))
+# KERNEL_TAG -> k-<arch>-<ver>...; registry-agnostic (subst ':'->'/'
+# so notdir drops any registry/repo prefix, incl. non-lfedge orgs).
+SHORT_KERNEL_TAG=$(subst eve-kernel-,k-,$(notdir $(subst :,/,$(KERNEL_TAG))))
 ROOTFS_VERSION:=$(if $(SHORT_KERNEL_TAG),$(ROOTFS_VERSION)-$(SHORT_KERNEL_TAG),$(ROOTFS_VERSION))
 
 # For non-generic platforms, include the variant to the rootfs version
@@ -412,6 +413,34 @@ lk-extra-opt/%: FORCE
 RESCAN_DEPS=FORCE $(LK_POSSIBLE_BUILD_ARG_TARGETS)
 # set FORCE_BUILD to --force to enforce rebuild
 FORCE_BUILD=
+
+# Packages that always need linuxkit --force. A package belongs
+# here when material content baked into the resulting image is NOT
+# covered by `linuxkit pkg show-tag`'s git-tracked-files hash — either
+# because it comes from a gitignored file in the build context, or
+# because it's fetched over the network from a ref that isn't
+# digest-pinned (so the same tracked ref can resolve to different
+# bytes between builds). In that state linuxkit's cache "lies": it
+# finds the tag in cache and serves the stale image, even though the
+# runtime content has changed.
+#
+# Current entries:
+#   external-boot-image — bakes runx-initrd (XENTOOLS_TAG) and the
+#                         kernel (KERNEL_TAG) via Dockerfile.in
+#                         placeholder substitution. Bumping either
+#                         doesn't invalidate the tag hash.
+#   kube-images         — folds in the gitignored external-boot-image.tar
+#                         AND skopeo-pulls upstream refs that aren't
+#                         digest-pinned into the erofs payload; neither
+#                         is covered by the tag hash.
+#
+# The list-driven mechanism below is used INSTEAD of the
+# target-specific `pkg/foo: FORCE_BUILD := --force` pattern —
+# that pattern silently propagates --force to every prerequisite
+# (alpine-base, alpine, uefi, xen-tools, ...) via GNU Make's
+# target-specific-variable inheritance, which was the source of
+# the "why is alpine-base rebuilding every time" symptom.
+LINUXKIT_FORCE_PKGS := external-boot-image kube-images
 
 # ROOTFS_DEPS enforces the scan of all rootfs image dependencies
 ifdef ROOTFS_DEPS
@@ -984,35 +1013,77 @@ pkgs: $(LINUXKIT) $(PKGS) $(LK_POSSIBLE_BUILD_ARG_TARGETS)
 pkg/kernel:
 	$(QUIET): $@: No-op pkg/kernel
 
-# external-boot-image's runtime contents (runx-initrd from XENTOOLS_TAG, kernel
-# from KERNEL_TAG) are baked in at build time via Dockerfile.in placeholder
-# substitution. `linuxkit pkg show-tag` only hashes git-tracked files under
-# pkg/external-boot-image/ — Dockerfile.in and build.yml — neither of which
-# changes when xen-tools or the kernel does. So the package tag is git-stable
-# but runtime-content-variable; without --force, linuxkit's "skip if tag is
-# already in cache/registry" behavior serves a stale runx-initrd whenever
-# xen-tools changes (e.g. an init-initrd edit produces a new xen-tools tag but
-# the same external-boot-image tag, so the cached external-boot-image wins).
-# Force a rebuild via the target-specific FORCE_BUILD; Make propagates it to
-# the eve-external-boot-image prerequisite that actually runs `linuxkit pkg`.
-pkg/external-boot-image: FORCE_BUILD := --force
+# external-boot-image's --force is handled via LINUXKIT_FORCE_PKGS
+# at the top of this file. Rationale for --force is documented
+# there. See also .claude/design/kube-images-composefs.md for the
+# kube-images entry (same trap, one layer up).
 
-# Same trap as pkg/external-boot-image, one level up: pkg/kube bundles
-# pkg/kube/external-boot-image.tar (a generated artifact, gitignored — see
-# /.gitignore:25), so changes to that .tar don't change linuxkit's content
-# hash for pkg/kube. Without --force, `linuxkit pkg build pkg/kube` finds the
-# existing kube image in cache and skips — keeping the OLD external-boot-image.tar
-# baked in, which the rootfs then ships to the device as /etc/external-boot-image.tar.
-pkg/kube: FORCE_BUILD := --force
+# external-boot-image is consumed by pkg/kube-images (folded into the
+# erofs payload) rather than baked into pkg/kube itself. The tar is
+# produced in pkg/kube-images/ and read from there by its Dockerfile
+# via skopeo's docker-archive: transport.
+# See .claude/design/kube-images-composefs.md.
 
-pkg/kube/external-boot-image.tar: pkg/external-boot-image
+pkg/kube-images/external-boot-image.tar: pkg/external-boot-image
 	$(eval BOOT_IMAGE_TAG := $(shell $(LINUXKIT) pkg show-tag --canonical pkg/external-boot-image))
 	$(eval CACHE_CONTENT := $(shell $(LINUXKIT) cache ls 2>&1))
 	$(if $(filter $(BOOT_IMAGE_TAG),$(CACHE_CONTENT)),,$(LINUXKIT) cache pull $(BOOT_IMAGE_TAG))
-	$(MAKE) cache-export IMAGE=$(BOOT_IMAGE_TAG) OUTFILE=pkg/kube/external-boot-image.tar
+	$(MAKE) cache-export IMAGE=$(BOOT_IMAGE_TAG) OUTFILE=pkg/kube-images/external-boot-image.tar
 	rm -f pkg/external-boot-image/Dockerfile
-pkg/kube: pkg/kube/external-boot-image.tar eve-kube
-	$(QUIET): $@: Succeeded
+
+# pkg/kube-images's Dockerfile expects external-boot-image.tar in its
+# build context. Declaring the dep here means `make pkg/kube-images`
+# — and therefore `make pkgs` / `make live` — produces the tar before
+# linuxkit pkg build tries to COPY it. See
+# .claude/design/kube-images-composefs.md.
+pkg/kube-images: pkg/kube-images/external-boot-image.tar
+
+# TODO(kube-images matrix): pkg/kube-images's LAYER_FORMAT /
+# EROFS_COMPRESSION Dockerfile ARGs (default uncompressed+lz4hc) aren't
+# selectable from make — the tree's build-arg mechanism (lk-extra-opt/%)
+# only passes boolean "VAR=y" flags, not arbitrary values. Non-default
+# combos need a direct --build-arg; left at the intended default build.
+
+# Auto-derived catalog. Regenerated from the YAMLs / Go consts that
+# already pin the versions the running cluster consumes, so bumping
+# a KubeVirt / Longhorn / Multus / kube-vip / CDI version in the
+# manifest that actually deploys the pod is a one-file edit — the
+# JSON follows automatically. Committed for reviewability of the
+# resulting diff; kube-images-catalog-check re-derives and fails on
+# drift in CI.
+KUBE_IMAGES_CATALOG_INPUTS := \
+    pkg/kube/kubevirt-operator.yaml \
+    pkg/kube/multus-daemonset.yaml \
+    pkg/kube/kubevip-ds.yaml \
+    pkg/kube/kubevip-sa.yaml \
+    pkg/kube/kube-init/components/components.go \
+    pkg/kube/kube-init/versions/versions.go \
+    tools/kube-images-catalog-gen.py \
+    $(wildcard pkg/kube/lh-cfg-v*.yaml)
+
+pkg/kube-images/upstream-images.list: $(KUBE_IMAGES_CATALOG_INPUTS)
+	# Unique temp per shell: this Makefile sets -j unconditionally (see
+	# MAKEFLAGS above) and recursive sub-makes each resolve this target
+	# on their own, so two can run the rule at once. With a shared
+	# $@.tmp the first mv consumes it and the second fails with
+	# "cannot stat".
+	./tools/kube-images-catalog-gen.py > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
+
+pkg/kube-images: pkg/kube-images/upstream-images.list
+
+## Fail if pkg/kube-images/upstream-images.list drifts from what
+## tools/kube-images-catalog-gen.py would derive today. Intended for CI.
+.PHONY: kube-images-catalog-check
+kube-images-catalog-check:
+	@tmp=$$(mktemp) && trap "rm -f $$tmp" EXIT && \
+	./tools/kube-images-catalog-gen.py > $$tmp && \
+	if diff -u pkg/kube-images/upstream-images.list $$tmp; then \
+	    echo "pkg/kube-images/upstream-images.list is in sync with sources"; \
+	else \
+	    echo "ERROR: catalog list is stale;" >&2; \
+	    echo "       regenerate with: rm -f pkg/kube-images/upstream-images.list && make pkg/kube-images/upstream-images.list" >&2; \
+	    exit 1; \
+	fi
 pkg/%: eve-% FORCE
 	$(QUIET): $@: Succeeded
 
@@ -1283,7 +1354,8 @@ eve-%: pkg/%/Dockerfile $(LINUXKIT) $(RESCAN_DEPS)
 	$(eval LINUXKIT_DOCKER_LOAD := $(if $(filter $(PKGS_DOCKER_LOAD),$*),--docker,))
 	$(eval LINUXKIT_BUILD_PLATFORMS_LIST := $(call uniq,linux/$(ZARCH) $(if $(filter $(PKGS_HOSTARCH),$*),linux/$(HOSTARCH),)))
 	$(eval LINUXKIT_BUILD_PLATFORMS := --platforms $(subst $(space),$(comma),$(strip $(LINUXKIT_BUILD_PLATFORMS_LIST))))
-	$(eval LINUXKIT_FLAGS := $(if $(filter manifest,$(LINUXKIT_PKG_TARGET)),,$(FORCE_BUILD) $(LINUXKIT_DOCKER_LOAD) $(LINUXKIT_BUILD_PLATFORMS)))
+	$(eval LINUXKIT_FORCE := $(if $(filter $*,$(LINUXKIT_FORCE_PKGS)),--force,))
+	$(eval LINUXKIT_FLAGS := $(if $(filter manifest,$(LINUXKIT_PKG_TARGET)),,$(FORCE_BUILD) $(LINUXKIT_FORCE) $(LINUXKIT_DOCKER_LOAD) $(LINUXKIT_BUILD_PLATFORMS)))
 	$(QUIET)$(LINUXKIT) $(DASH_V) pkg $(LINUXKIT_PKG_TARGET) $(LINUXKIT_OPTS) $(LINUXKIT_EXTRA_BUILD_ARGS) $(LINUXKIT_FLAGS) --build-yml $(call get_pkg_build_yml,$*) pkg/$*
 	$(QUIET)if [ -n "$(PRUNE)" ]; then \
 		flock $(PARALLEL_BUILD_LOCK) docker image prune -f; \
