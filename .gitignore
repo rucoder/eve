@@ -35,3 +35,11 @@ pkg/installer/vendor/winapi-*/lib
 pkg/installer/vendor/windows-sys*/src/Windows/
 pkg/monitor/eve-monitor-rs
 pkg/pillar/lk-build-arg-COVER
+
+# kube-images build context: intermediate .tar files produced by
+# `linuxkit cache export` for EVE-authored images (source=linuxkit-cache
+# entries in upstream-images-sync.yaml). Fed into pkg/kube-images's
+# Dockerfile build stage via skopeo docker-archive:, then discarded
+# with the builder layer. Never committed.
+pkg/kube-images/*.tar
+__pycache__/
