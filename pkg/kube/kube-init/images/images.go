@@ -1,344 +1,166 @@
 // Copyright (c) 2026 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package images imports pre-packaged container image tarballs into
-// the user-side containerd that k3s' kubelet consumes. Two flavours:
+// Package images makes the pre-packaged container images available to
+// the k3s user-containerd that kubelet consumes, without a first-boot
+// network pull and without copying gigabytes of layer blobs onto
+// /persist.
 //
-//   - The EVE-authored external-boot-image, which gets re-tagged to
-//     match the running EVE release so KubeVirt can reference a
-//     stable image:tag across upgrades.
-//   - The catalog of upstream component images (KubeVirt, CDI,
-//     Longhorn, Multus, SUC, etc.) shipped as exported tarballs at
-//     their pinned versions. Importing locally avoids first-boot
-//     internet pulls.
+// The images ship as a single self-contained EROFS image
+// (kube-images.erofs) holding a standard OCI image layout of every
+// pre-packaged image (the upstream images plus the EVE-authored
+// external-boot-image folded in at build time). The linuxkit rootfs
+// binds the eve-kube-images volume at /images inside the kube
+// container (images/modifiers/hv/k.yq), so kube-init sees
+// /images/kube-images.erofs. At the IMPORTING phase kube-init:
 //
-// All imports are idempotent and best-effort: a missing tarball or
-// failed import is logged and the daemon continues. kubelet falls
-// back to its default pull behaviour for any image we couldn't pre-
-// load.
+//  1. mounts the file read-only at its mount dir (plain
+//     `mount -t erofs`, no loop device — CONFIG_EROFS_FS_BACKED_BY_FILE),
+//     exposing the OCI layout (index.json, oci-layout, blobs/sha256/*);
+//  2. stages the read-only blobs into containerd's content store by
+//     symlink, so registering the images writes metadata only — the
+//     blob bytes are never copied to /persist;
+//  3. registers the layout directly against the containerd content and
+//     image services (registerLayout), renaming each image from its
+//     build-time-sanitised OCI ref to the real registry ref kubelet's
+//     pod specs reference (and the external-boot-image to the running
+//     EVE release) — no intermediate `ctr images import` tar stream.
 package images
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
-	"github.com/lf-edge/eve/pkg/kube/kube-init/versions"
 )
 
 const (
-	// ExternalBootImageTar is the on-disk path of the EVE-authored
-	// external-boot-image tarball. KubeVirt's virt-handler downloads
-	// the kernel/initrd from this image to boot guest VMs.
-	ExternalBootImageTar = "/etc/external-boot-image.tar"
+	// KubeImagesErofs is the EROFS image bound in by the linuxkit
+	// rootfs (kube-images:/images:ro). It contains an OCI image
+	// layout of every pre-packaged image.
+	KubeImagesErofs = "/images/kube-images.erofs"
 
-	// ExternalBootImageName is the fully-qualified image name
-	// kubelet pod specs reference (re-tagged to the running EVE
-	// release at import time).
+	// KubeImagesMount is where KubeImagesErofs is mounted read-only.
+	// After the mount this directory is a browsable OCI image layout.
+	KubeImagesMount = "/run/kube-images"
+
+	// ExternalBootImageName is the fully-qualified image name kubelet
+	// pod specs reference; the tag is the running EVE release.
 	ExternalBootImageName = "docker.io/lfedge/eve-external-boot-image"
+
+	// contentStoreBlobs is the digest dir of the user-containerd
+	// content store (root from pkg/kube/config-k3s.toml).
+	contentStoreBlobs = "/persist/vault/containerd/io.containerd.content.v1.content/blobs/sha256"
+
+	// catalogInErofs is the real-ref list shipped inside the layout.
+	catalogInErofs = KubeImagesMount + "/upstream-images.list"
 )
 
-// UpstreamImage describes one pre-packaged upstream image tarball.
-//
-// Coupling rules: every entry in UpstreamImages must have a matching
-// Makefile .tar rule (see upstream-image-tar-rule) and the same
-// image:tag must also appear in whichever YAML manifest / Helm
-// values / operator default actually references it from a pod spec.
-// A version bump is a three-site change in one commit.
-type UpstreamImage struct {
-	// Tarball is the on-disk path of the exported tarball (mounted
-	// read-only from the eve-kube-images volume into /images/).
-	Tarball string
-	// Name is the fully-qualified image name (registry/repo) that
-	// kubelet's pod spec references — without the :<tag> suffix.
-	Name string
-	// Tag is the pinned image version. Together with Name this forms
-	// the :<tag> suffix that kubelet will resolve.
-	Tag string
-}
-
-// FullRef returns "Name:Tag" — the form kubelet + ctr expect.
-func (u UpstreamImage) FullRef() string {
-	return u.Name + ":" + u.Tag
-}
-
-// UpstreamImages is the full catalog of pre-packaged upstream images
-// walked by ImportAll at first boot. Kept as a flat slice so adding
-// a new image is a one-line change; failures are per-image warnings,
-// not fatal.
-var UpstreamImages = []UpstreamImage{
-	// k3s-stack controllers.
-	{Tarball: "/images/system-upgrade-controller.tar", Name: "docker.io/rancher/system-upgrade-controller", Tag: versions.SystemUpgradeController},
-	{Tarball: "/images/descheduler.tar", Name: "registry.k8s.io/descheduler/descheduler", Tag: versions.Descheduler},
-
-	// CNI multiplexer.
-	{Tarball: "/images/multus-cni.tar", Name: "ghcr.io/k8snetworkplumbingwg/multus-cni", Tag: versions.Multus},
-
-	// alpine — SUC Plan's upgrade-container image. Tiny (~8 MB);
-	// the local copy saves a pull round-trip per upgrade Plan.
-	{Tarball: "/images/alpine.tar", Name: "docker.io/library/alpine", Tag: versions.Alpine},
-
-	// KubeVirt (5 images — operator + the 4 pods it spawns).
-	{Tarball: "/images/virt-operator.tar", Name: "quay.io/kubevirt/virt-operator", Tag: versions.KubeVirt},
-	{Tarball: "/images/virt-api.tar", Name: "quay.io/kubevirt/virt-api", Tag: versions.KubeVirt},
-	{Tarball: "/images/virt-controller.tar", Name: "quay.io/kubevirt/virt-controller", Tag: versions.KubeVirt},
-	{Tarball: "/images/virt-handler.tar", Name: "quay.io/kubevirt/virt-handler", Tag: versions.KubeVirt},
-	{Tarball: "/images/virt-launcher.tar", Name: "quay.io/kubevirt/virt-launcher", Tag: versions.KubeVirt},
-
-	// CDI (7 images — operator + the 6 pods it spawns).
-	{Tarball: "/images/cdi-operator.tar", Name: "quay.io/kubevirt/cdi-operator", Tag: versions.CDI},
-	{Tarball: "/images/cdi-apiserver.tar", Name: "quay.io/kubevirt/cdi-apiserver", Tag: versions.CDI},
-	{Tarball: "/images/cdi-controller.tar", Name: "quay.io/kubevirt/cdi-controller", Tag: versions.CDI},
-	{Tarball: "/images/cdi-importer.tar", Name: "quay.io/kubevirt/cdi-importer", Tag: versions.CDI},
-	{Tarball: "/images/cdi-cloner.tar", Name: "quay.io/kubevirt/cdi-cloner", Tag: versions.CDI},
-	{Tarball: "/images/cdi-uploadproxy.tar", Name: "quay.io/kubevirt/cdi-uploadproxy", Tag: versions.CDI},
-	{Tarball: "/images/cdi-uploadserver.tar", Name: "quay.io/kubevirt/cdi-uploadserver", Tag: versions.CDI},
-
-	// Longhorn + CSI sidecars (13 images).
-	{Tarball: "/images/longhorn-manager.tar", Name: "docker.io/longhornio/longhorn-manager", Tag: versions.Longhorn},
-	{Tarball: "/images/longhorn-engine.tar", Name: "docker.io/longhornio/longhorn-engine", Tag: versions.Longhorn},
-	{Tarball: "/images/longhorn-instance-manager.tar", Name: "docker.io/longhornio/longhorn-instance-manager", Tag: versions.Longhorn},
-	{Tarball: "/images/longhorn-share-manager.tar", Name: "docker.io/longhornio/longhorn-share-manager", Tag: versions.Longhorn},
-	{Tarball: "/images/longhorn-ui.tar", Name: "docker.io/longhornio/longhorn-ui", Tag: versions.Longhorn},
-	{Tarball: "/images/backing-image-manager.tar", Name: "docker.io/longhornio/backing-image-manager", Tag: versions.Longhorn},
-	{Tarball: "/images/support-bundle-kit.tar", Name: "docker.io/longhornio/support-bundle-kit", Tag: versions.SupportBundleKit},
-	{Tarball: "/images/csi-attacher.tar", Name: "docker.io/longhornio/csi-attacher", Tag: versions.CSIAttacher},
-	{Tarball: "/images/csi-provisioner.tar", Name: "docker.io/longhornio/csi-provisioner", Tag: versions.CSIProvisioner},
-	{Tarball: "/images/csi-node-driver-registrar.tar", Name: "docker.io/longhornio/csi-node-driver-registrar", Tag: versions.CSINodeDriverRegistrar},
-	{Tarball: "/images/csi-resizer.tar", Name: "docker.io/longhornio/csi-resizer", Tag: versions.CSIResizer},
-	{Tarball: "/images/csi-snapshotter.tar", Name: "docker.io/longhornio/csi-snapshotter", Tag: versions.CSISnapshotter},
-	{Tarball: "/images/livenessprobe.tar", Name: "docker.io/longhornio/livenessprobe", Tag: versions.CSILivenessProbe},
-}
-
-// ImportAll orchestrates the per-boot image import phase: the EVE
-// external-boot-image (only when KubeVirt is enabled) plus the full
-// UpstreamImages catalog.
-//
-// Per-image failures are logged as warnings and not propagated:
-// kubelet's pull-on-first-use behaviour is the fall-back contract.
-// Returns nil unconditionally for the same reason — a "fatal" image
-// import would block kube-init's progression on a transient I/O
-// hiccup that kubelet would have recovered from anyway.
+// ImportAll makes the pre-packaged images available to the k3s user
+// containerd with no blob copy to /persist. Best-effort: any failure
+// logs and returns nil, leaving kubelet's network pull as the fallback.
 func ImportAll(ctx context.Context, eveRelease string, installKubevirt bool) error {
 	log.Printf("importing images (release=%s, kubevirt=%v)", eveRelease, installKubevirt)
 
-	// Open one containerd client for the whole batch; dozens of
-	// per-image dials against the same socket were pure overhead.
-	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
-	if err != nil {
-		log.Printf("WARNING: containerd client: %v (skipping image import phase)", err)
+	if err := EnsureMounted(); err != nil {
+		log.Printf("WARNING: mount kube-images: %v; kubelet will pull upstream", err)
 		return nil
 	}
-	defer cc.Close()
-
+	// Blobs are staged per-blob just before each WriteBlob (in registerLayout),
+	// so containerd's GC can't reap a pre-staged, not-yet-referenced symlink
+	// before registration reaches it.
+	externalBootRef := ""
 	if installKubevirt {
-		if err := importExternalBootImageWith(ctx, cc, eveRelease); err != nil {
-			log.Printf("WARNING: external-boot-image import failed: %v", err)
-		}
+		externalBootRef = ExternalBootImageName + ":" + eveRelease
 	}
-
-	for _, img := range UpstreamImages {
-		if err := importUpstreamImageWith(ctx, cc, img.Tarball, img.Name, img.Tag); err != nil {
-			log.Printf("WARNING: %s import failed: %v", img.FullRef(), err)
-		}
+	if err := registerLayout(ctx, state.ContainerdSocket, KubeImagesMount, catalogInErofs, externalBootRef); err != nil {
+		log.Printf("WARNING: register kube-images: %v", err)
 	}
-
 	log.Printf("image import phase complete")
 	return nil
 }
 
-// ImportUpstreamImage imports a single upstream-tarball entry from
-// the UpstreamImages catalog. Unlike EVE-authored images, upstream
-// tarballs already carry the exact <imageName>:<tag> kubelet expects
-// — there is no re-tag step.
-//
-// Idempotent: if the image is already present in containerd, this
-// is a no-op. If the tarball is missing (minimal builds may omit
-// some images), the function logs and returns nil — kubelet will
-// pull the image from its registry on first use.
-func ImportUpstreamImage(ctx context.Context, tarball, imageName, tag string) error {
-	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
-	if err != nil {
-		return fmt.Errorf("containerd client: %w", err)
-	}
-	defer cc.Close()
-	return importUpstreamImageWith(ctx, cc, tarball, imageName, tag)
+// EnsureMounted (re-)mounts the kube-images EROFS payload read-only at
+// KubeImagesMount. It MUST run on every boot, not just first boot:
+// registerLayout stages each content-store blob as a symlink into
+// KubeImagesMount, which lives on tmpfs (/run) and so vanishes across
+// reboot. The registration metadata (and the symlinks) persist in the
+// vault, but their target disappears — so unless this mount is
+// re-established, every content-store blob dangles and any fresh unpack
+// fails with "blob not found" (ImagePullBackOff). Idempotent: a no-op
+// if already mounted, so first boot's ImportAll and every subsequent
+// boot can both call it.
+func EnsureMounted() error {
+	return mountErofs(KubeImagesErofs, KubeImagesMount)
 }
 
-// importUpstreamImageWith is the per-image body of ImportUpstreamImage
-// against a caller-owned containerd client. ImportAll uses this
-// directly so the whole batch shares one dial.
-func importUpstreamImageWith(ctx context.Context, cc *kubectlx.ContainerdClient,
-	tarball, imageName, tag string,
-) error {
-	fullRef := imageName + ":" + tag
-	exists, err := cc.ImageExists(ctx, fullRef)
-	if err != nil {
-		log.Printf("warning: image existence check %s failed: %v", fullRef, err)
+// mountErofs mounts the EROFS payload at erofs read-only at mountDir.
+// Idempotent: a no-op if already mounted. Uses a plain `mount -t erofs`
+// — with CONFIG_EROFS_FS_BACKED_BY_FILE the file is mounted directly,
+// no loop device.
+func mountErofs(erofs, mountDir string) error {
+	if _, err := os.Stat(erofs); err != nil {
+		return fmt.Errorf("stat %s: %w", erofs, err)
 	}
-	if exists {
+	if mounted, err := isMounted(mountDir); err != nil {
+		return err
+	} else if mounted {
 		return nil
 	}
-	if _, err := os.Stat(tarball); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			log.Printf("upstream image tarball %s not found, skipping (will pull on first use)",
-				tarball)
-			return nil
-		}
-		return fmt.Errorf("stat %s: %w", tarball, err)
+	if err := os.MkdirAll(mountDir, 0755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", mountDir, err)
 	}
-	log.Printf("importing upstream image %s from %s", fullRef, tarball)
-	if _, err := cc.ImportImage(ctx, tarball); err != nil {
-		return fmt.Errorf("import %s: %w", tarball, err)
+	cmd := exec.Command("mount", "-t", "erofs", "-o", "ro", erofs, mountDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount erofs %s -> %s: %w (output: %s)",
+			erofs, mountDir, err, strings.TrimSpace(string(out)))
 	}
-	log.Printf("successfully imported upstream image %s", fullRef)
+	log.Printf("mounted %s at %s (ro, erofs)", erofs, mountDir)
 	return nil
 }
 
-// ImportExternalBootImage imports the external-boot-image tarball
-// and re-tags it as ExternalBootImageName:<eveRelease>. After a
-// successful import any prior :<release> tags are removed so the
-// image set tracks the running EVE release.
+// linkBlob symlinks a single content-store blob at dst to the read-only
+// EROFS-mounted src, unless dst already exists. Symlink because src is on
+// a read-only EROFS on a different filesystem (hardlink impossible) and a
+// copy is exactly what we avoid. content.Store.Info os.Stats the path
+// (following the link), which enables the shared-mode zero-copy
+// short-circuit. Returns true if a new link was created.
 //
-// Missing tarball is a silent no-op — the install may have skipped
-// KubeVirt artifacts deliberately.
-func ImportExternalBootImage(ctx context.Context, eveRelease string) error {
-	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
-	if err != nil {
-		return fmt.Errorf("containerd client: %w", err)
+// Staged per-blob immediately before WriteBlob (not in bulk up front):
+// a symlink for a blob no registered image references yet is unreferenced
+// on-disk content that containerd's GC reaps, so a bulk pre-stage loses
+// every blob registration hasn't reached by the time GC runs.
+func linkBlob(src, dst string) (linked bool, err error) {
+	if _, statErr := os.Lstat(dst); statErr == nil {
+		return false, nil
 	}
-	defer cc.Close()
-	return importExternalBootImageWith(ctx, cc, eveRelease)
+	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+		return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+	}
+	if err := os.Symlink(src, dst); err != nil {
+		return false, fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
+	}
+	return true, nil
 }
 
-// importExternalBootImageWith is the ImportExternalBootImage body
-// against a caller-owned containerd client.
-func importExternalBootImageWith(ctx context.Context, cc *kubectlx.ContainerdClient,
-	eveRelease string,
-) error {
-	if _, err := os.Stat(ExternalBootImageTar); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			log.Printf("external-boot-image tarball not found at %s, skipping",
-				ExternalBootImageTar)
-			return nil
-		}
-		return fmt.Errorf("stat %s: %w", ExternalBootImageTar, err)
-	}
-
-	fullImageName := ExternalBootImageName + ":" + eveRelease
-	if exists, err := cc.ImageExists(ctx, fullImageName); err == nil && exists {
-		log.Printf("external-boot-image %s already imported", fullImageName)
-		cleanupOldImages(ctx, cc, ExternalBootImageName, eveRelease)
-		return nil
-	}
-	if err := importImage(ctx, cc, ExternalBootImageTar,
-		ExternalBootImageName, eveRelease); err != nil {
-		return fmt.Errorf("import external-boot-image: %w", err)
-	}
-	log.Printf("successfully imported external-boot-image as %s", fullImageName)
-	// Also expose the release as :latest so VMIRSes can pin against a
-	// stable tag. The image store on /persist survives upgrades, so
-	// :latest already points at the previous release; TagImage
-	// overwrites the record rather than erroring on AlreadyExists.
-	latestRef := ExternalBootImageName + ":latest"
-	if err := cc.TagImage(ctx, fullImageName, latestRef); err != nil {
-		return fmt.Errorf("re-tag %s -> %s: %w", fullImageName, latestRef, err)
-	}
-	cleanupOldImages(ctx, cc, ExternalBootImageName, eveRelease)
-	return nil
-}
-
-// importImage is the shared import-then-retag flow for EVE-authored
-// images whose tarball-internal tag may not match the
-// expectedName:expectedTag kubelet pod specs reference. Reads the
-// tarball's manifest.json, imports into containerd, and re-tags if
-// the tarball's own name doesn't already match.
-func importImage(ctx context.Context, cc *kubectlx.ContainerdClient,
-	tarball, expectedName, expectedTag string,
-) error {
-	tarballNameTag, err := getImageNameFromTarball(tarball)
+// isMounted reports whether mountpoint appears in /proc/mounts.
+func isMounted(mountpoint string) (bool, error) {
+	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return fmt.Errorf("read image name from tarball %s: %w", tarball, err)
+		return false, fmt.Errorf("read /proc/mounts: %w", err)
 	}
-	log.Printf("tarball %s contains image: %s", tarball, tarballNameTag)
-	if _, err := cc.ImportImage(ctx, tarball); err != nil {
-		return fmt.Errorf("import %s: %w", tarball, err)
-	}
-	log.Printf("imported tarball %s into containerd", tarball)
-
-	target := expectedName + ":" + expectedTag
-	if tarballNameTag != "" && tarballNameTag != "null" && tarballNameTag != target {
-		log.Printf("re-tagging %s -> %s", tarballNameTag, target)
-		if err := cc.TagImage(ctx, tarballNameTag, target); err != nil {
-			return fmt.Errorf("tag %s -> %s: %w", tarballNameTag, target, err)
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 2 && fields[1] == mountpoint {
+			return true, nil
 		}
 	}
-	return nil
-}
-
-// manifestJSON is the subset of Docker image manifest.json we parse.
-type manifestJSON struct {
-	RepoTags []string `json:"RepoTags"`
-}
-
-// getImageNameFromTarball returns the first RepoTags entry from
-// manifest.json inside tarball. Runs `tar -xf <tarball> manifest.json
-// -O` (stdout extraction) and parses the JSON in Go to avoid a jq
-// runtime dependency.
-func getImageNameFromTarball(tarball string) (string, error) {
-	output, err := exec.Command("tar", "-xf", tarball, "manifest.json", "-O").Output()
-	if err != nil {
-		return "", fmt.Errorf("extract manifest.json from %s: %w", tarball, err)
-	}
-	return parseFirstRepoTag(output)
-}
-
-// parseFirstRepoTag is the pure half of getImageNameFromTarball,
-// factored out for unit testing.
-func parseFirstRepoTag(manifestBytes []byte) (string, error) {
-	var manifests []manifestJSON
-	if err := json.Unmarshal(manifestBytes, &manifests); err != nil {
-		return "", fmt.Errorf("parse manifest.json: %w", err)
-	}
-	if len(manifests) == 0 || len(manifests[0].RepoTags) == 0 {
-		return "", errors.New("manifest.json has no RepoTags")
-	}
-	return manifests[0].RepoTags[0], nil
-}
-
-// cleanupOldImages lists every image whose name starts with baseName
-// in containerd's k8s.io namespace and removes the entries that
-// don't match the current tag. Prevents stale EVE-authored images
-// from accumulating across upgrades. Best-effort: per-remove
-// failures are warnings.
-func cleanupOldImages(ctx context.Context, cc *kubectlx.ContainerdClient,
-	baseName, currentTag string,
-) {
-	log.Printf("cleaning up old images for %s, keeping tag: %s", baseName, currentTag)
-	refs, err := cc.ListImages(ctx)
-	if err != nil {
-		log.Printf("WARNING: failed to list images for cleanup: %v", err)
-		return
-	}
-	currentImage := baseName + ":" + currentTag
-	latestImage := baseName + ":latest"
-	prefix := baseName + ":"
-	for _, ref := range refs {
-		if ref == "" || !strings.HasPrefix(ref, prefix) ||
-			ref == currentImage || ref == latestImage {
-			continue
-		}
-		log.Printf("removing old image: %s", ref)
-		if err := cc.DeleteImage(ctx, ref); err != nil {
-			log.Printf("WARNING: failed to remove old image %s: %v", ref, err)
-		}
-	}
-	log.Printf("old image cleanup completed for %s", baseName)
+	return false, nil
 }

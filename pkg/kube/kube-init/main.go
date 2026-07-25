@@ -1541,6 +1541,19 @@ func (d *daemon) workInit(workCtx context.Context) error {
 		return fmt.Errorf("migrate legacy base-k3s-mode marker: %w", err)
 	}
 
+	// Re-mount the kube-images EROFS payload on EVERY boot. The
+	// content-store blobs registered on first boot are symlinks into
+	// this mount (KubeImagesMount, on tmpfs), so without re-mounting
+	// they dangle after a reboot and any fresh unpack fails with
+	// "blob not found" → ImagePullBackOff. StateImporting (which also
+	// mounts, via ImportAll) is skipped on a steady-phase reboot, so
+	// the mount has to happen here where it runs unconditionally.
+	// Best-effort: registration already happened first boot; a mount
+	// failure only means kubelet falls back to a network pull.
+	if err := images.EnsureMounted(); err != nil {
+		log.Printf("WARNING: re-mount kube-images: %v; kubelet will pull upstream", err)
+	}
+
 	res := initResult{
 		deviceName:      deviceName,
 		uuid:            uuid,
