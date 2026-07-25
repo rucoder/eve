@@ -496,6 +496,7 @@ lvm2-dev
 lvm2-libs
 lz4
 lz4-libs
+lz4-dev
 lzip
 lzo
 lzo-dev
