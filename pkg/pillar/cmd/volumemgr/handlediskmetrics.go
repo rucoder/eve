@@ -142,7 +142,8 @@ func generateAndPublishVolumeMgrStatus(ctx *volumemgrContext) {
 	}
 	st := types.VolumeMgrStatus{
 		Name:           agentName,
-		Initialized:    true,
+		Initialized:    ctx.storageReady,
+		UnmetCondition: ctx.storageUnmet,
 		RemainingSpace: remaining,
 	}
 	ctx.pubVolumeMgrStatus.Publish(st.Key(), st)
