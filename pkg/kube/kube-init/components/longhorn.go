@@ -4,18 +4,24 @@
 package components
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 // longhornUninstallGuard signals an uninstall is in flight. Sits on
@@ -32,22 +38,26 @@ const longhornCfgFilename = "longhorn-cfg.yaml"
 // /persist with the same line every tick.
 var longhornReadyOnce sync.Once
 
+// longhornNodesGVR and longhornEngineImagesGVR are the Longhorn CRD
+// resources this file reads. Cached to avoid string-duplicating the
+// GVR at every callsite.
+var (
+	longhornNodesGVR = schema.GroupVersionResource{
+		Group: "longhorn.io", Version: "v1beta2", Resource: "nodes",
+	}
+	longhornEngineImagesGVR = schema.GroupVersionResource{
+		Group: "longhorn.io", Version: "v1beta2", Resource: "engineimages",
+	}
+)
+
 // LonghornIsReady reports whether Longhorn is fully operational on
 // this node. Called periodically by the FSM's running-state monitor;
 // self-heals by recreating a missing longhorn.io node object when
 // it observes one.
 //
-// Returns (true, nil) for three "nothing to report" cases that
-// callers treat as "Longhorn is up to date":
-//   - the node is in base-k3s mode (no Longhorn at all).
-//   - longhorn-system namespace is absent (not installed yet).
-//
-// Returns (false, nil) when Longhorn is genuinely not ready (or an
-// uninstall is in flight).
-//
-// Returns (false, err) when we cannot tell — marker-read failure,
-// etc. Callers should treat a non-nil error as "do not act on the
-// bool, retry the check next tick".
+// See the previous implementation's docstring for the (true, nil) /
+// (false, nil) / (false, err) contract — unchanged by the client-go
+// migration.
 func LonghornIsReady(ctx context.Context) (bool, error) {
 	uninstalling, err := state.IsMarked(longhornUninstallGuard)
 	if err != nil {
@@ -61,38 +71,41 @@ func LonghornIsReady(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("check native-kubernetes-mode marker: %w", err)
 	}
 	if nkm {
-		// Post-K3sBase-conversion: Longhorn has been uninstalled.
-		// Report ready so callers stop waiting.
 		return true, nil
 	}
-	if _, err := kubectl("get", "namespace/longhorn-system"); err != nil {
+	kc := kubeclient.Default()
+	if _, err := kc.Clientset.CoreV1().Namespaces().
+		Get(ctx, longhornNamespace, metav1.GetOptions{}); err != nil {
 		// Namespace probe failure: most often "not installed yet",
 		// but could also be an API outage. Treat as "ready" (i.e.
 		// "no Longhorn to wait for") to match the previous shell
 		// flow; an API outage will surface elsewhere.
 		return true, nil
 	}
-	if !longhornDaemonSetsReady() {
+	if !longhornDaemonSetsReady(ctx) {
 		return false, nil
 	}
 	nodeName := readDeviceK8sName()
 	if nodeName == "" {
 		return false, nil
 	}
-	if _, err := kubectl("get", "nodes.longhorn.io", nodeName,
-		"-n", longhornNamespace); err != nil {
+	if _, err := kc.Dynamic.Resource(longhornNodesGVR).Namespace(longhornNamespace).
+		Get(ctx, nodeName, metav1.GetOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			// Anything other than NotFound (Forbidden, Unauthorized,
+			// ServerTimeout, dial failure) is NOT "node missing" —
+			// treating it as such loops the monitor firing spurious
+			// Create attempts against an API that isn't misconfigured.
+			log.Printf("warning: get longhorn node %s: %v", nodeName, err)
+			return false, nil
+		}
 		log.Printf("longhorn node %s missing, creating", nodeName)
-		if cErr := longhornNodeCreate(nodeName); cErr != nil {
+		if cErr := longhornNodeCreate(ctx, nodeName); cErr != nil {
 			log.Printf("warning: create longhorn node %s: %v", nodeName, cErr)
 		}
 		return false, nil
 	}
-	// Tie-breaker nodes carry Schedulable=False by design; the
-	// engine image is never deployed there. Gate the deployment
-	// check on Schedulable=True so tie-breakers stop emitting the
-	// per-tick "engine not deployed" log without special-casing
-	// the node role here. Redoes intent from upstream 679a3ac7c.
-	sched, err := longhornNodeSchedulable(nodeName)
+	sched, err := longhornNodeSchedulable(ctx, nodeName)
 	if err != nil {
 		log.Printf("warning: read longhorn node %s Schedulable: %v", nodeName, err)
 		return false, nil
@@ -118,24 +131,22 @@ func LonghornIsReady(ctx context.Context) (bool, error) {
 // longhornNodeSchedulable reads the Longhorn node's Schedulable
 // condition status. Returns "True", "False", or the raw value
 // (including empty string when the condition is not yet present).
-func longhornNodeSchedulable(nodeName string) (string, error) {
-	out, err := kubectl("get", "nodes.longhorn.io", nodeName,
-		"-n", longhornNamespace,
-		"-o", `jsonpath={.status.conditions[?(@.type=="Schedulable")].status}`)
+func longhornNodeSchedulable(ctx context.Context, nodeName string) (string, error) {
+	obj, err := kubeclient.Default().Dynamic.Resource(longhornNodesGVR).
+		Namespace(longhornNamespace).Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
-}
-
-// engineImageList captures just the fields longhornEngineDeployedOnNode
-// needs from `kubectl get engineimage -o json`.
-type engineImageList struct {
-	Items []struct {
-		Status struct {
-			NodeDeploymentMap map[string]bool `json:"nodeDeploymentMap"`
-		} `json:"status"`
-	} `json:"items"`
+	status, _ := obj.Object["status"].(map[string]any)
+	conditions, _ := status["conditions"].([]any)
+	for _, c := range conditions {
+		cm, _ := c.(map[string]any)
+		if t, _ := cm["type"].(string); t == "Schedulable" {
+			s, _ := cm["status"].(string)
+			return s, nil
+		}
+	}
+	return "", nil
 }
 
 // longhornEngineDeployedOnNode reports whether every Longhorn engine
@@ -143,24 +154,40 @@ type engineImageList struct {
 // recycles the engine-image pod on this node plus a longhorn-manager
 // pod on a different node so the controller re-reconciles state.
 func longhornEngineDeployedOnNode(ctx context.Context, nodeName string) bool {
-	out, err := kubectl("get", "engineimage", "-n", longhornNamespace, "-o", "json")
+	list, err := kubeclient.Default().Dynamic.Resource(longhornEngineImagesGVR).
+		Namespace(longhornNamespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false
 	}
-	var result engineImageList
-	if err := json.Unmarshal([]byte(out), &result); err != nil {
-		log.Printf("warning: parse engineimage list: %v", err)
-		return false
-	}
-	if len(result.Items) == 0 {
+	if len(list.Items) == 0 {
 		log.Printf("no Longhorn engine images found")
 		return false
 	}
-	for _, item := range result.Items {
-		deployed, ok := item.Status.NodeDeploymentMap[nodeName]
-		if !ok || !deployed {
+	for _, item := range list.Items {
+		status, _ := item.Object["status"].(map[string]any)
+		ndm, statusHasMap := status["nodeDeploymentMap"].(map[string]any)
+		if !statusHasMap {
+			// Fresh CR — longhorn-manager hasn't populated
+			// status.nodeDeploymentMap yet. Not the same as "engine
+			// not deployed on us" (which would justify a pod
+			// recycle); it's "no data yet, come back next event".
+			return false
+		}
+		deployed, keyPresent := ndm[nodeName].(bool)
+		if !keyPresent {
+			// This node's slot missing from the map — same
+			// "reconciler hasn't seen us yet" state as above.
+			// Do NOT recycle pods on this shape.
+			return false
+		}
+		if !deployed {
 			log.Printf("engine image not deployed on %s, recycling pods", nodeName)
-			deleteEngineAndManagerPods(ctx, nodeName, item.Status.NodeDeploymentMap)
+			ndmBool := make(map[string]bool, len(ndm))
+			for k, v := range ndm {
+				b, _ := v.(bool)
+				ndmBool[k] = b
+			}
+			deleteEngineAndManagerPods(ctx, nodeName, ndmBool)
 			return false
 		}
 	}
@@ -170,31 +197,25 @@ func longhornEngineDeployedOnNode(ctx context.Context, nodeName string) bool {
 // deleteEngineAndManagerPods recycles the engine-image pod on
 // nodeName and one longhorn-manager pod on a peer node that owns
 // the deployment map. Recycling forces a state refresh.
-//
-// Delete failures are logged (a silent failure would loop the
-// caller forever calling this function without making progress).
 func deleteEngineAndManagerPods(ctx context.Context, nodeName string, ndm map[string]bool) {
-	out, err := kubectl("get", "pods", "-n", longhornNamespace,
-		"--field-selector", "spec.nodeName="+nodeName,
-		"-l", "longhorn.io/component=engine-image",
-		"-o", "jsonpath={.items[*].metadata.name}")
+	kc := kubeclient.Default()
+	podClient := kc.Clientset.CoreV1().Pods(longhornNamespace)
+
+	// engine-image pods on this node.
+	pods, err := podClient.List(ctx, metav1.ListOptions{
+		LabelSelector: "longhorn.io/component=engine-image",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
 	if err != nil {
 		log.Printf("warning: list engine-image pods on %s: %v", nodeName, err)
 	} else {
-		for _, pod := range strings.Fields(strings.TrimSpace(out)) {
-			phase, pErr := kubectl("get", "pod", pod, "-n", longhornNamespace,
-				"-o", "jsonpath={.status.phase}")
-			if pErr != nil {
-				log.Printf("warning: get pod %s phase: %v", pod, pErr)
+		for _, p := range pods.Items {
+			if p.Status.Phase != corev1.PodRunning {
 				continue
 			}
-			if strings.TrimSpace(phase) != "Running" {
-				continue
-			}
-			log.Printf("deleting engine pod %s on %s", pod, nodeName)
-			if _, dErr := kubectl("delete", "pod", pod,
-				"-n", longhornNamespace); dErr != nil {
-				log.Printf("warning: delete engine pod %s: %v", pod, dErr)
+			log.Printf("deleting engine pod %s on %s", p.Name, nodeName)
+			if err := podClient.Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+				log.Printf("warning: delete engine pod %s: %v", p.Name, err)
 			}
 		}
 	}
@@ -205,19 +226,18 @@ func deleteEngineAndManagerPods(ctx context.Context, nodeName string, ndm map[st
 		if !deployed || owner == nodeName {
 			continue
 		}
-		mgrOut, mErr := kubectl("get", "pods", "-n", longhornNamespace,
-			"--field-selector", "spec.nodeName="+owner,
-			"-l", "app=longhorn-manager",
-			"-o", "jsonpath={.items[*].metadata.name}")
-		if mErr != nil {
-			log.Printf("warning: list longhorn-manager pods on %s: %v", owner, mErr)
+		mgrPods, err := podClient.List(ctx, metav1.ListOptions{
+			LabelSelector: "app=longhorn-manager",
+			FieldSelector: "spec.nodeName=" + owner,
+		})
+		if err != nil {
+			log.Printf("warning: list longhorn-manager pods on %s: %v", owner, err)
 			return
 		}
-		for _, pod := range strings.Fields(strings.TrimSpace(mgrOut)) {
-			log.Printf("deleting longhorn-manager pod %s on %s", pod, owner)
-			if _, dErr := kubectl("delete", "pod", pod,
-				"-n", longhornNamespace); dErr != nil {
-				log.Printf("warning: delete manager pod %s: %v", pod, dErr)
+		for _, p := range mgrPods.Items {
+			log.Printf("deleting longhorn-manager pod %s on %s", p.Name, owner)
+			if err := podClient.Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+				log.Printf("warning: delete manager pod %s: %v", p.Name, err)
 			}
 		}
 		return
@@ -225,12 +245,7 @@ func deleteEngineAndManagerPods(ctx context.Context, nodeName string, ndm map[st
 }
 
 // LonghornPostInstallConfig copies the runtime Longhorn config
-// into the k3s auto-deploy dir. Idempotent: writes a marker after
-// the copy and short-circuits when the marker is already present.
-//
-// Returns an error rather than logging-and-swallowing so callers
-// can decide whether to retry on the next tick or surface the
-// problem to the FSM.
+// into the k3s auto-deploy dir. Idempotent.
 func LonghornPostInstallConfig() error {
 	src := "/etc/" + longhornCfgFilename
 	dst := filepath.Join(manifestsDst, longhornCfgFilename)
@@ -262,10 +277,12 @@ func LonghornPostInstallConfigClean() {
 // longhorn-csi-plugin pod that has not yet been patched. A marker
 // file inside the pod marks completion so re-runs are no-ops.
 func CheckOverwriteNsmounter(ctx context.Context) {
-	out, err := kubectl("get", "pods", "-n", longhornNamespace,
-		"-l", "app=longhorn-csi-plugin",
-		"--field-selector", "status.phase=Running",
-		"-o", "jsonpath={.items[*].metadata.name}")
+	kc := kubeclient.Default()
+	pods, err := kc.Clientset.CoreV1().Pods(longhornNamespace).List(ctx,
+		metav1.ListOptions{
+			LabelSelector: "app=longhorn-csi-plugin",
+			FieldSelector: "status.phase=Running",
+		})
 	if err != nil {
 		log.Printf("warning: list longhorn-csi-plugin pods: %v", err)
 		return
@@ -274,32 +291,83 @@ func CheckOverwriteNsmounter(ctx context.Context) {
 	const markerPath = "/usr/local/sbin/nsmounter.updated"
 	const nsmounterSrc = "/usr/bin/nsmounter"
 
-	for _, pod := range strings.Fields(strings.TrimSpace(out)) {
-		if _, err := kubectl("exec", pod, "-n", longhornNamespace,
-			"-c", "longhorn-csi-plugin", "--",
-			"test", "-f", markerPath); err == nil {
+	for _, p := range pods.Items {
+		if err := podExec(ctx, p.Name, longhornNamespace, "longhorn-csi-plugin",
+			[]string{"test", "-f", markerPath}, nil, nil, nil); err == nil {
 			continue
 		}
-		log.Printf("patching nsmounter in pod %s", pod)
+		log.Printf("patching nsmounter in pod %s", p.Name)
 		data, readErr := os.ReadFile(nsmounterSrc)
 		if readErr != nil {
 			log.Printf("warning: read nsmounter binary: %v", readErr)
 			return
 		}
 		cpCmd := "cat > /usr/local/sbin/nsmounter && chmod +x /usr/local/sbin/nsmounter"
-		cmd := kubectlx.Cmd("exec", "-i", pod, "-n", longhornNamespace,
-			"-c", "longhorn-csi-plugin", "--",
-			"sh", "-c", cpCmd)
-		cmd.Stdin = strings.NewReader(string(data))
-		if cpOut, cpErr := cmd.CombinedOutput(); cpErr != nil {
+		var out bytes.Buffer
+		if err := podExec(ctx, p.Name, longhornNamespace, "longhorn-csi-plugin",
+			[]string{"sh", "-c", cpCmd},
+			bytes.NewReader(data), &out, &out); err != nil {
 			log.Printf("warning: copy nsmounter into %s: %v (%s)",
-				pod, cpErr, strings.TrimSpace(string(cpOut)))
+				p.Name, err, out.String())
 			continue
 		}
-		if _, touchErr := kubectl("exec", pod, "-n", longhornNamespace,
-			"-c", "longhorn-csi-plugin", "--",
-			"touch", markerPath); touchErr != nil {
-			log.Printf("warning: touch nsmounter marker in %s: %v", pod, touchErr)
+		if err := podExec(ctx, p.Name, longhornNamespace, "longhorn-csi-plugin",
+			[]string{"touch", markerPath}, nil, nil, nil); err != nil {
+			log.Printf("warning: touch nsmounter marker in %s: %v", p.Name, err)
 		}
 	}
+}
+
+// podExec is the client-go remotecommand equivalent of
+// `kubectl exec -c <container> <pod> -n <ns> -- <cmd...>` with
+// optional stdin/stdout/stderr streams. Replaces the previous
+// shell-out and inline exec.Command usages.
+//
+// stdin/stdout/stderr may each be nil when unused. NotFound on the
+// pod surfaces as-is so callers can distinguish "pod gone" from
+// "command failed inside pod".
+func podExec(
+	ctx context.Context, podName, namespace, container string,
+	command []string,
+	stdin *bytes.Reader, stdout, stderr *bytes.Buffer,
+) error {
+	kc := kubeclient.Default()
+	// The exec subresource URL is constructed off the typed core
+	// client; SPDYExecutor executes the actual bidirectional stream.
+	req := kc.Clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(podName).Namespace(namespace).
+		SubResource("exec")
+	opts := &corev1.PodExecOptions{
+		Container: container,
+		Command:   command,
+		Stdin:     stdin != nil,
+		Stdout:    stdout != nil,
+		Stderr:    stderr != nil,
+	}
+	req.VersionedParams(opts, scheme.ParameterCodec)
+
+	// SPDYExecutor's ctor takes a URL; pull it from the RESTClient
+	// request. Use SPDY (not the newer WebSocket) because it's the
+	// baseline both k3s and stock kube-apiserver ship.
+	execURL, err := url.Parse(req.URL().String())
+	if err != nil {
+		return fmt.Errorf("build exec URL: %w", err)
+	}
+	exec, err := remotecommand.NewSPDYExecutor(kc.Config, "POST", execURL)
+	if err != nil {
+		return fmt.Errorf("build SPDY executor: %w", err)
+	}
+	streamOpts := remotecommand.StreamOptions{
+		Stdout: stdout, Stderr: stderr,
+	}
+	if stdin != nil {
+		streamOpts.Stdin = stdin
+	}
+	if err := exec.StreamWithContext(ctx, streamOpts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return err
+		}
+		return fmt.Errorf("exec %s -c %s: %w", podName, container, err)
+	}
+	return nil
 }

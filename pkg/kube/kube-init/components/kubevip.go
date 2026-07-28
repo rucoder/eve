@@ -7,6 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 )
 
 // Kube-VIP manifest paths (baked into the kube container image).
@@ -36,8 +39,9 @@ func KubeVIPApply(ctx context.Context) error {
 // proceeds across stale state.
 func KubeVIPDelete(ctx context.Context) error {
 	log.Printf("deleting Kube-VIP resources")
+	kc := kubeclient.Default()
 	for _, f := range []string{kubevipDS, kubevipCM, kubevipSA} {
-		if _, err := kubectl("delete", "-f", f); err != nil {
+		if err := kubectlx.DeleteFile(ctx, kc, f); err != nil {
 			log.Printf("warning: delete %s: %v", f, err)
 		}
 	}

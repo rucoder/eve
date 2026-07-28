@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Node-password paths. var so tests can redirect; same convention
@@ -137,11 +139,10 @@ func FixNodePasswordSecret(ctx context.Context) error {
 		return nil
 	}
 	secretName := hostname + ".node-password.k3s"
-	out, err := kubectlx.CmdContext(ctx, "-n", "kube-system",
-		"delete", "secret", secretName, "--ignore-not-found").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("delete secret %s: %w (output: %s)",
-			secretName, err, string(out))
+	err = kubeclient.Default().Clientset.CoreV1().Secrets("kube-system").
+		Delete(ctx, secretName, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete secret %s: %w", secretName, err)
 	}
 	log.Printf("deleted stale node password secret %s for brownfield fix",
 		secretName)

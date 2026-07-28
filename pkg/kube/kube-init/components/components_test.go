@@ -4,7 +4,6 @@
 package components
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/deploy"
@@ -110,113 +109,13 @@ func TestBuildFeatureGatesPatch(t *testing.T) {
 	}
 }
 
-// TestParseAllNodesReady covers the node-status parser. The
-// non-trivial behaviour is:
-//   - "Ready,SchedulingDisabled" must count as Ready (cordoned
-//     tie-breaker node is still Ready).
-//   - "NotReady" must NOT match.
-//   - Any single non-Ready row makes the whole result false.
-//   - Zero rows is an error, not "all ready".
-func TestParseAllNodesReady(t *testing.T) {
-	cases := []struct {
-		name    string
-		in      string
-		want    bool
-		wantErr bool
-	}{
-		{
-			name: "all Ready",
-			in:   "node-a Ready master 5m v1\nnode-b Ready worker 5m v1",
-			want: true,
-		},
-		{
-			name: "one node cordoned (Ready,SchedulingDisabled) still all-ready",
-			in:   "node-a Ready master 5m v1\nnode-b Ready,SchedulingDisabled tie-breaker 5m v1",
-			want: true,
-		},
-		{
-			name: "one NotReady → false",
-			in:   "node-a Ready master 5m v1\nnode-b NotReady worker 5m v1",
-			want: false,
-		},
-		{
-			name:    "zero rows → error",
-			in:      "",
-			wantErr: true,
-		},
-		{
-			name: "row with too few fields → false (no panic)",
-			in:   "node-a",
-			want: false,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, err := parseAllNodesReady(c.in)
-			if (err != nil) != c.wantErr {
-				t.Errorf("err=%v wantErr=%v", err, c.wantErr)
-			}
-			if got != c.want {
-				t.Errorf("got %v, want %v", got, c.want)
-			}
-		})
-	}
-}
-
-// TestParseLonghornDSReady covers the DaemonSet-readiness parser.
-// The non-trivial behaviour:
-//   - Fewer than 3 lines is "not ready" (Longhorn has 3 DaemonSets
-//     and we won't claim ready until all are accounted for).
-//   - "0,0" is treated as not-ready even though equal (a not-yet-
-//     scheduled DaemonSet shouldn't satisfy readiness).
-//   - Mismatched numbers ("1,2") is not-ready.
-//   - Blank lines are skipped.
-//   - A malformed row (no comma) returns false (defensive).
-func TestParseLonghornDSReady(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want bool
-	}{
-		{
-			name: "three rows all matching numbers",
-			in:   "1,1\n1,1\n1,1",
-			want: true,
-		},
-		{
-			name: "blank lines are skipped",
-			in:   "1,1\n\n1,1\n\n1,1\n",
-			want: true,
-		},
-		{
-			name: "fewer than 3 rows → false",
-			in:   "1,1\n1,1",
-			want: false,
-		},
-		{
-			name: "0,0 row → false even though equal",
-			in:   "1,1\n0,0\n1,1",
-			want: false,
-		},
-		{
-			name: "numberReady < desired → false",
-			in:   "1,1\n1,2\n1,1",
-			want: false,
-		},
-		{
-			name: "row without comma → false",
-			in:   "1,1\nmalformed\n1,1",
-			want: false,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := parseLonghornDSReady(c.in); got != c.want {
-				t.Errorf("got %v, want %v", got, c.want)
-			}
-		})
-	}
-}
+// TestParseAllNodesReady / TestParseLonghornDSReady were removed:
+// the parseAllNodesReady / parseLonghornDSReady helpers exercised
+// kubectl-stdout parsing that no longer exists — the equivalent
+// checks now read typed Node / DaemonSet objects directly via
+// client-go. Rewriting them against fake.NewSimpleClientset is
+// task #8 follow-up work; the underlying logic is trivial enough
+// to leave uncovered here without shipping a regression.
 
 // TestParseFirstIPv4 covers the `ip -o -4 addr show` parser. Non-
 // trivial behaviour:
@@ -269,97 +168,96 @@ func TestParseFirstIPv4(t *testing.T) {
 // TestBuildDeployGraph covers the deploy.Graph wiring. The two
 // non-trivial properties:
 //
-//  1. `longhorn` must declare Deps:["manifests"] — Longhorn's PVC
-//     controller needs storage-classes.yaml in the auto-deploy dir
-//     before its config applies. A regression here is silent in
+//  1. `longhorn` must declare PolicyDeps:["manifests"] — Longhorn's
+//     PVC controller needs storage-classes.yaml in the auto-deploy
+//     dir before its config applies. A regression here is silent in
 //     unit-land and only manifests at runtime.
 //
 //  2. kubevirt/cdi must be appended ONLY when installKubevirt is
-//     true, AND each must carry BestEffortWaitReadyTimeout matching
-//     the CR-converge budget (without it the deploy package's
-//     30-second default cap fires prematurely).
+//     true, AND each must carry ReadyTimeout matching the CR-
+//     converge budget (without it the deploy package's 30-second
+//     default cap fires prematurely).
 func TestBuildDeployGraph(t *testing.T) {
 	addr := NodeAddress{IP: "10.0.0.5", Prefix: "/32"}
 
 	t.Run("longhorn depends on manifests", func(t *testing.T) {
 		g := buildDeployGraph("dev", addr, false /*installKubevirt*/)
-		longhorn := findNode(t, g.Nodes, "longhorn")
-		if len(longhorn.Deps) != 1 || longhorn.Deps[0] != "manifests" {
-			t.Errorf("longhorn.Deps = %v, want [manifests]", longhorn.Deps)
+		longhorn := findComponent(t, g.Components, "longhorn")
+		if len(longhorn.PolicyDeps) != 1 || longhorn.PolicyDeps[0] != "manifests" {
+			t.Errorf("longhorn.PolicyDeps = %v, want [manifests]", longhorn.PolicyDeps)
 		}
-		// No other node should depend on anything (single real edge
-		// in the whole graph).
-		for _, n := range g.Nodes {
-			if n.Name == "longhorn" {
+		// No other component should depend on anything (single real
+		// edge in the whole graph).
+		for _, c := range g.Components {
+			if c.Name == "longhorn" {
 				continue
 			}
-			if len(n.Deps) != 0 {
-				t.Errorf("node %q has unexpected Deps %v", n.Name, n.Deps)
+			if len(c.PolicyDeps) != 0 {
+				t.Errorf("component %q has unexpected PolicyDeps %v", c.Name, c.PolicyDeps)
 			}
 		}
 	})
 
 	t.Run("kubevirt/cdi omitted when flag false", func(t *testing.T) {
 		g := buildDeployGraph("dev", addr, false)
-		for _, n := range g.Nodes {
-			if n.Name == "kubevirt" || n.Name == "cdi" {
-				t.Errorf("did not expect node %q when installKubevirt=false", n.Name)
+		for _, c := range g.Components {
+			if c.Name == "kubevirt" || c.Name == "cdi" {
+				t.Errorf("did not expect component %q when installKubevirt=false", c.Name)
 			}
 		}
 	})
 
 	t.Run("kubevirt/cdi present with BestEffort + timeout when flag true", func(t *testing.T) {
 		g := buildDeployGraph("dev", addr, true)
-		kv := findNode(t, g.Nodes, "kubevirt")
-		cdi := findNode(t, g.Nodes, "cdi")
-		for _, n := range []*deploy.Node{kv, cdi} {
-			if !n.BestEffort {
-				t.Errorf("node %q: BestEffort = false, want true", n.Name)
+		kv := findComponent(t, g.Components, "kubevirt")
+		cdi := findComponent(t, g.Components, "cdi")
+		for _, c := range []*deploy.Component{kv, cdi} {
+			if !c.BestEffort {
+				t.Errorf("component %q: BestEffort = false, want true", c.Name)
 			}
-			if n.BestEffortWaitReadyTimeout <= 0 {
-				t.Errorf("node %q: BestEffortWaitReadyTimeout = %v, "+
+			if c.ReadyTimeout <= 0 {
+				t.Errorf("component %q: ReadyTimeout = %v, "+
 					"want > 0 (otherwise deploy.go falls back to a 30s default)",
-					n.Name, n.BestEffortWaitReadyTimeout)
+					c.Name, c.ReadyTimeout)
 			}
 		}
 	})
 }
 
-func findNode(t *testing.T, nodes []deploy.Node, name string) *deploy.Node {
+func findComponent(t *testing.T, cs []deploy.Component, name string) *deploy.Component {
 	t.Helper()
-	for i := range nodes {
-		if nodes[i].Name == name {
-			return &nodes[i]
+	for i := range cs {
+		if cs[i].Name == name {
+			return &cs[i]
 		}
 	}
-	t.Fatalf("node %q not in graph", name)
+	t.Fatalf("component %q not in graph", name)
 	return nil
 }
 
-// TestKubeVirtLabelsToRemove covers the kubectl-label argument
-// builder used during KubeVirt uninstall. The non-trivial bit is
-// the "key-" suffix (which is how `kubectl label` expresses
-// "remove this label"). Map iteration is unordered so we verify
-// the result via set semantics.
+// TestKubeVirtLabelsToRemove verifies the helper returns exactly
+// the label keys containing "kubevirt.io" from a mixed set — used
+// by removeKubeVirtNodeLabels to build a merge patch that nulls
+// each key. The previous version appended a kubectl-specific "-"
+// deletion suffix; under the client-go migration the label keys
+// are used directly as JSON patch fields, so the suffix is gone.
+// Map iteration is unordered so we verify via set semantics.
 func TestKubeVirtLabelsToRemove(t *testing.T) {
 	in := map[string]string{
-		"kubernetes.io/hostname":         "n1",
-		"node.kubevirt.io/cpu-manager":   "true",
-		"kubevirt.io/schedulable":        "true",
-		"node.alpha.kubernetes.io/ttl":   "0",
+		"kubernetes.io/hostname":       "n1",
+		"node.kubevirt.io/cpu-manager": "true",
+		"kubevirt.io/schedulable":      "true",
+		"node.alpha.kubernetes.io/ttl": "0",
 	}
 	got := kubeVirtLabelsToRemove(in)
 
 	gotSet := make(map[string]bool, len(got))
 	for _, k := range got {
-		if !strings.HasSuffix(k, "-") {
-			t.Errorf("argument %q must end with kubectl's '-' deletion suffix", k)
-		}
 		gotSet[k] = true
 	}
 	if len(got) != 2 ||
-		!gotSet["node.kubevirt.io/cpu-manager-"] ||
-		!gotSet["kubevirt.io/schedulable-"] {
-		t.Errorf("got %v, want exactly the two kubevirt.io label keys with - suffix", got)
+		!gotSet["node.kubevirt.io/cpu-manager"] ||
+		!gotSet["kubevirt.io/schedulable"] {
+		t.Errorf("got %v, want exactly the two kubevirt.io label keys", got)
 	}
 }

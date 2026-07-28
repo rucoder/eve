@@ -1,29 +1,31 @@
 // Copyright (c) 2026 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package kubectlx wraps the k3s multi-call binary for the subcommands
-// kube-init uses:
+// Package kubectlx is kube-init's typed convenience layer over
+// client-go and containerd's Go client. Every operation the daemon
+// used to perform by shelling out to `k3s kubectl …`, `k3s ctr -n k8s.io …`,
+// or `k3s crictl …` is now an in-process API call — no argv assembly,
+// no stderr parsing, no re-exec of the multi-call binary.
 //
-//   - kubectl (Run, Cmd, CmdContext — exec.go) — goes via
-//     `k3s kubectl <args>` with KUBECONFIG wired in.
-//   - ctr (CtrRun, CtrCmd — ctr.go) — goes via
-//     `k3s ctr -a <user-containerd-socket> -n k8s.io <args>`.
-//     The k8s.io namespace is load-bearing: images imported into
-//     any other namespace are invisible to kubelet.
-//   - crictl (CrictlRun, CrictlCmd — crictl.go) — goes via
-//     `k3s crictl --runtime-endpoint=unix://<socket> <args>`.
+// The public surface splits three ways:
 //
-// The package also provides typed kubectl primitives for apply/create
-// with classified backoff (apply.go) and readiness waits (wait.go).
-// The typed waits exist so callers do not have to treat a successful
-// `kubectl apply` as proof that the resource is ready to use: `kubectl
-// apply` returns once the API server has persisted the object;
-// downstream callers can still race the CRD's discovery cache, an
-// operator's reconciler, or an admission webhook's readiness. Pair
-// every apply with the appropriate wait when ordering matters.
+//   - Apply / ApplyFile / ApplyURL / Get (apply.go) — dynamic-client
+//     server-side apply, with multi-document YAML support and a
+//     RESTMapper-reset-and-retry that closes the "CR applied before
+//     its CRD is Established" race in one place.
+//   - Wait* / WaitForCondition (wait.go) — informer-driven readiness
+//     waits (Deployment, DaemonSet, Job, CRD) plus a JSONPath-based
+//     generic condition wait for CR-defined status fields.
+//   - ContainerdClient (containerd.go) — a thin wrapper over
+//     containerd.Client bound to the k8s.io namespace. ImportImage,
+//     ImageExists, DeleteImage, ListImages cover every previous
+//     `ctr images …` and `crictl inspecti` callsite. cri-api is not
+//     a dependency — everything kube-init needed from crictl was an
+//     image-service operation, which containerd exposes directly.
 //
-// Having one place that assembles the `/usr/bin/k3s …` prefix also
-// means the binary path, the containerd socket path, and the k8s.io
-// namespace string are each hard-coded exactly once per subcommand
-// family — not copy-pasted across every call site.
+// Callers construct a *kubeclient.Client once at daemon boot (see the
+// kubeclient package) and pass it into every kubectlx function that
+// needs a k8s API handle. The containerd client is analogous —
+// construct once via NewContainerd(state.ContainerdSocket), Close on
+// shutdown.
 package kubectlx

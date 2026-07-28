@@ -24,8 +24,22 @@ import (
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/deploy"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/edgenodeinfo"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/tools/cache"
+)
+
+// GVK/GVR handles used by components/* patch operations.
+var (
+	kubevirtGVK = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "KubeVirt"}
+	cdiGVK      = schema.GroupVersionKind{Group: "cdi.kubevirt.io", Version: "v1beta1", Kind: "CDI"}
 )
 
 // Component manifest paths, baked into the container image at build
@@ -129,7 +143,7 @@ type NodeAddress struct {
 // NOT written here — the caller writes them after the post-deploy
 // SaveVarLib completes so "marker present" unambiguously implies a
 // complete /var/lib snapshot too.
-func DeployAll(ctx context.Context, deviceName string, installKubevirt bool) error {
+func DeployAll(ctx, retryCtx context.Context, deviceName string, installKubevirt bool) error {
 	log.Printf("starting component deployment (device=%s, kubevirt=%v)",
 		deviceName, installKubevirt)
 
@@ -148,11 +162,16 @@ func DeployAll(ctx context.Context, deviceName string, installKubevirt bool) err
 	// eve-kube-app and would race-fail with "namespace not found" if
 	// multus hadn't created it yet. Hoisting the creation eliminates
 	// the race — every graph node can assume the namespace exists.
-	if err := ensureEveKubeAppNamespace(); err != nil {
+	if err := ensureEveKubeAppNamespace(ctx); err != nil {
 		return fmt.Errorf("ensure eve-kube-app namespace: %w", err)
 	}
 
 	g := buildDeployGraph(deviceName, addr, installKubevirt)
+	// Wire the daemon-scoped ctx for BestEffort background retries.
+	// Retries survive Run's return (its ctx is workCtx, per-invocation)
+	// so a slow component keeps reconciling in the background; they
+	// die on daemon shutdown when retryCtx is cancelled.
+	g.RetryCtx = retryCtx
 	if err := g.Run(ctx); err != nil {
 		return err
 	}
@@ -164,23 +183,51 @@ func DeployAll(ctx context.Context, deviceName string, installKubevirt bool) err
 // it does not already exist. Idempotent. The namespace hosts EVE
 // app instance workloads and is referenced by the multus
 // NetworkAttachmentDefinition and the debug-user RoleBinding.
-func ensureEveKubeAppNamespace() error {
-	if _, err := kubectl("get", "namespace", "eve-kube-app"); err == nil {
+func ensureEveKubeAppNamespace(ctx context.Context) error {
+	nsClient := kubeclient.Default().Clientset.CoreV1().Namespaces()
+	if _, err := nsClient.Get(ctx, "eve-kube-app", metav1.GetOptions{}); err == nil {
 		return nil
 	}
-	if _, err := kubectl("create", "namespace", "eve-kube-app"); err != nil {
+	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "eve-kube-app"}}
+	if _, err := nsClient.Create(ctx, nsObj, metav1.CreateOptions{}); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
 		return fmt.Errorf("create namespace: %w", err)
 	}
 	log.Printf("created namespace eve-kube-app")
 	return nil
 }
 
+// GraphEdges returns the resolved dependency edges of the deploy
+// graph without running it. Consumed by the k3s-sctl `graph`
+// command (task #9) so operators can diagnose "why is component X
+// waiting?" on-device without re-parsing manifests. installKubevirt
+// mirrors the DeployAll flag so the reported graph matches what a
+// live boot would execute.
+//
+// The graph is built with placeholder deviceName + NodeAddress —
+// those affect the Apply closures, not the edges, so the placeholders
+// are safe. If the plan itself is malformed (a coding bug), the
+// underlying error is surfaced.
+func GraphEdges(installKubevirt bool) ([]deploy.Edge, error) {
+	g := buildDeployGraph("<sctl>", NodeAddress{IP: "0.0.0.0", Prefix: "/32"}, installKubevirt)
+	return g.Edges()
+}
+
 // buildDeployGraph constructs the deploy.Graph used by DeployAll.
-// Extracted so the wiring (Deps edges + conditional inclusion of
-// kubevirt/cdi) can be unit-tested without invoking installers.
+// Extracted so the wiring (PolicyDeps edges + conditional inclusion
+// of kubevirt/cdi) can be unit-tested without invoking installers.
+//
+// Components declare no Manifests today — every install runs via
+// the imperative Apply / Ready step-func pair inherited from the
+// previous Node-based graph. Task #12 will migrate each InstallX
+// to declarative Manifests so the runner's structural rules can
+// derive edges automatically; until then, ordering rides on
+// PolicyDeps.
 func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool) deploy.Graph {
 	g := deploy.Graph{
-		Nodes: []deploy.Node{
+		Components: []deploy.Component{
 			{
 				Name:  "multus",
 				Apply: func(c context.Context) error { return ApplyMultusCNI(c, addr) },
@@ -197,21 +244,21 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				// Longhorn needs storage-classes.yaml in the auto-deploy
 				// dir before its config is applied (real dep).
 				//
-				// BestEffort with the full 10-min wait timeout — Apply
+				// BestEffort with the full 10-min ready timeout — Apply
 				// still runs synchronously and writes
-				// state.LonghornInitialized, but WaitReady is
-				// downgraded so the rest of the deploy (and the
-				// FSM's transition to RUNNING) doesn't block on
-				// Longhorn's CR convergence. runHealthWorker's
+				// state.LonghornInitialized, but Ready is downgraded
+				// so the rest of the deploy (and the FSM's transition
+				// to RUNNING) doesn't block on Longhorn's CR
+				// convergence. runHealthWorker's
 				// LonghornPostInstallConfig gates its work on
-				// Longhorn_is_ready, so steady-state ticks
-				// reconcile any apply that hasn't converged yet.
-				Name:                       "longhorn",
-				Deps:                       []string{"manifests"},
-				Apply:                      func(c context.Context) error { return InstallLonghorn(c, deviceName) },
-				WaitReady:                  WaitLonghornReady,
-				BestEffort:                 true,
-				BestEffortWaitReadyTimeout: longhornWaitTimeout,
+				// Longhorn_is_ready, so steady-state ticks reconcile
+				// any apply that hasn't converged yet.
+				Name:         "longhorn",
+				PolicyDeps:   []string{"manifests"},
+				Apply:        func(c context.Context) error { return InstallLonghorn(c, deviceName) },
+				Ready:        WaitLonghornReady,
+				BestEffort:   true,
+				ReadyTimeout: longhornWaitTimeout,
 			},
 			{
 				Name:  "descheduler",
@@ -220,20 +267,20 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 		},
 	}
 	if installKubevirt {
-		g.Nodes = append(g.Nodes,
-			deploy.Node{
-				Name:                       "kubevirt",
-				Apply:                      InstallKubeVirt,
-				WaitReady:                  WaitKubeVirtReady,
-				BestEffort:                 true,
-				BestEffortWaitReadyTimeout: kubevirtCRDeployedWaitTimeout,
+		g.Components = append(g.Components,
+			deploy.Component{
+				Name:         "kubevirt",
+				Apply:        InstallKubeVirt,
+				Ready:        WaitKubeVirtReady,
+				BestEffort:   true,
+				ReadyTimeout: kubevirtCRDeployedWaitTimeout,
 			},
-			deploy.Node{
-				Name:                       "cdi",
-				Apply:                      InstallCDI,
-				WaitReady:                  WaitCDIReady,
-				BestEffort:                 true,
-				BestEffortWaitReadyTimeout: cdiCRDeployedWaitTimeout,
+			deploy.Component{
+				Name:         "cdi",
+				Apply:        InstallCDI,
+				Ready:        WaitCDIReady,
+				BestEffort:   true,
+				ReadyTimeout: cdiCRDeployedWaitTimeout,
 			},
 		)
 	}
@@ -440,32 +487,33 @@ func InstallKubeVirt(ctx context.Context) error {
 		return nil
 	}
 
+	kc := kubeclient.Default()
 	log.Printf("installing KubeVirt operator")
-	if err := kubectlx.ApplyWithBackoff(ctx, kubevirtOperator, kubectlx.ApplyOptions{}); err != nil {
+	if err := kubectlx.ApplyFile(ctx, kc, kubevirtOperator, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply kubevirt operator: %w", err)
 	}
 
 	// Wait for virt-operator before applying the CR — the operator
 	// owns the KubeVirt CRD admission webhook; applying the CR
 	// before the operator is Ready races both.
-	if err := kubectlx.WaitDeploymentReady(ctx, kubevirtNamespace,
+	if err := kubectlx.WaitDeploymentReady(ctx, kc, kubevirtNamespace,
 		kubevirtOperatorDeployment, kubevirtOperatorWaitTimeout); err != nil {
 		return fmt.Errorf("wait virt-operator ready: %w", err)
 	}
 
 	log.Printf("applying KubeVirt CR")
-	if err := kubectlx.ApplyWithBackoff(ctx, kubevirtCRURL, kubectlx.ApplyOptions{}); err != nil {
+	if err := kubectlx.ApplyURL(ctx, kc, kubevirtCRURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply kubevirt CR: %w", err)
 	}
 
 	// Replica patch is best-effort — the CR controller may still be
 	// starting; the next steady-state tick will reconcile.
-	if err := kubeVirtConfigReplicas(3); err != nil {
+	if err := kubeVirtConfigReplicas(ctx, 3); err != nil {
 		log.Printf("warning: KubeVirt replica count patch: %v", err)
 	}
 
 	log.Printf("applying KubeVirt feature gates")
-	if err := kubectlx.ApplyWithBackoff(ctx, kubevirtFeatures, kubectlx.ApplyOptions{}); err != nil {
+	if err := kubectlx.ApplyFile(ctx, kc, kubevirtFeatures, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply kubevirt features: %w", err)
 	}
 
@@ -479,24 +527,47 @@ func InstallKubeVirt(ctx context.Context) error {
 // WaitKubeVirtReady blocks until the KubeVirt CR reports
 // status.phase=Deployed.
 func WaitKubeVirtReady(ctx context.Context) error {
-	return kubectlx.WaitForCondition(ctx,
-		"kubevirt", kubevirtNamespace, kubevirtCRName,
+	return kubectlx.WaitForCondition(ctx, kubeclient.Default(),
+		kubevirtGVK, kubevirtNamespace, kubevirtCRName,
 		"{.status.phase}", "Deployed",
 		kubevirtCRDeployedWaitTimeout)
 }
 
 // kubeVirtConfigReplicas patches virt-operator Deployment replicas
 // and KubeVirt CR infra.replicas in one shot.
-func kubeVirtConfigReplicas(replicas int) error {
+//
+// Uses server-side apply with a dedicated field manager
+// ("kube-init-replicas") so subsequent SSAs of the operator
+// manifest under FM="kube-init" don't race for ownership of
+// .spec.replicas — the two managers own disjoint fields cleanly,
+// and both use Force via kubectlx's default so field-manager
+// hand-off is transparent. Merge patches don't work here: they
+// create an Update-op ownership record that SSA sees as a foreign
+// owner and rejects with a conflict on retry.
+func kubeVirtConfigReplicas(ctx context.Context, replicas int) error {
 	log.Printf("setting virt-operator and KubeVirt infra replicas to %d", replicas)
-	deployPatch := fmt.Sprintf(`{"spec":{"replicas": %d}}`, replicas)
-	if _, err := kubectl("patch", "deployment", "virt-operator",
-		"-n", kubevirtNamespace, "--patch", deployPatch); err != nil {
+	kc := kubeclient.Default()
+
+	deployApply := fmt.Sprintf(
+		`{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"virt-operator","namespace":%q},"spec":{"replicas":%d}}`,
+		kubevirtNamespace, replicas)
+	force := true
+	if _, err := kc.Clientset.AppsV1().Deployments(kubevirtNamespace).
+		Patch(ctx, "virt-operator", types.ApplyPatchType,
+			[]byte(deployApply),
+			metav1.PatchOptions{FieldManager: "kube-init-replicas", Force: &force},
+		); err != nil {
 		return fmt.Errorf("patch virt-operator deployment: %w", err)
 	}
-	crPatch := fmt.Sprintf(`{"spec":{"infra":{"replicas": %d}}}`, replicas)
-	if _, err := kubectl("patch", "KubeVirt", "kubevirt",
-		"-n", kubevirtNamespace, "--type=merge", "--patch", crPatch); err != nil {
+
+	crApply := fmt.Sprintf(
+		`{"apiVersion":"kubevirt.io/v1","kind":"KubeVirt","metadata":{"name":"kubevirt","namespace":%q},"spec":{"infra":{"replicas":%d}}}`,
+		kubevirtNamespace, replicas)
+	kubevirtGVR := kubevirtGVK.GroupVersion().WithResource("kubevirts")
+	if _, err := kc.Dynamic.Resource(kubevirtGVR).Namespace(kubevirtNamespace).
+		Patch(ctx, "kubevirt", types.ApplyPatchType, []byte(crApply),
+			metav1.PatchOptions{FieldManager: "kube-init-replicas", Force: &force},
+		); err != nil {
 		return fmt.Errorf("patch KubeVirt CR infra.replicas: %w", err)
 	}
 	return nil
@@ -517,15 +588,16 @@ func InstallCDI(ctx context.Context) error {
 		"https://github.com/kubevirt/containerized-data-importer/releases/download/%s/cdi-cr.yaml",
 		cdiVersion)
 
+	kc := kubeclient.Default()
 	log.Printf("installing CDI %s", cdiVersion)
-	if err := kubectlx.ApplyWithBackoff(ctx, cdiOperatorURL, kubectlx.ApplyOptions{}); err != nil {
+	if err := kubectlx.ApplyURL(ctx, kc, cdiOperatorURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply CDI operator: %w", err)
 	}
-	if err := kubectlx.WaitDeploymentReady(ctx, cdiNamespace,
+	if err := kubectlx.WaitDeploymentReady(ctx, kc, cdiNamespace,
 		cdiOperatorDeployment, cdiOperatorWaitTimeout); err != nil {
 		return fmt.Errorf("wait cdi-operator ready: %w", err)
 	}
-	if err := kubectlx.ApplyWithBackoff(ctx, cdiCRURL, kubectlx.ApplyOptions{}); err != nil {
+	if err := kubectlx.ApplyURL(ctx, kc, cdiCRURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply CDI CR: %w", err)
 	}
 	log.Printf("CDI installation complete")
@@ -534,8 +606,8 @@ func InstallCDI(ctx context.Context) error {
 
 // WaitCDIReady blocks until the CDI CR reports phase=Deployed.
 func WaitCDIReady(ctx context.Context) error {
-	return kubectlx.WaitForCondition(ctx,
-		"cdi", "", cdiCRName,
+	return kubectlx.WaitForCondition(ctx, kubeclient.Default(),
+		cdiGVK, "", cdiCRName,
 		"{.status.phase}", "Deployed",
 		cdiCRDeployedWaitTimeout)
 }
@@ -621,7 +693,7 @@ func InstallLonghorn(ctx context.Context, deviceName string) error {
 
 	log.Printf("installing Longhorn")
 	longhornPreflightCheck()
-	applyLonghornDiskConfig(deviceName)
+	applyLonghornDiskConfig(ctx, deviceName)
 
 	cfgData, err := os.ReadFile(longhornCfg)
 	if err != nil {
@@ -649,29 +721,85 @@ func InstallLonghorn(ctx context.Context, deviceName string) error {
 	return nil
 }
 
-// WaitLonghornReady polls for DaemonSet readiness + Longhorn node
-// object existence; times out after longhornWaitTimeout.
+// WaitLonghornReady blocks until every Longhorn DaemonSet is ready
+// AND the Longhorn node object for this device exists — informer-
+// driven, no polling. Watches DaemonSets in longhorn-system and
+// longhorn.io/Node objects (via a local dynamic informer factory
+// scoped to this call), re-evaluates the compound predicate on
+// every event, returns as soon as both conditions hold.
+//
+// Times out after longhornWaitTimeout.
 func WaitLonghornReady(ctx context.Context) error {
 	log.Printf("waiting for Longhorn readiness (timeout %v)", longhornWaitTimeout)
-	deadline := time.Now().Add(longhornWaitTimeout)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+
+	waitCtx, cancel := context.WithTimeout(ctx, longhornWaitTimeout)
+	defer cancel()
+
+	kc := kubeclient.Default()
+
+	// The shared typed factory (kc.InformerFactory) already runs a
+	// DaemonSets informer against every namespace, so we register a
+	// handler and reuse the cache. longhorn.io/Node is not typed —
+	// spin up a local dynamic factory scoped to waitCtx so its
+	// goroutines exit when this call returns.
+	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(
+		kc.Dynamic, 30*time.Minute)
+	longhornNodesInformer := dynFactory.ForResource(longhornNodesGVR).Informer()
+
+	ready := make(chan struct{}, 1)
+	signalReady := func() {
+		select {
+		case ready <- struct{}{}:
+		default:
 		}
-		if time.Now().After(deadline) {
+	}
+	check := func() {
+		if longhornDaemonSetsReady(waitCtx) && longhornNodeExists(waitCtx) {
+			signalReady()
+		}
+	}
+
+	dsInformer := kc.InformerFactory.Apps().V1().DaemonSets().Informer()
+	dsReg, err := dsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { check() },
+		UpdateFunc: func(_, _ any) { check() },
+	})
+	if err != nil {
+		return fmt.Errorf("add daemonset event handler: %w", err)
+	}
+	defer func() { _ = dsInformer.RemoveEventHandler(dsReg) }()
+
+	nodeReg, err := longhornNodesInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { check() },
+		UpdateFunc: func(_, _ any) { check() },
+	})
+	if err != nil {
+		return fmt.Errorf("add longhorn node event handler: %w", err)
+	}
+	defer func() { _ = longhornNodesInformer.RemoveEventHandler(nodeReg) }()
+
+	// Start the dynamic factory (typed factory is already running
+	// under the daemon's root ctx). Both stop when waitCtx is done.
+	dynFactory.Start(waitCtx.Done())
+	if !cache.WaitForCacheSync(waitCtx.Done(), longhornNodesInformer.HasSynced) {
+		return fmt.Errorf("longhorn node informer failed to sync: %w", waitCtx.Err())
+	}
+
+	// Kick off with a synchronous check — the informer caches may
+	// already show a Ready state (steady-state re-entry), and we'd
+	// otherwise block waiting for the next event that never comes.
+	check()
+
+	select {
+	case <-ready:
+		log.Printf("Longhorn is ready")
+		return nil
+	case <-waitCtx.Done():
+		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("timed out waiting for Longhorn readiness after %v",
 				longhornWaitTimeout)
 		}
-		if longhornDaemonSetsReady() && longhornNodeExists() {
-			log.Printf("Longhorn is ready")
-			return nil
-		}
-		log.Printf("Longhorn not yet ready, rechecking in 10s")
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Second):
-		}
+		return waitCtx.Err()
 	}
 }
 
@@ -697,26 +825,18 @@ func InstallDescheduler(ctx context.Context) error {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// kubectl is the package-local wrapper around kubectlx.Run.
-func kubectl(args ...string) (string, error) {
-	return kubectlx.Run(args...)
-}
+// kubectl (formerly a shell-out wrapper) has been removed. Every
+// component now calls client-go directly. Longhorn's kubectl-exec
+// callsite is the sole remaining shell-out in this package — see
+// components/longhorn.go for its migration status.
 
-// kubectlApply runs `kubectl apply -f <file>` with the kubectlx
-// backoff/classification wrapper. The retry loop is REQUIRED for
-// manifests that combine a CRD and a custom resource of that CRD
-// in the same file (e.g. multus-daemonset.yaml ships a
-// NetworkAttachmentDefinition CRD plus a NAD instance): kubectl's
-// API-discovery cache is built at process start, so the first
-// apply creates the CRD but errors on the CR with "no matches for
-// kind". ApplyWithBackoff classifies that as Transient and retries
-// after backoff, by which point the CRD is established.
-//
-// Defaults (kubectlx.ApplyOptions{}): 10 attempts, 1-30 s backoff,
-// 60 s per-attempt timeout. The caller's ctx still bounds the
-// total wall-clock.
+// kubectlApply applies a manifest file via client-go server-side
+// apply. The retry-on-NoKindMatchError inside kubectlx.ApplyFile
+// handles the CRD-then-CR race that manifests like multus-daemonset.yaml
+// hit (the CRD + a CR of that kind in one file — the first pass
+// creates the CRD, the second sees it).
 func kubectlApply(ctx context.Context, yamlFile string) error {
-	return kubectlx.ApplyWithBackoff(ctx, yamlFile, kubectlx.ApplyOptions{})
+	return kubectlx.ApplyFile(ctx, kubeclient.Default(), yamlFile, kubectlx.ApplyOptions{})
 }
 
 // copyFile copies src to dst, preserving the source's mode bits.
@@ -931,47 +1051,36 @@ func parseFirstIPv4(ipAddrOutput string) string {
 
 // applyLonghornDiskConfig labels + annotates the local node for
 // Longhorn's default-disk discovery.
-func applyLonghornDiskConfig(deviceName string) {
+func applyLonghornDiskConfig(ctx context.Context, deviceName string) {
 	nodeName := state.ToK8sName(deviceName)
-	if _, err := kubectl("label", "node", nodeName,
-		"node.longhorn.io/create-default-disk=config", "--overwrite"); err != nil {
-		log.Printf("warning: label node for longhorn disk: %v", err)
-	}
-	annotation := fmt.Sprintf(
-		`node.longhorn.io/default-disks-config=[ { "path":%q, "allowScheduling":true }]`,
-		longhornDiskPath)
-	if _, err := kubectl("annotate", "node", nodeName, annotation,
-		"--overwrite"); err != nil {
-		log.Printf("warning: annotate node for longhorn disk: %v", err)
+	nodes := kubeclient.Default().Clientset.CoreV1().Nodes()
+	patch := fmt.Sprintf(
+		`{"metadata":{"labels":{"node.longhorn.io/create-default-disk":"config"},"annotations":{"node.longhorn.io/default-disks-config":%q}}}`,
+		fmt.Sprintf(`[ { "path":%q, "allowScheduling":true }]`, longhornDiskPath))
+	if _, err := nodes.Patch(ctx, nodeName,
+		types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		log.Printf("warning: label/annotate node for longhorn disk: %v", err)
 	}
 }
 
 // longhornDaemonSetsReady returns true when every DaemonSet in
 // longhorn-system has numberReady == desiredNumberScheduled (and
 // neither is 0). At least three DaemonSets are expected.
-func longhornDaemonSetsReady() bool {
-	out, err := kubectl("get", "daemonsets", "-n", longhornNamespace,
-		"-o", `jsonpath={range .items[*]}{.status.numberReady},{.status.desiredNumberScheduled}{"\n"}{end}`)
+func longhornDaemonSetsReady(ctx context.Context) bool {
+	list, err := kubeclient.Default().Clientset.AppsV1().
+		DaemonSets(longhornNamespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		log.Printf("warning: list longhorn daemonsets: %v", err)
 		return false
 	}
-	return parseLonghornDSReady(out)
-}
-
-// parseLonghornDSReady is the pure half of longhornDaemonSetsReady,
-// factored out so the parsing logic is testable without a cluster.
-func parseLonghornDSReady(jsonpathOutput string) bool {
-	lines := strings.Split(strings.TrimSpace(jsonpathOutput), "\n")
-	if len(lines) < 3 {
+	if len(list.Items) < 3 {
 		return false
 	}
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	for _, ds := range list.Items {
+		if ds.Status.DesiredNumberScheduled == 0 {
+			return false
 		}
-		parts := strings.SplitN(line, ",", 2)
-		if len(parts) != 2 || parts[0] != parts[1] || parts[0] == "0" {
+		if ds.Status.NumberReady != ds.Status.DesiredNumberScheduled {
 			return false
 		}
 	}
@@ -983,15 +1092,27 @@ func parseLonghornDSReady(jsonpathOutput string) bool {
 // create it (the manager won't initialise without one); a create
 // failure is logged so a steady-state hot loop in WaitLonghornReady
 // is debuggable.
-func longhornNodeExists() bool {
+func longhornNodeExists(ctx context.Context) bool {
 	devName := readDeviceK8sName()
 	if devName == "" {
 		return false
 	}
-	if _, err := kubectl("get", "nodes.longhorn.io", devName,
-		"-n", longhornNamespace); err != nil {
+	longhornNodesGVR := schema.GroupVersionResource{
+		Group: "longhorn.io", Version: "v1beta2", Resource: "nodes",
+	}
+	if _, err := kubeclient.Default().Dynamic.Resource(longhornNodesGVR).
+		Namespace(longhornNamespace).Get(ctx, devName,
+		metav1.GetOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			// Any non-NotFound error (auth, timeout, dial failure) is
+			// NOT "node missing" — attempting Create on repeat monitor
+			// ticks just hammers the API with pointless attempts that
+			// will hit the same underlying failure.
+			log.Printf("warning: get longhorn node %s: %v", devName, err)
+			return false
+		}
 		log.Printf("longhorn node %s not found, attempting to create", devName)
-		if cErr := longhornNodeCreate(devName); cErr != nil {
+		if cErr := longhornNodeCreate(ctx, devName); cErr != nil {
 			log.Printf("warning: create longhorn node %s: %v", devName, cErr)
 		}
 		return false
@@ -1000,9 +1121,8 @@ func longhornNodeExists() bool {
 }
 
 // longhornNodeCreate creates a minimal Longhorn Node object so the
-// Longhorn manager can initialise. Returns the kubectl error
-// (including the trimmed stderr) on failure.
-func longhornNodeCreate(name string) error {
+// Longhorn manager can initialise.
+func longhornNodeCreate(ctx context.Context, name string) error {
 	yaml := fmt.Sprintf(`---
 apiVersion: longhorn.io/v1beta2
 kind: Node
@@ -1014,12 +1134,9 @@ spec:
   evictionRequested: false
   tags: []
 `, name)
-	cmd := kubectlx.Cmd("apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(yaml)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("kubectl apply longhorn node %s: %w (output: %s)",
-			name, err, strings.TrimSpace(string(out)))
+	if err := kubectlx.Apply(ctx, kubeclient.Default(),
+		[]byte(yaml), kubectlx.ApplyOptions{}); err != nil {
+		return fmt.Errorf("apply longhorn node %s: %w", name, err)
 	}
 	return nil
 }

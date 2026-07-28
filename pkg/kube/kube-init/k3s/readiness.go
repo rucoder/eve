@@ -4,7 +4,6 @@
 package k3s
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +13,13 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/edgenodeinfo"
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
 // Readiness-wait cadences. Vars so tests can shrink them.
@@ -43,6 +47,16 @@ func WaitReady(ctx context.Context, timeout time.Duration) error {
 		return fmt.Errorf("wait kubeconfig: %w", err)
 	}
 
+	// Build a client-go clientset now that the kubeconfig exists.
+	// Dial errors against the not-yet-serving API surface as
+	// per-Get failures below and drive the poll loops — no shell-out.
+	// This client is local to WaitReady; the daemon-scoped
+	// kubeclient.Default() is initialised separately by main.
+	kc, err := kubeclient.New(state.K3sKubeconfig)
+	if err != nil {
+		return fmt.Errorf("build kubeclient: %w", err)
+	}
+
 	info, ok := edgenodeinfo.Get()
 	if !ok {
 		return fmt.Errorf("EdgeNodeInfo not yet published; subscription has not delivered")
@@ -56,15 +70,15 @@ func WaitReady(ctx context.Context, timeout time.Duration) error {
 	}
 	nodeName := state.ToK8sName(info.DeviceName)
 
-	if err := waitNodeReady(ctx, nodeName); err != nil {
+	if err := waitNodeReady(ctx, kc.Clientset, nodeName); err != nil {
 		return fmt.Errorf("wait node ready: %w", err)
 	}
 
-	if err := labelNodeUUID(nodeName, uuid); err != nil {
+	if err := labelNodeUUID(ctx, kc.Clientset, nodeName, uuid); err != nil {
 		log.Printf("warning: failed to label node %s with uuid: %v", nodeName, err)
 	}
 
-	if err := waitSystemPodsReady(ctx); err != nil {
+	if err := waitSystemPodsReady(ctx, kc.Clientset); err != nil {
 		return fmt.Errorf("wait system pods ready: %w", err)
 	}
 	log.Printf("k3s is fully ready")
@@ -134,9 +148,10 @@ func copyKubeconfig() error {
 	return nil
 }
 
-// waitNodeReady polls `kubectl get node/<name>` until the node
-// shows Ready status.
-func waitNodeReady(ctx context.Context, nodeName string) error {
+// waitNodeReady polls the API server until the named node reports
+// Ready=True. API-server dial errors and NotFound (node hasn't
+// registered yet) drive the poll — anything else surfaces.
+func waitNodeReady(ctx context.Context, cs kubernetes.Interface, nodeName string) error {
 	log.Printf("waiting for node %s to be Ready", nodeName)
 
 	ticker := time.NewTicker(nodeReadyPollInterval)
@@ -148,35 +163,23 @@ func waitNodeReady(ctx context.Context, nodeName string) error {
 				nodeName, ctx.Err())
 		case <-ticker.C:
 		}
-		out, err := kubectlx.Run("get", "node/"+nodeName, "--no-headers")
+		n, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
-			// kubectl returns non-zero while the API is starting up
-			// or while the node hasn't registered yet — keep polling.
+			// API not up yet, or node not registered — keep polling.
 			continue
 		}
-		if nodeIsReady(out, nodeName) {
+		if nodeIsReady(n) {
 			log.Printf("node %s is Ready", nodeName)
 			return nil
 		}
 	}
 }
 
-// nodeIsReady parses `kubectl get node/X --no-headers` output and
-// reports whether the named node is in Ready status.
-//
-// Output line shape:
-//
-//	mynode   Ready    control-plane,master   5m   v1.34.2+k3s1
-//	mynode   NotReady control-plane,master   1s   v1.34.2+k3s1
-//
-// Scans every line and matches on both the nodeName column and the
-// status column — never on the status column alone, because a
-// multi-row response with the wrong node first would false-positive.
-func nodeIsReady(kubectlOutput, nodeName string) bool {
-	scanner := bufio.NewScanner(strings.NewReader(kubectlOutput))
-	for scanner.Scan() {
-		f := strings.Fields(scanner.Text())
-		if len(f) >= 2 && f[0] == nodeName && f[1] == "Ready" {
+// nodeIsReady inspects a Node's status conditions and returns true
+// when the Ready condition is True.
+func nodeIsReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
 			return true
 		}
 	}
@@ -184,12 +187,18 @@ func nodeIsReady(kubectlOutput, nodeName string) bool {
 }
 
 // labelNodeUUID applies the `node-uuid=<uuid>` label to nodeName,
-// overwriting any prior value.
-func labelNodeUUID(nodeName, uuid string) error {
-	label := fmt.Sprintf("node-uuid=%s", uuid)
-	out, err := kubectlx.Run("label", "node", nodeName, label, "--overwrite")
+// overwriting any prior value. Uses a JSON merge patch so partial
+// label maps on the object are preserved.
+func labelNodeUUID(ctx context.Context, cs kubernetes.Interface, nodeName, uuid string) error {
+	patch := fmt.Sprintf(`{"metadata":{"labels":{"node-uuid":%q}}}`, uuid)
+	_, err := cs.CoreV1().Nodes().Patch(ctx, nodeName,
+		types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("kubectl label: %w (output: %s)", err, out)
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("label node %s: not found (registration race?): %w",
+				nodeName, err)
+		}
+		return fmt.Errorf("label node %s: %w", nodeName, err)
 	}
 	log.Printf("labelled node %s with node-uuid=%s", nodeName, uuid)
 	return nil
@@ -199,7 +208,7 @@ func labelNodeUUID(nodeName, uuid string) error {
 // Ready or has finished (Completed/Succeeded). Progress is logged
 // every time the ready/total count changes, including the list of
 // pods we are still waiting on.
-func waitSystemPodsReady(ctx context.Context) error {
+func waitSystemPodsReady(ctx context.Context, cs kubernetes.Interface) error {
 	log.Printf("waiting for all system pods to be Ready")
 	ticker := time.NewTicker(podReadyPollInterval)
 	defer ticker.Stop()
@@ -211,7 +220,7 @@ func waitSystemPodsReady(ctx context.Context) error {
 			return fmt.Errorf("timed out waiting for system pods: %w", ctx.Err())
 		case <-ticker.C:
 		}
-		ready, total, notReady := countSystemPods()
+		ready, total, notReady := countSystemPods(ctx, cs)
 		if total == 0 {
 			continue
 		}
@@ -229,49 +238,45 @@ func waitSystemPodsReady(ctx context.Context) error {
 	}
 }
 
-// countSystemPods queries `kubectl -n kube-system get pods` and
-// returns (readyCount, totalCount, notReadyDescriptions). Errors
-// and empty output collapse to (0, 0, nil) — they may be transient
-// during api-server startup; the caller is expected to keep polling.
-func countSystemPods() (int, int, []string) {
-	out, err := kubectlx.Run("-n", "kube-system", "get", "pods", "--no-headers")
-	if err != nil || strings.TrimSpace(out) == "" {
+// countSystemPods lists kube-system pods and classifies each by
+// readiness. Transient API errors collapse to (0, 0, nil) — the
+// caller keeps polling.
+func countSystemPods(ctx context.Context, cs kubernetes.Interface) (int, int, []string) {
+	pods, err := cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{})
+	if err != nil || pods == nil || len(pods.Items) == 0 {
 		return 0, 0, nil
 	}
-	return parseSystemPodsOutput(out)
-}
-
-// parseSystemPodsOutput is the pure-string half of countSystemPods,
-// factored out so tests can drive it with canned kubectl outputs.
-//
-// Each input line is `NAME READY STATUS RESTARTS AGE`. A pod counts
-// as ready when:
-//   - STATUS is Completed or Succeeded (finished Job pods), OR
-//   - the READY column shows all containers ready (e.g. "1/1") AND
-//     is not "0/N".
-//
-// Not-ready descriptions include the status in parentheses so
-// operator output identifies the failure mode at a glance.
-func parseSystemPodsOutput(out string) (int, int, []string) {
 	var ready, total int
 	var notReady []string
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
+	for _, p := range pods.Items {
 		total++
-		status := fields[2]
-		if status == "Completed" || status == "Succeeded" {
+		if p.Status.Phase == corev1.PodSucceeded {
 			ready++
 			continue
 		}
-		parts := strings.SplitN(fields[1], "/", 2)
-		if len(parts) == 2 && parts[0] == parts[1] && parts[0] != "0" {
+		if p.Status.Phase != corev1.PodRunning {
+			notReady = append(notReady, p.Name+"("+string(p.Status.Phase)+")")
+			continue
+		}
+		if podContainersReady(&p) {
 			ready++
 		} else {
-			notReady = append(notReady, fields[0]+"("+status+")")
+			notReady = append(notReady, p.Name+"("+string(p.Status.Phase)+")")
 		}
 	}
 	return ready, total, notReady
+}
+
+// podContainersReady returns true if every container has Ready=True.
+// Matches `kubectl get pods` READY column semantics.
+func podContainersReady(p *corev1.Pod) bool {
+	if len(p.Status.ContainerStatuses) == 0 {
+		return false
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if !cs.Ready {
+			return false
+		}
+	}
+	return true
 }

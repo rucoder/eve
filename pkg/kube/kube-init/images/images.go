@@ -19,7 +19,6 @@
 package images
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
 )
 
 const (
@@ -156,7 +156,12 @@ func ImportAll(ctx context.Context, eveRelease string, installKubevirt bool) err
 // pull the image from its registry on first use.
 func ImportUpstreamImage(ctx context.Context, tarball, imageName, tag string) error {
 	fullRef := imageName + ":" + tag
-	if imageExists(fullRef) {
+	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	defer cc.Close()
+	if exists, err := cc.ImageExists(ctx, fullRef); err == nil && exists {
 		return nil
 	}
 	if _, err := os.Stat(tarball); err != nil {
@@ -168,7 +173,7 @@ func ImportUpstreamImage(ctx context.Context, tarball, imageName, tag string) er
 		return fmt.Errorf("stat %s: %w", tarball, err)
 	}
 	log.Printf("importing upstream image %s from %s", fullRef, tarball)
-	if _, err := kubectlx.CtrRunContext(ctx, "images", "import", tarball); err != nil {
+	if _, err := cc.ImportImage(ctx, tarball); err != nil {
 		return fmt.Errorf("import %s: %w", tarball, err)
 	}
 	log.Printf("successfully imported upstream image %s", fullRef)
@@ -193,31 +198,39 @@ func ImportExternalBootImage(ctx context.Context, eveRelease string) error {
 	}
 
 	fullImageName := ExternalBootImageName + ":" + eveRelease
-	if imageExists(fullImageName) {
+	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	defer cc.Close()
+	if exists, err := cc.ImageExists(ctx, fullImageName); err == nil && exists {
 		log.Printf("external-boot-image %s already imported", fullImageName)
-		cleanupOldImages(ctx, ExternalBootImageName, eveRelease)
+		cleanupOldImages(ctx, cc, ExternalBootImageName, eveRelease)
 		return nil
 	}
-	if err := importImage(ctx, ExternalBootImageTar,
+	if err := importImage(ctx, cc, ExternalBootImageTar,
 		ExternalBootImageName, eveRelease); err != nil {
 		return fmt.Errorf("import external-boot-image: %w", err)
 	}
 	log.Printf("successfully imported external-boot-image as %s", fullImageName)
-	cleanupOldImages(ctx, ExternalBootImageName, eveRelease)
+	cleanupOldImages(ctx, cc, ExternalBootImageName, eveRelease)
 	return nil
 }
 
 // importImage is the shared import-then-retag flow for EVE-authored
 // images whose tarball-internal tag may not match the
 // expectedName:expectedTag kubelet pod specs reference. Reads the
-// tarball's manifest.json, imports via ctr, and re-tags if needed.
-func importImage(ctx context.Context, tarball, expectedName, expectedTag string) error {
+// tarball's manifest.json, imports into containerd, and re-tags if
+// the tarball's own name doesn't already match.
+func importImage(ctx context.Context, cc *kubectlx.ContainerdClient,
+	tarball, expectedName, expectedTag string,
+) error {
 	tarballNameTag, err := getImageNameFromTarball(tarball)
 	if err != nil {
 		return fmt.Errorf("read image name from tarball %s: %w", tarball, err)
 	}
 	log.Printf("tarball %s contains image: %s", tarball, tarballNameTag)
-	if _, err := kubectlx.CtrRunContext(ctx, "images", "import", tarball); err != nil {
+	if _, err := cc.ImportImage(ctx, tarball); err != nil {
 		return fmt.Errorf("import %s: %w", tarball, err)
 	}
 	log.Printf("imported tarball %s into containerd", tarball)
@@ -225,8 +238,7 @@ func importImage(ctx context.Context, tarball, expectedName, expectedTag string)
 	target := expectedName + ":" + expectedTag
 	if tarballNameTag != "" && tarballNameTag != "null" && tarballNameTag != target {
 		log.Printf("re-tagging %s -> %s", tarballNameTag, target)
-		if _, err := kubectlx.CtrRunContext(ctx,
-			"images", "tag", tarballNameTag, target); err != nil {
+		if err := cc.TagImage(ctx, tarballNameTag, target); err != nil {
 			return fmt.Errorf("tag %s -> %s: %w", tarballNameTag, target, err)
 		}
 	}
@@ -263,37 +275,29 @@ func parseFirstRepoTag(manifestBytes []byte) (string, error) {
 	return manifests[0].RepoTags[0], nil
 }
 
-// imageExists asks crictl whether the image is present in the
-// k8s.io namespace kubelet consumes. crictl is preferred over ctr
-// here because `ctr images list` does not filter to the kubelet
-// namespace and would produce false positives.
-func imageExists(imageName string) bool {
-	_, err := kubectlx.CrictlRun("inspecti", imageName)
-	return err == nil
-}
-
 // cleanupOldImages lists every image whose name starts with baseName
-// in containerd and removes the entries that don't match the current
-// tag. Prevents stale EVE-authored images from accumulating across
-// upgrades. Best-effort: per-remove failures are warnings.
-func cleanupOldImages(ctx context.Context, baseName, currentTag string) {
+// in containerd's k8s.io namespace and removes the entries that
+// don't match the current tag. Prevents stale EVE-authored images
+// from accumulating across upgrades. Best-effort: per-remove
+// failures are warnings.
+func cleanupOldImages(ctx context.Context, cc *kubectlx.ContainerdClient,
+	baseName, currentTag string,
+) {
 	log.Printf("cleaning up old images for %s, keeping tag: %s", baseName, currentTag)
-	output, err := kubectlx.CtrRunContext(ctx, "images", "list", "-q")
+	refs, err := cc.ListImages(ctx)
 	if err != nil {
 		log.Printf("WARNING: failed to list images for cleanup: %v", err)
 		return
 	}
 	currentImage := baseName + ":" + currentTag
 	prefix := baseName + ":"
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || !strings.HasPrefix(line, prefix) || line == currentImage {
+	for _, ref := range refs {
+		if ref == "" || !strings.HasPrefix(ref, prefix) || ref == currentImage {
 			continue
 		}
-		log.Printf("removing old image: %s", line)
-		if _, rmErr := kubectlx.CtrRunContext(ctx, "images", "rm", line); rmErr != nil {
-			log.Printf("WARNING: failed to remove old image %s: %v", line, rmErr)
+		log.Printf("removing old image: %s", ref)
+		if err := cc.DeleteImage(ctx, ref); err != nil {
+			log.Printf("WARNING: failed to remove old image %s: %v", ref, err)
 		}
 	}
 	log.Printf("old image cleanup completed for %s", baseName)

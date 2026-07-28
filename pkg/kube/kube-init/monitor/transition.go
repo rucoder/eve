@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -117,32 +119,27 @@ func CheckClusterTransitionDone(ctx context.Context) bool {
 }
 
 // countReadyNodes runs `k3s kubectl get nodes` and counts rows
-// whose status column starts with "Ready". Cordoned nodes
-// ("Ready,SchedulingDisabled") count too — they're schedulable
-// for control-plane purposes.
+// whose Ready condition is True. Cordoned nodes (spec.unschedulable=true)
+// count too — they're still Ready for control-plane counting purposes.
+// Non-True Ready collapses to "not counted".
 func countReadyNodes(ctx context.Context) int {
-	// Route through kubectlx so the binary path is `k3s kubectl` —
-	// the kube container does not ship a standalone kubectl.
-	cmd := kubectlx.CmdContext(ctx, "get", "nodes", "--no-headers")
-	out, err := cmd.CombinedOutput()
+	nodes, err := kubeclient.Default().Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0
 	}
-	return parseReadyCount(string(out))
+	return countReady(nodes.Items)
 }
 
-// parseReadyCount is the pure half of countReadyNodes, factored
-// out for unit tests.
-//
-// Counts rows whose status column (field[1]) starts with "Ready".
-// "Ready,SchedulingDisabled" is included (a cordoned tie-breaker
-// node still counts as control-plane-ready); "NotReady" is not.
-func parseReadyCount(kubectlOutput string) int {
+// countReady is the pure half of countReadyNodes, factored out for
+// unit tests. Counts nodes whose Ready condition is True.
+func countReady(nodes []corev1.Node) int {
 	count := 0
-	for _, line := range strings.Split(strings.TrimSpace(kubectlOutput), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && strings.HasPrefix(fields[1], "Ready") {
-			count++
+	for _, n := range nodes {
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
+				count++
+				break
+			}
 		}
 	}
 	return count

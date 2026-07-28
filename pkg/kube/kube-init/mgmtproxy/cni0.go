@@ -9,8 +9,17 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
+
+// cdiGVR is the dynamic resource ref for the CDI CR whose
+// importProxy config we manage from mgmtproxy.
+var cdiGVR = schema.GroupVersionResource{
+	Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "cdis",
+}
 
 // CNI0Result reports the outcome of SetupCNI0ProxyIP without
 // requiring callers to parse error strings. The three "non-error"
@@ -121,11 +130,10 @@ func PatchCDIProxyConfig(ctx context.Context) error {
 		return nil
 	}
 	patch := buildCDIProxyPatch(CNI0URL, cdiImportProxyNoProxy)
-	cmd := kubectlx.CmdContext(ctx, "patch", "cdi", "cdi",
-		"--type", "merge", "-p", patch)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("kubectl patch cdi: %w (output: %s)",
-			err, strings.TrimSpace(string(out)))
+	_, err := kubeclient.Default().Dynamic.Resource(cdiGVR).
+		Patch(ctx, "cdi", types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("patch cdi: %w", err)
 	}
 	return nil
 }
@@ -135,28 +143,33 @@ func PatchCDIProxyConfig(ctx context.Context) error {
 // kubectl error is treated as "not matching" so the caller falls
 // through to the (idempotent) patch attempt.
 func cdiProxyConfigMatches(ctx context.Context, httpsProxy, noProxy string) bool {
-	cur, err := cdiProxyGet(ctx, "{.spec.config.importProxy.HTTPSProxy}")
+	cur, err := cdiProxyGet(ctx, "HTTPSProxy")
 	if err != nil || cur != httpsProxy {
 		return false
 	}
-	cur, err = cdiProxyGet(ctx, "{.spec.config.importProxy.noProxy}")
+	cur, err = cdiProxyGet(ctx, "noProxy")
 	if err != nil || cur != noProxy {
 		return false
 	}
 	return true
 }
 
-// cdiProxyGet reads a single jsonpath from the CDI CR. Empty
-// string with nil error is possible when the field is unset; the
-// caller treats that as a mismatch.
-func cdiProxyGet(ctx context.Context, jsonpath string) (string, error) {
-	cmd := kubectlx.CmdContext(ctx, "get", "cdi", "cdi",
-		"-o", "jsonpath="+jsonpath)
-	out, err := cmd.Output()
+// cdiProxyGet reads a specific field from the CDI CR's
+// spec.config.importProxy. Empty string with nil error is possible
+// when the field is unset; the caller treats that as a mismatch.
+// key is one of "HTTPSProxy" or "noProxy".
+func cdiProxyGet(ctx context.Context, key string) (string, error) {
+	obj, err := kubeclient.Default().Dynamic.Resource(cdiGVR).
+		Get(ctx, "cdi", metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	// spec.config.importProxy.<key>
+	spec, _ := obj.Object["spec"].(map[string]any)
+	config, _ := spec["config"].(map[string]any)
+	importProxy, _ := config["importProxy"].(map[string]any)
+	v, _ := importProxy[key].(string)
+	return v, nil
 }
 
 // buildCDIProxyPatch returns the merge-patch JSON for the CDI CR's

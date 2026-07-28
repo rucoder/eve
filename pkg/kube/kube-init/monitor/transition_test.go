@@ -10,71 +10,17 @@ import (
 	"time"
 )
 
-// TestParseReadyCount covers the kubectl-output parser used to
-// gate the cluster-join state machine. Non-trivial cases:
-//   - "Ready,SchedulingDisabled" must count (cordoned tie-breaker
-//     still satisfies the join quorum).
-//   - "NotReady" must not count.
-//   - Rows with fewer than 2 fields must be ignored without panic.
-//   - Empty / blank output produces 0 (no rows).
-func TestParseReadyCount(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want int
-	}{
-		{
-			name: "two Ready nodes",
-			in:   "n1 Ready master 5m v1\nn2 Ready worker 5m v1",
-			want: 2,
-		},
-		{
-			name: "Ready,SchedulingDisabled counts",
-			in:   "n1 Ready master 5m v1\nn2 Ready,SchedulingDisabled tie 5m v1",
-			want: 2,
-		},
-		{
-			name: "NotReady does not count",
-			in:   "n1 Ready master 5m v1\nn2 NotReady worker 5m v1",
-			want: 1,
-		},
-		{
-			name: "row with one field is skipped (no panic)",
-			in:   "shortrow\nn1 Ready master 5m v1",
-			want: 1,
-		},
-		{
-			name: "empty input → 0",
-			in:   "",
-			want: 0,
-		},
-		{
-			name: "whitespace-only input → 0",
-			in:   "  \n  ",
-			want: 0,
-		},
-		{
-			name: "Ready prefix but different status (e.g. 'ReadyForJoin') counts as Ready",
-			in:   "n1 ReadyForJoin master 5m v1",
-			want: 1,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := parseReadyCount(c.in); got != c.want {
-				t.Errorf("got %d, want %d", got, c.want)
-			}
-		})
-	}
-}
-
 // TestParseTransitionMarker covers the timestamp+counter parse +
-// sanity-check used by CheckClusterTransitionDone. The
-// validation we own:
+// sanity-check used by CheckClusterTransitionDone. The validation
+// we own:
 //   - Two whitespace-separated fields required.
 //   - Timestamp must be > 0.
 //   - Timestamp must not be >60s in the future.
 //   - Reboot count must parse as an int.
+//
+// Restored from the pre-migration test file after the code review
+// noted that parseTransitionMarker is still live but its coverage
+// was dropped along with kubectl-stdout parsers.
 func TestParseTransitionMarker(t *testing.T) {
 	now := time.Now().Unix()
 
@@ -167,5 +113,11 @@ func TestParseTransitionMarker(t *testing.T) {
 				t.Errorf("cnt = %d, want %d", cnt, c.wantCnt)
 			}
 		})
+	}
+
+	// missing file → distinct error surface (os.ReadFile fails before
+	// any field parsing runs).
+	if _, _, err := parseTransitionMarker(dir + "/does-not-exist"); err == nil {
+		t.Errorf("missing file: expected error, got nil")
 	}
 }

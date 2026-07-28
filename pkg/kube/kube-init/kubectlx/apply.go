@@ -4,193 +4,84 @@
 package kubectlx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
-	"strings"
+	"net/http"
+	"os"
 	"time"
+
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/util/retry"
 )
 
-// ErrClass classifies a kubectl failure. The classification drives
-// retry behaviour: only Transient is retried; AlreadyExists is treated
-// as success; Fatal is surfaced immediately.
-type ErrClass int
+// DefaultFieldManager is the server-side apply field-manager used when
+// ApplyOptions.FieldManager is left empty. Every SSA operation from
+// kube-init tags its owned fields with this value so future applies see
+// a stable owner; a change here after devices are in the field would
+// look like a fresh ownership transfer to the API server (harmless but
+// noisy in audit logs), so keep it stable.
+const DefaultFieldManager = "kube-init"
 
-const (
-	// ErrClassUnknown means the stderr did not match any known
-	// pattern. Treated as Transient by ApplyWithBackoff so a novel
-	// kubectl error does not fail outright; logged distinctly so the
-	// pattern table can grow over time.
-	ErrClassUnknown ErrClass = iota
-
-	// ErrClassTransient is a kubectl error that is expected to clear
-	// on its own: discovery cache races, API-server unavailability,
-	// etcd leader changes, webhook readiness races. Worth retrying.
-	ErrClassTransient
-
-	// ErrClassAlreadyExists is short-circuit success — the resource
-	// is already present in the desired state. Most kubectl apply
-	// calls won't hit this (apply is idempotent), but `kubectl create`
-	// and a few apply-with-immutable-field paths can.
-	ErrClassAlreadyExists
-
-	// ErrClassFatal is a configuration or permission error that will
-	// not clear on retry: RBAC forbidden, schema invalid, manifest
-	// not found, unauthorized. Surface immediately.
-	ErrClassFatal
-)
-
-// String returns the short stable name of the error class
-// ("transient", "alreadyExists", "fatal", "unknown"). Used in log
-// lines and in the exhaustion error message; downstream tooling may
-// match on these strings, so keep them stable.
-func (c ErrClass) String() string {
-	switch c {
-	case ErrClassTransient:
-		return "transient"
-	case ErrClassAlreadyExists:
-		return "alreadyExists"
-	case ErrClassFatal:
-		return "fatal"
-	default:
-		return "unknown"
-	}
-}
-
-// transientPatterns are substrings (case-insensitive) that indicate
-// the kubectl error is worth retrying. These are deliberately narrow
-// — anything not on this list and not on the fatal list is treated as
-// ErrClassUnknown (which ApplyWithBackoff retries with a warning).
-var transientPatterns = []string{
-	// CRD discovery cache race: apply a CR immediately after its
-	// CRD before kubectl's discovery cache catches up.
-	"no matches for kind",
-	"the server could not find the requested resource",
-
-	// API server is starting up, restarting, or behind a leader
-	// change. Common during k3s startup. We match both "connection
-	// refused" (Go net dial errors) and "was refused" (kubectl's own
-	// "The connection to the server X was refused" wording).
-	"connection refused",
-	"was refused",
-	"the server is currently unable to handle the request",
-	"etcdserver: leader changed",
-	"etcdserver: request timed out",
-	"i/o timeout",
-	"unexpected eof",
-	"tls handshake timeout",
-
-	// Webhook not yet ready (admission controller pod still
-	// rolling out).
-	"failed calling webhook",
-	// matches kubectl's `webhook "<name>": ... connection refused` chain
-	// when the webhook pod is still rolling out.
-	`webhook "`,
-	"context deadline exceeded",
-
-	// Transient throttling.
-	"too many requests",
-}
-
-// fatalPatterns are substrings (case-insensitive) that indicate the
-// kubectl error will not clear on retry. Surface these immediately so
-// the FSM can move to recycle/backoff instead of spinning forever.
-var fatalPatterns = []string{
-	"forbidden",
-	"unauthorized",
-	"is invalid",
-	"error validating data",
-	"error parsing",
-	// kubectl's exact shape when -f points at a missing manifest:
-	//   error: the path "<path>": no such file or directory
-	// Anchoring on `the path "` avoids matching unrelated ENOENT
-	// messages that can appear in longer error chains (e.g. a missing
-	// kubeconfig path embedded in a transient API error).
-	`the path "`,
-	"unable to recognize", // bad apiVersion in manifest
-}
-
-// alreadyExistsPatterns are substrings (case-insensitive) that
-// indicate the resource is already present. Treated as success.
-var alreadyExistsPatterns = []string{
-	"alreadyexists",
-	"already exists",
-}
-
-// ClassifyKubectlErr inspects kubectl stderr/combined output and
-// returns the appropriate ErrClass. The classifier is intentionally
-// pattern-based rather than parsing structured output: kubectl's
-// human-readable stderr is the only thing that's stable across
-// versions and across different command shapes (apply, create, wait,
-// rollout, ...).
-//
-// The order of checks matters:
-//  1. AlreadyExists wins over everything (we don't want to retry on
-//     a resource that's already there).
-//  2. Fatal wins over Transient (an "invalid" manifest can also
-//     mention "connection refused" in a longer error chain — fail
-//     fast on the structural problem).
-//  3. Transient is the third priority.
-//  4. Unknown is the default.
-func ClassifyKubectlErr(out string) ErrClass {
-	low := strings.ToLower(out)
-
-	for _, p := range alreadyExistsPatterns {
-		if strings.Contains(low, p) {
-			return ErrClassAlreadyExists
-		}
-	}
-	for _, p := range fatalPatterns {
-		if strings.Contains(low, p) {
-			return ErrClassFatal
-		}
-	}
-	for _, p := range transientPatterns {
-		if strings.Contains(low, strings.ToLower(p)) {
-			return ErrClassTransient
-		}
-	}
-	return ErrClassUnknown
-}
-
-// runOnceFn is the package-level seam for executing a single kubectl
-// invocation. Production code uses execRunOnce (which shells out via
-// the local CmdContext helper). Tests override this to return canned
-// (output, error) pairs without spawning kubectl, so the retry loop
-// in runWithBackoff can be exercised hermetically.
-var runOnceFn = execRunOnce
-
-// ApplyOptions tunes ApplyWithBackoff. Zero values give sane defaults.
+// ApplyOptions tunes Apply / ApplyFile / ApplyURL. Zero values give
+// sane defaults suitable for kube-init's boot path.
 type ApplyOptions struct {
-	// MaxAttempts is the absolute cap on retry count. After this
-	// many failed attempts ApplyWithBackoff returns the last error
-	// even if the classification says "transient". Default: 10.
+	// FieldManager identifies the caller for server-side apply. Empty
+	// = DefaultFieldManager ("kube-init"). Override for one-off tools
+	// that should not overwrite kube-init-owned fields.
+	FieldManager string
+
+	// NoForce disables the SSA force-conflict-override that's on by
+	// default. Kube-init owns every component it applies, so field
+	// conflicts against other managers (auto-named MergePatch
+	// managers from our own Deployment-scale calls, brownfield
+	// legacy shell-kubectl ownership, etc.) must be resolved in
+	// favour of the incoming manifest — the alternative is a
+	// permanently-conflicting SSA retry loop, which we've observed
+	// on the KubeVirt virt-operator (design doc §6 predicted this).
+	//
+	// Consumers who genuinely want to defer to an existing owner
+	// can set NoForce: true; every current callsite leaves it zero
+	// (force enabled).
+	NoForce bool
+
+	// Namespace overrides the object's own metadata.namespace for
+	// namespaced kinds. Rarely needed — most manifests already spell
+	// out the target namespace — but supported for parity with
+	// `kubectl apply -n <ns>`. Cluster-scoped kinds ignore this.
+	Namespace string
+
+	// MaxAttempts caps how many times a transient failure is retried.
+	// Zero = default (10).
 	MaxAttempts int
 
-	// InitialBackoff is the first sleep between retries. Default:
-	// 1 second.
+	// InitialBackoff is the first inter-attempt sleep. Zero = 1s.
 	InitialBackoff time.Duration
 
-	// MaxBackoff caps the per-attempt sleep. Default: 30 seconds.
+	// MaxBackoff caps the exponential backoff. Zero = 30s.
 	MaxBackoff time.Duration
 
-	// CommandTimeout bounds each individual kubectl invocation.
-	// 0 means no per-attempt timeout (caller's ctx still applies).
-	// Default: 60 seconds.
-	CommandTimeout time.Duration
-
-	// ExtraArgs are appended to the base apply command. Use for
-	// e.g. `--server-side`, `--field-manager=kube-init`,
-	// `--validate=false`, namespace overrides.
-	ExtraArgs []string
-
-	// rng is overridable for deterministic tests.
-	rng *rand.Rand
+	// PerAttemptTimeout bounds a single Apply request. Zero = 60s.
+	// Set to a longer value for large SSA payloads (operator manifests
+	// with dozens of embedded objects can push past 60s on constrained
+	// devices during initial CRD registration).
+	PerAttemptTimeout time.Duration
 }
 
 func (o *ApplyOptions) withDefaults() {
+	if o.FieldManager == "" {
+		o.FieldManager = DefaultFieldManager
+	}
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = 10
 	}
@@ -200,167 +91,361 @@ func (o *ApplyOptions) withDefaults() {
 	if o.MaxBackoff <= 0 {
 		o.MaxBackoff = 30 * time.Second
 	}
-	if o.CommandTimeout <= 0 {
-		o.CommandTimeout = 60 * time.Second
+	if o.PerAttemptTimeout <= 0 {
+		o.PerAttemptTimeout = 60 * time.Second
 	}
 }
 
-// ErrApplyExhausted is returned by ApplyWithBackoff when MaxAttempts
-// is reached without success. The wrapped error is the last kubectl
-// failure, with classification context preserved in the message.
-var ErrApplyExhausted = errors.New("kubectl apply: max attempts exhausted")
+// ErrApplyExhausted is returned when MaxAttempts is reached without
+// success. The wrapped error is the last apply failure — callers can
+// still inspect it with errors.Is / errors.As.
+var ErrApplyExhausted = errors.New("kubectlx apply: max attempts exhausted")
 
-// ApplyWithBackoff runs `kubectl apply -f <file> [extraArgs...]` with:
-//   - exponential backoff (doubled each attempt, capped at MaxBackoff)
-//   - jitter (uniform 0..backoff/2 added)
-//   - per-attempt timeout (bounds a single kubectl invocation)
-//   - error classification (Fatal short-circuits; AlreadyExists is
-//     success; Transient/Unknown are retried)
-//   - max attempt cap (no spin-forever)
+// Apply parses one or more objects from raw YAML/JSON bytes (multi-doc
+// YAML supported) and server-side-applies each via the dynamic client.
+// Objects are applied in document order, so authors can rely on
+// "CRDs before CRs" within a single manifest — the CRD-just-installed
+// race between docs is resolved by the RESTMapper reset + retry in
+// applyOne.
 //
-// Returns nil on success or AlreadyExists. Returns the wrapped
-// kubectl error for Fatal classifications. When MaxAttempts is reached
-// it returns an error that satisfies both errors.Is(err,
-// ErrApplyExhausted) and errors.Is(err, <last kubectl exec error>),
-// so callers can distinguish "we hit the retry cap" from "fatal" while
-// still being able to inspect the underlying cause.
-//
-// The caller's ctx is honoured throughout — cancelling ctx between
-// attempts aborts the loop immediately, and during an attempt aborts
-// the running kubectl process via KubectlCmdContext.
-func ApplyWithBackoff(ctx context.Context, file string, opts ApplyOptions) error {
+// Returns the first non-nil per-object error. Callers that want
+// best-effort semantics across multiple objects should split the
+// manifest themselves and call Apply per document.
+func Apply(ctx context.Context, kc *kubeclient.Client, data []byte, opts ApplyOptions) error {
 	opts.withDefaults()
-
-	baseArgs := append([]string{"apply", "-f", file}, opts.ExtraArgs...)
-	return runWithBackoff(ctx, baseArgs, opts)
-}
-
-// CreateWithBackoff is the create-equivalent of ApplyWithBackoff. Use
-// for resources where create-not-apply is required (e.g. one-shot
-// Jobs whose generateName must produce a fresh object each time).
-//
-// AlreadyExists is still treated as success — if the caller wants
-// "fail on already exists" they should use raw kubectlx.Run.
-func CreateWithBackoff(ctx context.Context, file string, opts ApplyOptions) error {
-	opts.withDefaults()
-
-	baseArgs := append([]string{"create", "-f", file}, opts.ExtraArgs...)
-	return runWithBackoff(ctx, baseArgs, opts)
-}
-
-// runWithBackoff is the shared retry loop for Apply/Create. Kept
-// unexported so the two public entry points stay the only supported
-// shapes.
-func runWithBackoff(ctx context.Context, baseArgs []string, opts ApplyOptions) error {
-	if opts.rng == nil {
-		opts.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	objs, err := parseManifest(data)
+	if err != nil {
+		return fmt.Errorf("kubectlx apply: parse manifest: %w", err)
 	}
-
-	var lastErr error
-	var lastClass ErrClass
-	backoff := opts.InitialBackoff
-
-	for attempt := 1; attempt <= opts.MaxAttempts; attempt++ {
-		// Honour caller cancellation before each attempt.
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("kubectl %v cancelled before attempt %d: %w",
-				baseArgs, attempt, err)
+	for i, obj := range objs {
+		if err := applyOne(ctx, kc, obj, opts); err != nil {
+			return fmt.Errorf("kubectlx apply doc[%d] (%s): %w",
+				i, describeObj(obj), err)
 		}
+	}
+	return nil
+}
 
-		out, err := runOnceFn(ctx, baseArgs, opts.CommandTimeout)
-		if err == nil {
-			if attempt > 1 {
-				log.Printf("kubectlx: kubectl %v succeeded on attempt %d",
-					baseArgs, attempt)
+// ApplyFile reads a manifest from disk and applies it via Apply.
+func ApplyFile(ctx context.Context, kc *kubeclient.Client, path string, opts ApplyOptions) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("kubectlx apply: read %s: %w", path, err)
+	}
+	return Apply(ctx, kc, data, opts)
+}
+
+// ApplyURL fetches a manifest via HTTP(S) under ctx and applies it.
+// The fetch itself is subject to opts.PerAttemptTimeout on each retry.
+// Non-2xx status is a fatal (non-retryable) error.
+func ApplyURL(ctx context.Context, kc *kubeclient.Client, url string, opts ApplyOptions) error {
+	opts.withDefaults()
+	data, err := fetchURL(ctx, url, opts.PerAttemptTimeout)
+	if err != nil {
+		return fmt.Errorf("kubectlx apply: fetch %s: %w", url, err)
+	}
+	return Apply(ctx, kc, data, opts)
+}
+
+// DeleteFile reads a manifest from disk and deletes each object it
+// contains. Missing objects (NotFound) are folded into nil — the
+// caller's intent (absent) is already satisfied. Errors on individual
+// objects are collected; the first is returned.
+func DeleteFile(ctx context.Context, kc *kubeclient.Client, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("kubectlx delete: read %s: %w", path, err)
+	}
+	return DeleteBytes(ctx, kc, data)
+}
+
+// DeleteURL fetches a manifest and deletes each object it contains.
+func DeleteURL(ctx context.Context, kc *kubeclient.Client, url string) error {
+	data, err := fetchURL(ctx, url, 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("kubectlx delete: fetch %s: %w", url, err)
+	}
+	return DeleteBytes(ctx, kc, data)
+}
+
+// DeleteBytes deletes every object parsed from data. Multi-document
+// YAML is supported. NotFound is not an error.
+func DeleteBytes(ctx context.Context, kc *kubeclient.Client, data []byte) error {
+	objs, err := parseManifest(data)
+	if err != nil {
+		return fmt.Errorf("kubectlx delete: parse manifest: %w", err)
+	}
+	var firstErr error
+	for _, obj := range objs {
+		gvk := obj.GroupVersionKind()
+		var mapping *meta.RESTMapping
+		err := withMapperReset(kc, func() error {
+			m, err := kc.Mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+			if err != nil {
+				return err
 			}
+			mapping = m
 			return nil
+		})
+		if err != nil {
+			if apierrors.IsNotFound(err) || isNoKindMatch(err) {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", describeObj(obj), err)
+			}
+			continue
 		}
-
-		class := ClassifyKubectlErr(out)
-		lastErr = fmt.Errorf("kubectl %v: %w (output: %s)",
-			baseArgs, err, strings.TrimSpace(out))
-		lastClass = class
-
-		switch class {
-		case ErrClassAlreadyExists:
-			log.Printf("kubectlx: kubectl %v: resource already exists, treating as success",
-				baseArgs)
-			return nil
-
-		case ErrClassFatal:
-			log.Printf("kubectlx: kubectl %v: fatal error on attempt %d, not retrying: %v",
-				baseArgs, attempt, lastErr)
-			return lastErr
-
-		case ErrClassUnknown:
-			log.Printf("kubectlx: kubectl %v: unclassified error on attempt %d (retrying): %v",
-				baseArgs, attempt, lastErr)
-
-		case ErrClassTransient:
-			log.Printf("kubectlx: kubectl %v: transient error on attempt %d (retrying): %v",
-				baseArgs, attempt, lastErr)
+		iface := kc.Dynamic.Resource(mapping.Resource)
+		var derr error
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			derr = iface.Namespace(obj.GetNamespace()).
+				Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+		} else {
+			derr = iface.Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
 		}
-
-		// Don't sleep after the final attempt.
-		if attempt == opts.MaxAttempts {
-			break
-		}
-
-		// Exponential backoff with jitter. Jitter is bounded to half
-		// the backoff so the sleep is always in [backoff, 1.5*backoff).
-		jitter := time.Duration(opts.rng.Int63n(int64(backoff/2 + 1)))
-		sleep := backoff + jitter
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("kubectl %v cancelled during backoff after attempt %d (last error: %w): %w",
-				baseArgs, attempt, lastErr, ctx.Err())
-		case <-time.After(sleep):
-		}
-
-		// Double for next attempt, but cap.
-		backoff *= 2
-		if backoff > opts.MaxBackoff {
-			backoff = opts.MaxBackoff
+		if derr != nil && !apierrors.IsNotFound(derr) && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", describeObj(obj), derr)
 		}
 	}
-
-	return errors.Join(
-		fmt.Errorf("%w: kubectl %v failed %d times (last class=%s)",
-			ErrApplyExhausted, baseArgs, opts.MaxAttempts, lastClass),
-		lastErr,
-	)
+	return firstErr
 }
 
-// ErrAttemptTimeout marks an error returned by execRunOnce when the
-// per-attempt timeout fired but the caller's ctx is still alive. This
-// lets the retry loop and tests tell "this single kubectl invocation
-// took too long" apart from "the caller asked us to stop".
-var ErrAttemptTimeout = errors.New("kubectlx: per-attempt timeout")
-
-// execRunOnce executes a single kubectl invocation under a per-attempt
-// timeout (if set) carved from the caller's ctx. Returns the combined
-// output and the exec error.
-//
-// If the per-attempt timeout fires while the caller's ctx is still
-// alive, the returned error wraps ErrAttemptTimeout so callers can
-// distinguish it from caller-driven cancellation. If the caller's ctx
-// is itself cancelled, that cancellation surfaces normally via the
-// exec error.
-func execRunOnce(ctx context.Context, args []string, timeout time.Duration) (string, error) {
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
+// Get retrieves a single object by GVK + namespace + name using the
+// dynamic client. Returns a *unstructured.Unstructured. On
+// NoKindMatchError the RESTMapper is reset and the lookup retried
+// once.
+func Get(
+	ctx context.Context, kc *kubeclient.Client,
+	gvk schema.GroupVersionKind, namespace, name string,
+) (*unstructured.Unstructured, error) {
+	var obj *unstructured.Unstructured
+	err := withMapperReset(kc, func() error {
+		mapping, err := kc.Mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			return err
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			obj, err = kc.Dynamic.Resource(mapping.Resource).
+				Namespace(namespace).Get(reqCtx, name, metav1.GetOptions{})
+		} else {
+			obj, err = kc.Dynamic.Resource(mapping.Resource).
+				Get(reqCtx, name, metav1.GetOptions{})
+		}
+		return err
+	})
+	return obj, err
+}
+
+// applyOne server-side-applies a single unstructured object with retry
+// on transient errors and a mapper-reset-retry on NoKindMatchError.
+func applyOne(
+	ctx context.Context, kc *kubeclient.Client,
+	obj *unstructured.Unstructured, opts ApplyOptions,
+) error {
+	gvk := obj.GroupVersionKind()
+	if opts.Namespace != "" && obj.GetNamespace() == "" {
+		obj.SetNamespace(opts.Namespace)
+	}
+	name := obj.GetName()
+	if name == "" {
+		return fmt.Errorf("object %s has no metadata.name (generateName not supported by SSA)", gvk)
 	}
 
-	cmd := CmdContext(runCtx, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil && timeout > 0 && ctx.Err() == nil && runCtx.Err() != nil {
-		// The runCtx deadline fired but the caller's ctx is still
-		// healthy — this is a per-attempt timeout, not caller cancel.
-		err = fmt.Errorf("%w (after %s): %w", ErrAttemptTimeout, timeout, err)
+	body, err := obj.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("marshal %s/%s: %w", gvk.Kind, name, err)
 	}
-	return string(out), err
+
+	backoff := retry.DefaultBackoff
+	backoff.Duration = opts.InitialBackoff
+	backoff.Cap = opts.MaxBackoff
+	backoff.Steps = opts.MaxAttempts
+	backoff.Factor = 2.0
+	backoff.Jitter = 0.5
+
+	var attempts int
+	err = retry.OnError(backoff, isRetryable, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attempts++
+		return withMapperReset(kc, func() error {
+			mapping, err := kc.Mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+			if err != nil {
+				return err
+			}
+			reqCtx, cancel := context.WithTimeout(ctx, opts.PerAttemptTimeout)
+			defer cancel()
+			force := !opts.NoForce
+			applyOpts := metav1.PatchOptions{
+				FieldManager: opts.FieldManager,
+				Force:        &force,
+			}
+			var iface = kc.Dynamic.Resource(mapping.Resource)
+			if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+				_, err = iface.Namespace(obj.GetNamespace()).
+					Patch(reqCtx, name, types.ApplyPatchType, body, applyOpts)
+			} else {
+				_, err = iface.Patch(reqCtx, name, types.ApplyPatchType, body, applyOpts)
+			}
+			return err
+		})
+	})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// Server-side apply should not surface AlreadyExists (it
+			// reconciles ownership), but a create-shape fallback might.
+			// Treat as success — the object exists in the desired
+			// shape.
+			log.Printf("kubectlx: %s/%s already exists (treating as success)", gvk.Kind, name)
+			return nil
+		}
+		if isRetryable(err) {
+			return fmt.Errorf("%w after %d attempts: %w",
+				ErrApplyExhausted, attempts, err)
+		}
+		return err
+	}
+	if attempts > 1 {
+		log.Printf("kubectlx: %s/%s applied after %d attempts", gvk.Kind, name, attempts)
+	}
+	return nil
+}
+
+// withMapperReset runs fn once; on meta.NoKindMatchError it invalidates
+// the RESTMapper's discovery cache and runs fn a second time. Every
+// other error is passed through unchanged. This handles the
+// CRD-just-installed race in exactly one place — callers do not need to
+// know that mapper resets exist.
+func withMapperReset(kc *kubeclient.Client, fn func() error) error {
+	err := fn()
+	if err == nil {
+		return nil
+	}
+	if !isNoKindMatch(err) {
+		return err
+	}
+	kc.ResetMapper()
+	return fn()
+}
+
+// isNoKindMatch returns true if err's chain contains a
+// meta.NoKindMatchError.
+func isNoKindMatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nkm *meta.NoKindMatchError
+	return errors.As(err, &nkm)
+}
+
+// isRetryable returns true for errors that are worth another attempt:
+// server-side timeouts, service unavailable, transient throttling,
+// generic i/o problems, and CRD-race NoKindMatchError. It intentionally
+// excludes NotFound (Get semantics — the caller decides) and Forbidden
+// / Unauthorized / Invalid (permanent).
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isNoKindMatch(err) {
+		return true
+	}
+	if apierrors.IsServerTimeout(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsTimeout(err) {
+		return true
+	}
+	if apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsInvalid(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsNotFound(err) {
+		return false
+	}
+	// context.Canceled is caller-driven abort (peer-fail cancels
+	// runCtx; daemon shutdown cancels ctx). Retrying just sleeps
+	// through backoffs before the loop-head ctx check catches on —
+	// a spurious ~30s×10 wait during shutdown, and a misleading
+	// "max attempts exhausted: context canceled" surface error.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// context.DeadlineExceeded from a per-attempt timeout is worth
+	// retrying — the caller ctx is still alive (checked at loop head).
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// Unknown errors: retry rather than surface immediately. A novel
+	// error is more often transient plumbing than a permanent misuse.
+	return true
+}
+
+// parseManifest splits a multi-document YAML or JSON payload into
+// unstructured objects. Empty documents (blank space between `---`
+// separators) are skipped. Returns an error only if the entire input
+// is undecodable — a bad document within a multi-doc stream aborts
+// parsing at that document and reports its offset.
+func parseManifest(data []byte) ([]*unstructured.Unstructured, error) {
+	dec := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	var out []*unstructured.Unstructured
+	for i := 0; ; i++ {
+		var raw map[string]any
+		if err := dec.Decode(&raw); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("decode doc %d: %w", i, err)
+		}
+		if len(raw) == 0 {
+			continue
+		}
+		obj := &unstructured.Unstructured{Object: raw}
+		if obj.GetKind() == "" || obj.GetAPIVersion() == "" {
+			return nil, fmt.Errorf("doc %d: missing apiVersion or kind", i)
+		}
+		out = append(out, obj)
+	}
+	return out, nil
+}
+
+// fetchURL is a thin http.Get with a deadline. Any non-2xx status is a
+// fatal error (returned as-is) so the retry classifier doesn't loop on
+// a 404 forever.
+func fetchURL(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("http %d %s", resp.StatusCode, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// describeObj formats an object for error messages: "Kind ns/name" for
+// namespaced objects, "Kind name" for cluster-scoped. Uses just the
+// name if kind is empty (undecoded object).
+func describeObj(obj *unstructured.Unstructured) string {
+	if obj == nil {
+		return "<nil>"
+	}
+	kind := obj.GetKind()
+	name := obj.GetName()
+	if ns := obj.GetNamespace(); ns != "" {
+		return fmt.Sprintf("%s %s/%s", kind, ns, name)
+	}
+	return fmt.Sprintf("%s %s", kind, name)
 }

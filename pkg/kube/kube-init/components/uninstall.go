@@ -14,8 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Uninstall constants. Versions are mirrored from install constants
@@ -29,41 +35,23 @@ const (
 	longhornDeployURL = "https://raw.githubusercontent.com/longhorn/longhorn/" +
 		longhornUninstallVersion + "/deploy/longhorn.yaml"
 
-	// 1000 iterations * 5s = ~83 minutes; Longhorn's data-shred step
-	// can take 30+ minutes on a populated cluster.
 	longhornUninstallMaxPolls     = 1000
 	longhornUninstallPollInterval = 5 * time.Second
 
-	// replicatedStorageUninstallComplete is a one-shot "we got to
-	// the end" marker so a kube-init restart after uninstall
-	// doesn't retry the whole flow.
 	replicatedStorageUninstallComplete state.Marker = "/var/lib/replicated-storage-uninstall-complete"
 )
 
+// storageClassGVR is the CRD-less storage class resource. Used for
+// listing and deleting per-provisioner storage classes.
+var storageClassGVR = schema.GroupVersionResource{
+	Group: "storage.k8s.io", Version: "v1", Resource: "storageclasses",
+}
+
 // ErrLonghornUninstallTimedOut is returned by UninstallLonghorn
 // when the uninstall Job did not complete inside the poll budget.
-// UninstallAll aborts on this sentinel rather than continuing to
-// NativeKubernetesMode marking: declaring the mode while Longhorn
-// volumes are half-shredded would leave the cluster in a worse
-// state than failing loud.
 var ErrLonghornUninstallTimedOut = errors.New("longhorn uninstall job did not complete within poll budget")
 
-// UninstallAll runs the full K3sBase conversion: drains the API,
-// uninstalls every component in reverse dependency order, and sets
-// the NativeKubernetesMode marker on success (the legacy K3sBase
-// conversion-complete gate — see state/markers.go for how it
-// relates to the EnableNativeK8SOrchestration opt-in).
-//
-// Per-component failures are normally warnings — uninstall
-// continues across stale state so partial-uninstall scenarios
-// converge instead of leaving the daemon stuck behind a broken
-// component.
-//
-// Exception: ErrLonghornUninstallTimedOut from UninstallLonghorn
-// aborts the flow. Marking the mode while Longhorn's data-shred
-// Job is still running would leave volumes in an inconsistent
-// state; better to surface the timeout to the FSM so it can
-// retry on the next tick.
+// UninstallAll runs the full K3sBase conversion.
 func UninstallAll(ctx context.Context) error {
 	log.Printf("starting component uninstall for K3sBase conversion")
 
@@ -114,8 +102,9 @@ func UninstallAll(ctx context.Context) error {
 // ConfigMap. Delete failures are warnings (best-effort cleanup).
 func UninstallDescheduler(ctx context.Context) error {
 	log.Printf("uninstalling descheduler")
+	kc := kubeclient.Default()
 	for _, f := range []string{deschedulerRBAC, deschedulerPolicy} {
-		if _, err := kubectl("delete", "-f", f, "--wait=false"); err != nil {
+		if err := kubectlx.DeleteFile(ctx, kc, f); err != nil {
 			log.Printf("warning: delete %s: %v", f, err)
 		}
 	}
@@ -123,37 +112,27 @@ func UninstallDescheduler(ctx context.Context) error {
 	return nil
 }
 
-// UninstallLonghorn performs the full Longhorn teardown:
-// post-install config cleanup, apply uninstall settings, create
-// uninstall job, poll until done (~83 min worst case), delete
-// deploy/job/storage classes, and clear the marker.
-//
-// The first three steps fail-hard because they own the path that
-// actually shreds data — proceeding past a failure here risks
-// inconsistent on-disk state. Post-shred cleanup steps log-and-
-// continue so a partial-uninstall scenario converges instead of
-// stranding the daemon behind a transient kubectl error.
+// UninstallLonghorn performs the full Longhorn teardown.
 func UninstallLonghorn(ctx context.Context) error {
 	log.Printf("uninstalling Longhorn")
 
 	longhornPostInstallConfigClean()
 
-	if err := kubectlx.ApplyWithBackoff(ctx,
+	kc := kubeclient.Default()
+	if err := kubectlx.ApplyFile(ctx, kc,
 		longhornUninstallSettings, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply longhorn uninstall settings: %w", err)
 	}
-	if err := kubectlx.CreateWithBackoff(ctx,
+	if err := kubectlx.ApplyURL(ctx, kc,
 		longhornUninstallJobURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("create longhorn uninstall job: %w", err)
 	}
 	if err := waitForLonghornUninstallJob(ctx); err != nil {
-		// Caller (UninstallAll) special-cases ErrLonghornUninstallTimedOut
-		// and aborts; other errors propagate as ordinary failures.
 		return fmt.Errorf("wait for longhorn uninstall job: %w", err)
 	}
 
 	for _, url := range []string{longhornDeployURL, longhornUninstallJobURL} {
-		if _, err := kubectl("delete", "-f", url); err != nil {
+		if err := kubectlx.DeleteURL(ctx, kc, url); err != nil {
 			log.Printf("warning: delete %s: %v", url, err)
 		}
 	}
@@ -170,6 +149,7 @@ func UninstallLonghorn(ctx context.Context) error {
 // UninstallCDI removes the CDI CR and operator.
 func UninstallCDI(ctx context.Context) error {
 	log.Printf("uninstalling CDI")
+	kc := kubeclient.Default()
 	cdiOperatorURL := fmt.Sprintf(
 		"https://github.com/kubevirt/containerized-data-importer/releases/download/%s/cdi-operator.yaml",
 		cdiVersion)
@@ -177,7 +157,7 @@ func UninstallCDI(ctx context.Context) error {
 		"https://github.com/kubevirt/containerized-data-importer/releases/download/%s/cdi-cr.yaml",
 		cdiVersion)
 	for _, url := range []string{cdiCRURL, cdiOperatorURL} {
-		if _, err := kubectl("delete", "-f", url, "--wait=true"); err != nil {
+		if err := kubectlx.DeleteURL(ctx, kc, url); err != nil {
 			log.Printf("warning: delete %s: %v", url, err)
 		}
 	}
@@ -189,29 +169,45 @@ func UninstallCDI(ctx context.Context) error {
 // webhooks, and every kubevirt.io label from every node.
 func UninstallKubeVirt(ctx context.Context) error {
 	log.Printf("uninstalling KubeVirt")
+	kc := kubeclient.Default()
 
-	if _, err := kubectl("delete", "-n", kubevirtNamespace,
-		"kubevirt", "kubevirt", "--wait=true"); err != nil {
+	// Delete the KubeVirt CR.
+	kubevirtGVR := schema.GroupVersionResource{
+		Group: "kubevirt.io", Version: "v1", Resource: "kubevirts",
+	}
+	if err := kc.Dynamic.Resource(kubevirtGVR).Namespace(kubevirtNamespace).
+		Delete(ctx, "kubevirt", metav1.DeleteOptions{}); err != nil &&
+		!apierrors.IsNotFound(err) {
 		log.Printf("warning: delete kubevirt CR: %v", err)
 	}
-	if _, err := kubectl("delete", "apiservices",
-		"v1.subresources.kubevirt.io"); err != nil {
+
+	// Delete the kubevirt APIService.
+	apiservicesGVR := schema.GroupVersionResource{
+		Group: "apiregistration.k8s.io", Version: "v1", Resource: "apiservices",
+	}
+	if err := kc.Dynamic.Resource(apiservicesGVR).
+		Delete(ctx, "v1.subresources.kubevirt.io", metav1.DeleteOptions{}); err != nil &&
+		!apierrors.IsNotFound(err) {
 		log.Printf("warning: delete kubevirt apiservice: %v", err)
 	}
-	for _, w := range []struct{ kind, name string }{
-		{"mutatingwebhookconfigurations", "virt-api-mutator"},
-		{"validatingwebhookconfigurations", "virt-operator-validator"},
-		{"validatingwebhookconfigurations", "virt-api-validator"},
-	} {
-		if _, err := kubectl("delete", w.kind, w.name); err != nil {
-			log.Printf("warning: delete %s %s: %v", w.kind, w.name, err)
+
+	// Delete every KubeVirt admission-webhook configuration by name.
+	if err := kc.Clientset.AdmissionregistrationV1().
+		MutatingWebhookConfigurations().Delete(ctx, "virt-api-mutator",
+		metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		log.Printf("warning: delete virt-api-mutator: %v", err)
+	}
+	for _, name := range []string{"virt-operator-validator", "virt-api-validator"} {
+		if err := kc.Clientset.AdmissionregistrationV1().
+			ValidatingWebhookConfigurations().Delete(ctx, name,
+			metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			log.Printf("warning: delete %s: %v", name, err)
 		}
 	}
-	// --wait=false on the operator delete — virt-operator pods can
-	// hang after API resources are gone; we don't want to block the
-	// whole uninstall on that.
-	if _, err := kubectl("delete", "-f", kubevirtOperator,
-		"--wait=false"); err != nil {
+
+	// Delete the operator manifest (does not wait — virt-operator pods
+	// sometimes hang after API resources are gone).
+	if err := kubectlx.DeleteFile(ctx, kc, kubevirtOperator); err != nil {
 		log.Printf("warning: delete kubevirt operator: %v", err)
 	}
 	if err := removeKubeVirtNodeLabels(ctx); err != nil {
@@ -228,7 +224,7 @@ func UninstallKubeVirt(ctx context.Context) error {
 // initialization marker.
 func UninstallMultus(ctx context.Context) error {
 	log.Printf("uninstalling Multus")
-	if _, err := kubectl("delete", "-f", MultusYAMLDst, "--wait=true"); err != nil {
+	if err := kubectlx.DeleteFile(ctx, kubeclient.Default(), MultusYAMLDst); err != nil {
 		log.Printf("warning: delete multus daemonset: %v", err)
 	}
 	if err := state.Unmark(state.MultusInitialized); err != nil {
@@ -246,11 +242,20 @@ func CleanupStorageClasses(ctx context.Context) error {
 	if err := os.Remove(scManifest); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("warning: remove %s: %v", scManifest, err)
 	}
-	if _, err := kubectl("-n", "kube-system", "delete",
-		"AddOn/storage-classes"); err != nil {
+	kc := kubeclient.Default()
+
+	// Delete the k3s AddOn CR that installs storage-classes.
+	addonGVR := schema.GroupVersionResource{
+		Group: "k3s.cattle.io", Version: "v1", Resource: "addons",
+	}
+	if err := kc.Dynamic.Resource(addonGVR).Namespace("kube-system").
+		Delete(ctx, "storage-classes", metav1.DeleteOptions{}); err != nil &&
+		!apierrors.IsNotFound(err) {
 		log.Printf("warning: delete storage-classes AddOn: %v", err)
 	}
-	if _, err := kubectl("delete", "sc", "lh-sc-rep1"); err != nil {
+	if err := kc.Clientset.StorageV1().StorageClasses().
+		Delete(ctx, "lh-sc-rep1", metav1.DeleteOptions{}); err != nil &&
+		!apierrors.IsNotFound(err) {
 		log.Printf("warning: delete lh-sc-rep1 storage class: %v", err)
 	}
 	log.Printf("storage classes cleanup complete")
@@ -261,11 +266,14 @@ func CleanupStorageClasses(ctx context.Context) error {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// waitForAPIServer polls `kubectl cluster-info` until it succeeds.
+// waitForAPIServer polls the ServerVersion endpoint until it succeeds.
+// The endpoint is unauthenticated on k3s (returns version regardless
+// of RBAC) so a dial success == API server is up.
 func waitForAPIServer(ctx context.Context) error {
 	log.Printf("waiting for API server...")
+	disco := kubeclient.Default().Discovery
 	for {
-		if _, err := kubectl("cluster-info"); err == nil {
+		if _, err := disco.ServerVersion(); err == nil {
 			log.Printf("API server is available")
 			return nil
 		}
@@ -277,12 +285,11 @@ func waitForAPIServer(ctx context.Context) error {
 	}
 }
 
-// waitForAllNodesReady polls until every node reports Ready (or
-// Ready,SchedulingDisabled for cordoned nodes).
+// waitForAllNodesReady polls until every node reports Ready=True.
 func waitForAllNodesReady(ctx context.Context) error {
 	log.Printf("waiting for all nodes to be Ready...")
 	for {
-		ready, err := allNodesReady()
+		ready, err := allNodesReady(ctx)
 		if err == nil && ready {
 			log.Printf("all nodes are Ready")
 			return nil
@@ -295,46 +302,42 @@ func waitForAllNodesReady(ctx context.Context) error {
 	}
 }
 
-// allNodesReady reports whether every node in `kubectl get nodes`
-// output starts its status column with "Ready". Empty output is
-// treated as an error so a transient API miss doesn't pass.
-func allNodesReady() (bool, error) {
-	out, err := kubectl("get", "nodes", "--no-headers")
+// allNodesReady reports whether every node reports Ready=True.
+// Empty node list is treated as an error so a transient API miss
+// doesn't pass.
+func allNodesReady(ctx context.Context) (bool, error) {
+	list, err := kubeclient.Default().Clientset.CoreV1().
+		Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false, err
 	}
-	return parseAllNodesReady(out)
-}
-
-// parseAllNodesReady is the pure half of allNodesReady. Returns
-// true iff every non-blank line's status column (field[1]) starts
-// with "Ready" — accepting both "Ready" and "Ready,SchedulingDisabled".
-// Returns (false, error) when there are zero rows.
-func parseAllNodesReady(out string) (bool, error) {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+	if len(list.Items) == 0 {
 		return false, fmt.Errorf("no nodes found")
 	}
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || !strings.HasPrefix(fields[1], "Ready") {
+	for _, n := range list.Items {
+		ready := false
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-// waitForLonghornUninstallJob polls .status.succeeded on the
-// longhorn-uninstall job until it equals "1" or the poll budget is
-// exhausted.
+// waitForLonghornUninstallJob polls the longhorn-uninstall Job's
+// .status.succeeded until it equals 1 or the poll budget is exhausted.
 func waitForLonghornUninstallJob(ctx context.Context) error {
 	log.Printf("waiting for Longhorn uninstall job (max %d polls × %v)...",
 		longhornUninstallMaxPolls, longhornUninstallPollInterval)
+	jobsClient := kubeclient.Default().Clientset.BatchV1().Jobs(longhornNamespace)
 	for i := 0; i < longhornUninstallMaxPolls; i++ {
-		out, err := kubectl("get", "job/longhorn-uninstall",
-			"-n", longhornNamespace,
-			"-o", "jsonpath={.status.succeeded}")
-		if err == nil && strings.TrimSpace(out) == "1" {
+		j, err := jobsClient.Get(ctx, "longhorn-uninstall", metav1.GetOptions{})
+		if err == nil && j.Status.Succeeded >= 1 {
 			log.Printf("Longhorn uninstall job succeeded after %d polls", i+1)
 			return nil
 		}
@@ -361,62 +364,55 @@ func longhornPostInstallConfigClean() {
 // deleteLonghornStorageClasses removes every storage class whose
 // provisioner is driver.longhorn.io.
 func deleteLonghornStorageClasses(ctx context.Context) error {
-	out, err := kubectl("get", "sc",
-		"-o", `jsonpath={range .items[?(@.provisioner=="driver.longhorn.io")]}{.metadata.name}{" "}{end}`)
+	scClient := kubeclient.Default().Clientset.StorageV1().StorageClasses()
+	list, err := scClient.List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("list longhorn storage classes: %w", err)
+		return fmt.Errorf("list storage classes: %w", err)
 	}
-	for _, sc := range strings.Fields(strings.TrimSpace(out)) {
-		if _, err := kubectl("delete", "sc", sc); err != nil {
-			log.Printf("warning: delete storage class %s: %v", sc, err)
+	for _, sc := range list.Items {
+		if sc.Provisioner != "driver.longhorn.io" {
+			continue
+		}
+		if err := scClient.Delete(ctx, sc.Name, metav1.DeleteOptions{}); err != nil &&
+			!apierrors.IsNotFound(err) {
+			log.Printf("warning: delete storage class %s: %v", sc.Name, err)
 		}
 	}
 	return nil
 }
 
-// nodeMetadata is the JSON shape we need from `kubectl get <node>
-// -o json` to enumerate labels.
-type nodeMetadata struct {
-	Metadata struct {
-		Labels map[string]string `json:"labels"`
-	} `json:"metadata"`
-}
-
 // removeKubeVirtNodeLabels deletes every label containing
-// "kubevirt.io" from every node. Per-node failures are logged AND
-// counted; the function returns an error when any node was not
-// successfully scrubbed, so the caller can decide whether to
-// surface it (a native-kubernetes-mode cluster carrying stale
-// kubevirt.io labels is a real misconfiguration, not a no-op).
+// "kubevirt.io" from every node.
 func removeKubeVirtNodeLabels(ctx context.Context) error {
-	out, err := kubectl("get", "node", "-o", "NAME")
+	nodes := kubeclient.Default().Clientset.CoreV1().Nodes()
+	list, err := nodes.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("get node names: %w", err)
 	}
 	var failed int
-	for _, node := range strings.Fields(strings.TrimSpace(out)) {
-		if node == "" {
+	for _, n := range list.Items {
+		removals := kubeVirtLabelsToRemove(n.Labels)
+		if len(removals) == 0 {
 			continue
 		}
-		nodeJSON, err := kubectl("get", node, "-o", "json")
+		// Build a merge patch that sets each target label to null —
+		// the Kubernetes-JSON convention for "remove this key".
+		labelPatch := make(map[string]any, len(removals))
+		for _, k := range removals {
+			labelPatch[k] = nil
+		}
+		patchBody := map[string]any{
+			"metadata": map[string]any{"labels": labelPatch},
+		}
+		patchJSON, err := json.Marshal(patchBody)
 		if err != nil {
-			log.Printf("warning: get %s: %v", node, err)
+			log.Printf("warning: build label patch for %s: %v", n.Name, err)
 			failed++
 			continue
 		}
-		var meta nodeMetadata
-		if err := json.Unmarshal([]byte(nodeJSON), &meta); err != nil {
-			log.Printf("warning: unmarshal node %s JSON: %v", node, err)
-			failed++
-			continue
-		}
-		labelsToRemove := kubeVirtLabelsToRemove(meta.Metadata.Labels)
-		if len(labelsToRemove) == 0 {
-			continue
-		}
-		args := append([]string{"label", node}, labelsToRemove...)
-		if _, err := kubectl(args...); err != nil {
-			log.Printf("warning: remove kubevirt labels from %s: %v", node, err)
+		if _, err := nodes.Patch(ctx, n.Name,
+			types.MergePatchType, patchJSON, metav1.PatchOptions{}); err != nil {
+			log.Printf("warning: remove kubevirt labels from %s: %v", n.Name, err)
 			failed++
 		}
 	}
@@ -426,13 +422,12 @@ func removeKubeVirtNodeLabels(ctx context.Context) error {
 	return nil
 }
 
-// kubeVirtLabelsToRemove returns the kubectl-label argument forms
-// (`key-` suffix) for every label containing "kubevirt.io".
+// kubeVirtLabelsToRemove returns the label keys containing "kubevirt.io".
 func kubeVirtLabelsToRemove(labels map[string]string) []string {
 	var out []string
 	for key := range labels {
 		if strings.Contains(key, "kubevirt.io") {
-			out = append(out, key+"-")
+			out = append(out, key)
 		}
 	}
 	return out

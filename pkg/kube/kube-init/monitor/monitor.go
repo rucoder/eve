@@ -27,12 +27,17 @@ import (
 	"github.com/lf-edge/eve/pkg/kube/kube-init/components"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/encstatus"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/k3s"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeinitstatus"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/prereqs"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/tiebreaker"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/vnc"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Per-loop intervals. Vars so tests can shrink them.
@@ -234,7 +239,7 @@ func (m *Monitor) RunHealthChecks(ctx context.Context) {
 		// or missing manifest would just produce a more confusing
 		// kubectl error on top of the render failure.
 		if rendered {
-			m.applyMultus()
+			m.applyMultus(ctx)
 		}
 	}
 	m.checkForMultusLinkRequest()
@@ -243,14 +248,14 @@ func (m *Monitor) RunHealthChecks(ctx context.Context) {
 	if err != nil {
 		log.Printf("warning: check node-labels marker: %v", err)
 	} else if !labelsMarked {
-		m.reapplyNodeLabels()
+		m.reapplyNodeLabels(ctx)
 	}
 
 	m.ensureDebugUser()
 	SyncKubeconfig()
 
 	// --- 2. Potentially slow work ---
-	m.reimportImages()
+	m.reimportImages(ctx)
 
 	longhornMarked, err := state.IsMarked(state.LonghornInitialized)
 	if err != nil {
@@ -691,7 +696,7 @@ func (m *Monitor) kubeconfigSyncLoop(ctx context.Context) {
 // Verification matches the node name exactly so a different node
 // whose name contains m.deviceName as a substring cannot false-
 // positive.
-func (m *Monitor) reapplyNodeLabels() {
+func (m *Monitor) reapplyNodeLabels(ctx context.Context) {
 	if m.uuid == "" {
 		// Without a UUID we can't apply or verify the
 		// node-uuid label. The labels initialised flag stays
@@ -700,50 +705,37 @@ func (m *Monitor) reapplyNodeLabels() {
 		log.Printf("reapply node labels: device UUID not yet available, skipping")
 		return
 	}
-	if _, err := kubectlx.Run("label", "node", m.deviceName,
-		"node-uuid="+m.uuid, "--overwrite"); err != nil {
-		log.Printf("warning: reapply node-uuid label: %v", err)
-		return
-	}
-	if _, err := kubectlx.Run("label", "node", m.deviceName,
-		"node.longhorn.io/create-default-disk=config", "--overwrite"); err != nil {
-		log.Printf("warning: reapply longhorn disk label: %v", err)
-		return
-	}
-	if _, err := kubectlx.Run("annotate", "node", m.deviceName,
-		`node.longhorn.io/default-disks-config=[ { "path":"/persist/vault/volumes", "allowScheduling":true }]`,
-		"--overwrite"); err != nil {
-		log.Printf("warning: reapply longhorn disk annotation: %v", err)
+	// Merge-patch applies node-uuid + longhorn labels + longhorn
+	// disks annotation in a single API call. The label & annotation
+	// verification below then reads the persisted node object
+	// directly rather than re-querying by label selector, closing
+	// the write-read race the shell path had.
+	labelPatch := fmt.Sprintf(
+		`{"metadata":{"labels":{"node-uuid":%q,"node.longhorn.io/create-default-disk":"config"},"annotations":{"node.longhorn.io/default-disks-config":%q}}}`,
+		m.uuid,
+		`[ { "path":"/persist/vault/volumes", "allowScheduling":true }]`)
+	nodes := kubeclient.Default().Clientset.CoreV1().Nodes()
+	if _, err := nodes.Patch(ctx, m.deviceName,
+		types.MergePatchType, []byte(labelPatch), metav1.PatchOptions{}); err != nil {
+		log.Printf("warning: reapply node labels+annotation: %v", err)
 		return
 	}
 
-	// Label verification: tagged `kubectl get nodes` must return
-	// our node name.
-	out, err := kubectlx.Run("get", "nodes",
-		"-l", "node-uuid="+m.uuid+",node.longhorn.io/create-default-disk=config",
-		"-o", "jsonpath={.items[*].metadata.name}")
-	labelMatched := false
-	if err == nil {
-		for _, name := range strings.Fields(out) {
-			if name == m.deviceName {
-				labelMatched = true
-				break
-			}
-		}
+	// Verification: read the node back and confirm every field is
+	// present as we wrote it.
+	n, err := nodes.Get(ctx, m.deviceName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("node labels verification failed for %s: %v", m.deviceName, err)
+		return
 	}
-	if !labelMatched {
+	if n.Labels["node-uuid"] != m.uuid ||
+		n.Labels["node.longhorn.io/create-default-disk"] != "config" {
 		log.Printf("node labels verification failed for %s", m.deviceName)
 		return
 	}
-
-	// Annotation verification: the value isn't pre-parsed by
-	// kubectl, so a non-empty jsonpath result means the
-	// annotation was persisted.
-	annot, err := kubectlx.Run("get", "node", m.deviceName,
-		"-o", `jsonpath={.metadata.annotations.node\.longhorn\.io/default-disks-config}`)
-	if err != nil || strings.TrimSpace(annot) == "" {
-		log.Printf("node annotation verification failed for %s (err=%v, value=%q)",
-			m.deviceName, err, annot)
+	if strings.TrimSpace(n.Annotations["node.longhorn.io/default-disks-config"]) == "" {
+		log.Printf("node annotation verification failed for %s (value empty)",
+			m.deviceName)
 		return
 	}
 
@@ -761,11 +753,11 @@ func (m *Monitor) reapplyNodeLabels() {
 //
 // RT image re-imports are intentionally not handled in this
 // package; they belong with the RT-specific code path.
-func (m *Monitor) reimportImages() {
+func (m *Monitor) reimportImages(ctx context.Context) {
 	if !m.installKubevirt {
 		return
 	}
-	m.importImageIfNeeded(
+	m.importImageIfNeeded(ctx,
 		"/images/external-boot-image.tar",
 		"docker.io/lfedge/eve-external-boot-image",
 		m.eveRelease,
@@ -776,15 +768,21 @@ func (m *Monitor) reimportImages() {
 // only when the expected image tag is not already present in the
 // kubelet-visible namespace. Consulting containerd directly makes
 // this idempotent across restarts without a persistent marker.
-func (m *Monitor) importImageIfNeeded(tarPath, imageName, tag string) {
+func (m *Monitor) importImageIfNeeded(ctx context.Context, tarPath, imageName, tag string) {
 	fullRef := imageName + ":" + tag
-	if out, err := kubectlx.CrictlRun("inspecti", fullRef); err == nil && len(out) > 0 {
+	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
+	if err != nil {
+		log.Printf("warning: containerd client: %v", err)
+		return
+	}
+	defer cc.Close()
+	if exists, err := cc.ImageExists(ctx, fullRef); err == nil && exists {
 		return
 	}
 	if _, err := os.Stat(tarPath); errors.Is(err, os.ErrNotExist) {
 		return
 	}
-	if _, err := kubectlx.CtrRun("images", "import", tarPath); err != nil {
+	if _, err := cc.ImportImage(ctx, tarPath); err != nil {
 		log.Printf("warning: image import %s failed: %v", tarPath, err)
 		return
 	}
@@ -860,14 +858,22 @@ func readFirstIPv4(iface string) (string, bool) {
 
 // applyMultus re-applies the rendered multus DaemonSet and
 // touches the initialization marker on success.
-func (m *Monitor) applyMultus() {
-	if _, err := kubectlx.Run("get", "namespace", "eve-kube-app"); err != nil {
-		if _, cErr := kubectlx.Run("create", "namespace", "eve-kube-app"); cErr != nil {
+func (m *Monitor) applyMultus(ctx context.Context) {
+	kc := kubeclient.Default()
+	nsClient := kc.Clientset.CoreV1().Namespaces()
+	if _, err := nsClient.Get(ctx, "eve-kube-app", metav1.GetOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("warning: get eve-kube-app namespace: %v", err)
+			return
+		}
+		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "eve-kube-app"}}
+		if _, cErr := nsClient.Create(ctx, nsObj, metav1.CreateOptions{}); cErr != nil &&
+			!apierrors.IsAlreadyExists(cErr) {
 			log.Printf("warning: create eve-kube-app namespace: %v", cErr)
 			return
 		}
 	}
-	if _, err := kubectlx.Run("apply", "-f", components.MultusYAMLDst); err != nil {
+	if err := kubectlx.ApplyFile(ctx, kc, components.MultusYAMLDst, kubectlx.ApplyOptions{}); err != nil {
 		log.Printf("warning: apply multus: %v", err)
 		return
 	}

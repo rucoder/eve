@@ -16,8 +16,10 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/k3s"
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // On disk paths owned by this file. Declared as `var` so tests can
@@ -161,23 +163,19 @@ func ConsumeStartupRank() (time.Duration, bool) {
 // carrying the control-plane label. Used as input to
 // computeRank.
 func listControlPlaneIPs(ctx context.Context) ([]string, error) {
-	cmd := kubectlx.CmdContext(ctx,
-		"get", "nodes",
-		"-l", "node-role.kubernetes.io/control-plane",
-		"-o", `jsonpath={range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}`,
-	)
-	out, err := cmd.CombinedOutput()
+	nodes, err := kubeclient.Default().Clientset.CoreV1().Nodes().List(ctx,
+		metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/control-plane"})
 	if err != nil {
-		return nil, fmt.Errorf("kubectl get nodes: %w (output: %s)",
-			err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("list control-plane nodes: %w", err)
 	}
 	var ips []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	for _, n := range nodes.Items {
+		for _, a := range n.Status.Addresses {
+			if a.Type != corev1.NodeInternalIP || a.Address == "" {
+				continue
+			}
+			ips = append(ips, a.Address)
 		}
-		ips = append(ips, line)
 	}
 	return ips, nil
 }

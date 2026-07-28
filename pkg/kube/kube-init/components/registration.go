@@ -5,13 +5,17 @@ package components
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // Registration manifest paths. The source lives on /persist (so the
@@ -129,10 +133,15 @@ func RegistrationConfigExists() bool {
 	return err == nil
 }
 
-// RegistrationApplied checks via kubectl whether k3s has applied
-// the registration AddOn.
-func RegistrationApplied() bool {
-	_, err := kubectl("-n", "kube-system", "get", "AddOn/"+appliedRegistrationYamlName)
+// RegistrationApplied checks via the k8s API whether k3s has applied
+// the registration AddOn CR.
+func RegistrationApplied(ctx context.Context) bool {
+	addonGVR := schema.GroupVersionResource{
+		Group: "k3s.cattle.io", Version: "v1", Resource: "addons",
+	}
+	_, err := kubeclient.Default().Dynamic.Resource(addonGVR).
+		Namespace("kube-system").Get(ctx,
+		appliedRegistrationYamlName, metav1.GetOptions{})
 	return err == nil
 }
 
@@ -155,7 +164,7 @@ func RegistrationApplied() bool {
 // kubectl errors at step 3 (e.g. API not yet reachable) are
 // downgraded to "AddOn check pending" so this function never
 // fails the caller.
-func LogRegistrationStatus() {
+func LogRegistrationStatus(ctx context.Context) {
 	if !RegistrationConfigExists() {
 		log.Printf("registration: not configured (no manifest at %s)",
 			registrationYamlFilePath)
@@ -166,7 +175,7 @@ func LogRegistrationStatus() {
 			registrationYamlFilePath)
 		return
 	}
-	if !RegistrationApplied() {
+	if !RegistrationApplied(ctx) {
 		log.Printf("registration: manifest staged at %s, awaiting k3s AddOn apply",
 			appliedRegistrationYamlFilePath)
 		return

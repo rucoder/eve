@@ -8,98 +8,17 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
 )
 
-func TestNodeIsReady(t *testing.T) {
-	cases := []struct {
-		name string
-		out  string
-		node string
-		want bool
-	}{
-		{"single Ready line", "mynode Ready control-plane 5m v1.34.2+k3s1", "mynode", true},
-		{"single NotReady line", "mynode NotReady control-plane 1s v1.34.2+k3s1", "mynode", false},
-		{"multi-line matches node",
-			"othernode NotReady ...\nmynode Ready ...\n", "mynode", true},
-		{"multi-line does not match wrong node",
-			"othernode Ready ...\nmynode NotReady ...\n", "mynode", false},
-		{"empty output", "", "mynode", false},
-		{"node missing from output entirely",
-			"someother Ready ...\n", "mynode", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := nodeIsReady(c.out, c.node); got != c.want {
-				t.Errorf("nodeIsReady(%q, %q) = %v, want %v",
-					c.out, c.node, got, c.want)
-			}
-		})
-	}
-}
-
-func TestParseSystemPodsOutput(t *testing.T) {
-	cases := []struct {
-		name        string
-		out         string
-		wantReady   int
-		wantTotal   int
-		wantNotRdy  []string
-	}{
-		{
-			name:      "all ready",
-			out:       "pod-a 1/1 Running 0 5m\npod-b 1/1 Running 0 5m",
-			wantReady: 2, wantTotal: 2, wantNotRdy: nil,
-		},
-		{
-			name: "mixed ready / not-ready",
-			out: "pod-a 1/1 Running 0 5m\n" +
-				"pod-b 0/1 ContainerCreating 0 5s\n" +
-				"pod-c 1/1 Running 0 5m",
-			wantReady: 2, wantTotal: 3,
-			wantNotRdy: []string{"pod-b(ContainerCreating)"},
-		},
-		{
-			name:      "Completed and Succeeded count as ready",
-			out:       "job-a 0/1 Completed 0 5m\njob-b 0/1 Succeeded 0 5m",
-			wantReady: 2, wantTotal: 2, wantNotRdy: nil,
-		},
-		{
-			name: "0/3 is not ready even though 0 == 0",
-			out:  "pod-a 0/3 Init 0 1s",
-			wantReady: 0, wantTotal: 1,
-			wantNotRdy: []string{"pod-a(Init)"},
-		},
-		{
-			name:      "partial 1/2 is not ready",
-			out:       "pod-a 1/2 Running 0 5m",
-			wantReady: 0, wantTotal: 1,
-			wantNotRdy: []string{"pod-a(Running)"},
-		},
-		{
-			name:      "blank lines and short lines are skipped",
-			out:       "\npod-a 1/1 Running 0 5m\nshortline\n",
-			wantReady: 1, wantTotal: 1, wantNotRdy: nil,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			ready, total, notReady := parseSystemPodsOutput(c.out)
-			if ready != c.wantReady || total != c.wantTotal {
-				t.Errorf("counts = (%d, %d), want (%d, %d)",
-					ready, total, c.wantReady, c.wantTotal)
-			}
-			if !reflect.DeepEqual(notReady, c.wantNotRdy) {
-				t.Errorf("notReady = %v, want %v", notReady, c.wantNotRdy)
-			}
-		})
-	}
-}
-
+// TestFileExistsClassification covers the "definitely absent" vs.
+// "we cannot tell" split in fileExists. Restored from the pre-
+// migration test file after the code review noted these helpers
+// are still live but their coverage was dropped along with the
+// retired stdout parsers.
 func TestFileExistsClassification(t *testing.T) {
 	dir := t.TempDir()
 	present := filepath.Join(dir, "present")
@@ -132,32 +51,14 @@ func TestFileExistsClassification(t *testing.T) {
 	}
 }
 
+// TestCopyKubeconfig verifies the destination-side semantics of
+// copyKubeconfig: on a missing source it fails without leaving a
+// partial destination; on success it produces a 0600-mode copy.
 func TestCopyKubeconfig(t *testing.T) {
-	// Route state.K3sKubeconfig + KubeconfigCopyDir/Copy onto a tmp
-	// tree so the test exercises the real copy path.
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "src", "k3s.yaml")
 	dstDir := filepath.Join(dir, "dst")
 	dstFile := filepath.Join(dstDir, "k3s.yaml")
 
-	if err := os.MkdirAll(filepath.Dir(srcPath), 0755); err != nil {
-		t.Fatalf("mkdir src: %v", err)
-	}
-	body := []byte("apiVersion: v1\nkind: Config\n")
-	if err := os.WriteFile(srcPath, body, 0644); err != nil {
-		t.Fatalf("seed src: %v", err)
-	}
-
-	// state.K3sKubeconfig is a const; copyKubeconfig reads it via
-	// the package, so we can't redirect through a var. Instead
-	// exercise the helper directly by swapping the destination
-	// path vars, and seed the FIXED state.K3sKubeconfig path... we
-	// can't. Defer: write source at state.K3sKubeconfig path under
-	// /tmp would require root. So we test the destination side via
-	// state.AtomicWriteFile (the only host-affecting call). Skip
-	// the end-to-end and just check AtomicWriteFile reaches the
-	// destination correctly by calling copyKubeconfig with the
-	// vars rewired.
 	origDir, origFile := KubeconfigCopyDir, KubeconfigCopy
 	KubeconfigCopyDir = dstDir
 	KubeconfigCopy = dstFile
@@ -165,23 +66,21 @@ func TestCopyKubeconfig(t *testing.T) {
 		KubeconfigCopyDir, KubeconfigCopy = origDir, origFile
 	})
 
-	// state.K3sKubeconfig points at /etc/rancher/k3s/k3s.yaml which
-	// likely doesn't exist on the test host. Expect an error here
-	// — the test confirms copyKubeconfig fails cleanly when the
-	// source is absent (no partial dst leak).
+	// state.K3sKubeconfig is a const path (/etc/rancher/k3s/k3s.yaml)
+	// that most CI hosts don't have. When it's absent, copyKubeconfig
+	// must fail cleanly with no partial dst leak.
 	if _, err := os.Stat(state.K3sKubeconfig); errors.Is(err, os.ErrNotExist) {
 		err := copyKubeconfig()
 		if err == nil {
 			t.Fatal("copyKubeconfig should fail when source is absent")
 		}
-		// dst must not have been created with garbage.
 		if _, err := os.Stat(dstFile); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("dst should not exist after failed copy; stat err=%v", err)
 		}
 		return
 	}
 	// If state.K3sKubeconfig happens to exist (CI machine with k3s),
-	// copy should succeed and produce dst with the right perms.
+	// verify the destination has correct permissions.
 	if err := copyKubeconfig(); err != nil {
 		t.Fatalf("copyKubeconfig: %v", err)
 	}
@@ -194,8 +93,9 @@ func TestCopyKubeconfig(t *testing.T) {
 	}
 }
 
+// TestWaitKubeconfigTimeoutsCleanly verifies WaitKubeconfig
+// respects ctx timeout when the kubeconfig never appears.
 func TestWaitKubeconfigTimeoutsCleanly(t *testing.T) {
-	// Shrink the poll cadence so the timeout fires quickly.
 	orig := kubeconfigPollInterval
 	kubeconfigPollInterval = 5 * time.Millisecond
 	t.Cleanup(func() { kubeconfigPollInterval = orig })
@@ -203,8 +103,6 @@ func TestWaitKubeconfigTimeoutsCleanly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	// state.K3sKubeconfig (/etc/rancher/k3s/k3s.yaml) most likely
-	// does not exist; the function should time out via ctx.
 	err := WaitKubeconfig(ctx)
 	if err == nil {
 		t.Skip("state.K3sKubeconfig exists on this host; cannot test the timeout path")

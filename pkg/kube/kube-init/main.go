@@ -53,6 +53,7 @@ import (
 	"github.com/lf-edge/eve/pkg/kube/kube-init/encstatus"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/images"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kcus"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeconfig"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeinitstatus"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/k3s"
@@ -450,6 +451,20 @@ type daemon struct {
 	// run loop is started in main.
 	psMgr *pubsubclient.Manager
 
+	// kc is the process-wide k8s client-go bundle. Constructed
+	// lazily by initKubeclient once k3s reports Ready (the
+	// kubeconfig file exists and the API is reachable) and reused
+	// for the daemon lifetime — informer caches survive between
+	// work-goroutine cycles. Also registered as kubeclient.Default()
+	// so leaf subsystems can consume it without threading.
+	kc *kubeclient.Client
+
+	// rootCtx is the top-level daemon ctx captured by run(). Used
+	// by initKubeclient to tie the shared informer factory
+	// goroutines to daemon lifetime — not to workCtx, which is
+	// per-attempt and would stop informers after each deploy pass.
+	rootCtx context.Context
+
 	// enterStateFn is the state-entry dispatcher. Defaults to
 	// d.enterState; tests replace it with a no-op to isolate the
 	// transition graph from real work.
@@ -593,6 +608,7 @@ func main() {
 // ===========================================================================
 
 func (d *daemon) run(ctx context.Context) {
+	d.rootCtx = ctx
 	go d.signalForwarder(ctx)
 	go d.listenSocket(ctx)
 
@@ -819,6 +835,15 @@ func (d *daemon) handleImporting(ctx context.Context, ev Event) {
 func (d *daemon) handleWaitK3sReady(ctx context.Context, ev Event) {
 	switch ev.Type {
 	case EvK3sReady:
+		// Bootstrap the k8s client-go bundle on both branches so
+		// steady-state monitor goroutines (which skip DEPLOYING)
+		// still have kubeclient.Default() available.
+		if err := d.initKubeclient(); err != nil {
+			d.lastError = err
+			log.Printf("WAIT_K3S_READY: kubeclient init failed: %v", err)
+			d.retryCurrentState(ctx)
+			return
+		}
 		switch d.phase {
 		case PhaseFirstBoot:
 			d.transition(ctx, StateDeploying, "k3s-ready/first-boot")
@@ -1293,13 +1318,41 @@ func (d *daemon) workConfigure(workCtx context.Context) error {
 	return nil
 }
 
+// initKubeclient constructs the process-wide *kubeclient.Client on
+// first call and starts its shared informer factories against
+// d.rootCtx (so caches survive between work-goroutine cycles).
+// Subsequent calls are no-ops. Safe to call from any state handler
+// after k3s.WaitForK3sReady has fired — the kubeconfig file is
+// guaranteed to exist by that point.
+func (d *daemon) initKubeclient() error {
+	if d.kc != nil {
+		return nil
+	}
+	// Test-safety: transition-table tests exercise handleWaitK3sReady
+	// without a real k3s process, so the kubeconfig file never
+	// materialises. Detecting that here (rather than at kubeclient.New
+	// time) lets the test-only path skip cleanly without a fake file.
+	if _, err := os.Stat(state.K3sKubeconfig); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	kc, err := kubeclient.New(state.K3sKubeconfig)
+	if err != nil {
+		return err
+	}
+	kc.Start(d.rootCtx.Done())
+	d.kc = kc
+	kubeclient.SetDefault(kc)
+	log.Printf("kubeclient: initialised from %s", state.K3sKubeconfig)
+	return nil
+}
+
 // workDeploy drives DeployAll and persists first-boot success
 // markers. The /var/lib snapshot supports the cluster→single
 // recovery path; a failure is logged but does not abort the
 // deploy because the snapshot is only consulted on a later
 // rebooted convert pass.
 func (d *daemon) workDeploy(workCtx context.Context) error {
-	if err := components.DeployAll(workCtx, d.deviceName, d.installKubevirt); err != nil {
+	if err := components.DeployAll(workCtx, d.rootCtx, d.deviceName, d.installKubevirt); err != nil {
 		return err
 	}
 
@@ -1457,7 +1510,7 @@ func (d *daemon) enterRunning(ctx context.Context) {
 
 	// One-shot status line so operators can see the registration
 	// state without scrolling through silent health-tick output.
-	components.LogRegistrationStatus()
+	components.LogRegistrationStatus(ctx)
 
 	// k3s is up and the supervisor is talking to it — persist the
 	// node password it generated (or confirm the one we restored
@@ -1657,6 +1710,26 @@ func (d *daemon) handleSocketConn(conn net.Conn) {
 	case "stop":
 		d.eventCh <- Event{Type: EvSocketStop, Detail: "socket"}
 		_, _ = conn.Write([]byte("OK: stopping\n"))
+
+	case "graph":
+		// Pure read of the static deploy-graph shape — no FSM event
+		// needed. Multi-line response terminated by conn close (deferred
+		// above). Format is "from → to (rule)" one edge per line so the
+		// origin of every ordering is diagnosable without re-parsing
+		// manifests. Empty output means the graph has no derived edges
+		// (the current PolicyDeps-only case).
+		edges, err := components.GraphEdges(d.installKubevirt)
+		if err != nil {
+			_, _ = fmt.Fprintf(conn, "ERR: graph: %v\n", err)
+			return
+		}
+		if len(edges) == 0 {
+			_, _ = conn.Write([]byte("OK: graph has no dependency edges\n"))
+			return
+		}
+		for _, e := range edges {
+			_, _ = fmt.Fprintf(conn, "%s → %s (%s)\n", e.From, e.To, e.Rule)
+		}
 
 	default:
 		_, _ = fmt.Fprintf(conn, "ERR: unknown command: %s\n", cmd)
@@ -2005,7 +2078,7 @@ func (d *daemon) runSteadyStateStorage(ctx context.Context, ct k3s.ClusterType, 
 
 	switch ct {
 	case k3s.ClusterTypeUnspecified:
-		if components.RegistrationApplied() {
+		if components.RegistrationApplied(ctx) {
 			if err := components.CleanupStorageClasses(ctx); err != nil {
 				log.Printf("WARNING: cleanup storage classes: %v", err)
 			}

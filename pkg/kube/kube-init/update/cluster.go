@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Component identifiers managed by the cluster-update loop. The
@@ -172,8 +174,12 @@ func waitComponentReady(ctx context.Context, comp string) error {
 // shape could not distinguish "cluster says no" from "probe binary
 // missing".
 func checkClusterReady(ctx context.Context) error {
-	if _, err := kubectlx.Run("cluster-info"); err != nil {
-		return fmt.Errorf("kubectl cluster-info: %w", err)
+	// Reachability probe: any typed API call is fine — use the
+	// version endpoint since it doesn't require RBAC. Failure
+	// surfaces as a dial or auth error, both of which are what
+	// the caller wants to know.
+	if _, err := kubeclient.Default().Discovery.ServerVersion(); err != nil {
+		return fmt.Errorf("api server version probe: %w", err)
 	}
 	apiCmd := exec.CommandContext(ctx, compUpdatePath, "--check-api-ready")
 	apiCmd.Env = append(os.Environ(), "KUBECONFIG="+state.K3sKubeconfig)
@@ -211,23 +217,15 @@ func componentIsInstalled(ctx context.Context, comp string) (bool, error) {
 		return true, nil
 	}
 
-	// Route through kubectlx so the binary path is `k3s kubectl` —
-	// the kube container does not ship a standalone kubectl.
-	cmd := kubectlx.CmdContext(ctx, "get", "namespace", ns)
-	out, err := cmd.CombinedOutput()
+	_, err := kubeclient.Default().Clientset.CoreV1().
+		Namespaces().Get(ctx, ns, metav1.GetOptions{})
 	if err == nil {
 		return true, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		// kubectl ran and returned non-zero. Most commonly that
-		// is the namespace not existing; we report "not
-		// installed" without an error so the upgrade loop skips
-		// the component cleanly.
+	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
-	return false, fmt.Errorf("kubectl get namespace %s: %w (output: %s)",
-		ns, err, truncateForLog(string(out), 1024))
+	return false, fmt.Errorf("get namespace %s: %w", ns, err)
 }
 
 // compIsRunningExpectedVersion asks update-component to compare the

@@ -29,12 +29,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
+	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/encconfig"
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 )
+
+// longhornNodesGVR is the CRD-defined resource for Longhorn node
+// records. Set once here so every longhorn-node op refers to the
+// same GVR without magic strings duplicated per callsite.
+var longhornNodesGVR = schema.GroupVersionResource{
+	Group: "longhorn.io", Version: "v1beta2", Resource: "nodes",
+}
 
 const (
 	tieBreakerNodeLabel  = "tie-breaker-node"
@@ -81,51 +94,62 @@ func StatusIsSelf(tieUUID, selfUUID string) bool {
 // StatusSet stamps every node with the tie-breaker-config-applied=1
 // label. ConfigApply calls this only after the rest of the phase
 // succeeds, so the label is a true "we got to the end" marker.
+//
+// client-go has no "label --all" bulk operation; we List then Patch
+// each node with a merge patch. A per-node error is fatal (the
+// caller retries the whole phase).
 func StatusSet(ctx context.Context) error {
 	log.Printf("tiebreaker: setting status label on all nodes")
-	_, err := kubectl("label", "nodes", "--all",
-		tieBreakerStatusLabel, "--overwrite")
-	return err
+	nodes := kubeclient.Default().Clientset.CoreV1().Nodes()
+	list, err := nodes.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	patch := `{"metadata":{"labels":{"tie-breaker-config-applied":"1"}}}`
+	for _, n := range list.Items {
+		if _, err := nodes.Patch(ctx, n.Name,
+			types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("label node %s: %w", n.Name, err)
+		}
+	}
+	return nil
 }
 
 // StatusGet reports whether the status label has been applied to
 // every node in the cluster (exactly clusterNodeCount nodes).
 func StatusGet(ctx context.Context) bool {
-	out, err := kubectl("get", "nodes",
-		"-l", tieBreakerStatusLabel,
-		"-o", "jsonpath={.items[*].metadata.name}")
+	list, err := kubeclient.Default().Clientset.CoreV1().Nodes().
+		List(ctx, metav1.ListOptions{LabelSelector: "tie-breaker-config-applied=1"})
 	if err != nil {
 		return false
 	}
-	return len(strings.Fields(strings.TrimSpace(out))) == clusterNodeCount
+	return len(list.Items) == clusterNodeCount
 }
 
 // NodeCountIsCluster reports whether the cluster currently has the
 // expected three nodes. Used to gate ConfigApply: until all three
 // have joined we can't pick a tie-breaker.
 func NodeCountIsCluster(ctx context.Context) bool {
-	out, err := kubectl("get", "nodes",
-		"-o", "jsonpath={.items[*].metadata.name}")
+	list, err := kubeclient.Default().Clientset.CoreV1().Nodes().
+		List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false
 	}
-	return len(strings.Fields(strings.TrimSpace(out))) == clusterNodeCount
+	return len(list.Items) == clusterNodeCount
 }
 
 // nodeNameFromUUID maps a device UUID onto its Kubernetes node name
 // via the node-uuid=<uuid> label that k3s readiness applies.
 func nodeNameFromUUID(ctx context.Context, uuid string) (string, error) {
-	out, err := kubectl("get", "nodes",
-		"-l", "node-uuid="+uuid,
-		"-o", "jsonpath={.items[*].metadata.name}")
+	list, err := kubeclient.Default().Clientset.CoreV1().Nodes().
+		List(ctx, metav1.ListOptions{LabelSelector: "node-uuid=" + uuid})
 	if err != nil {
 		return "", fmt.Errorf("get node name for uuid %s: %w", uuid, err)
 	}
-	name := strings.TrimSpace(out)
-	if name == "" {
+	if len(list.Items) == 0 {
 		return "", fmt.Errorf("no node found with uuid %s", uuid)
 	}
-	return name, nil
+	return list.Items[0].Name, nil
 }
 
 // nodesConfigApply labels the tie-breaker with tie-breaker-node=true
@@ -136,49 +160,80 @@ func nodesConfigApply(ctx context.Context, tieUUID string) error {
 	if err != nil {
 		return err
 	}
-	out, err := kubectl("get", "nodes",
-		"-o", "jsonpath={.items[*].metadata.name}")
+	nodes := kubeclient.Default().Clientset.CoreV1().Nodes()
+	list, err := nodes.List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
-	for _, nodeName := range strings.Fields(strings.TrimSpace(out)) {
-		if nodeName == tieName {
-			log.Printf("tiebreaker: labeling %s as tie-breaker", nodeName)
-			if _, err := kubectl("label", "node", nodeName,
-				tieBreakerNodeLabel+"="+tieBreakerLabelSet,
-				"--overwrite"); err != nil {
-				return fmt.Errorf("label tie-breaker node %s: %w", nodeName, err)
-			}
-			if _, err := kubectl("cordon", nodeName); err != nil {
-				return fmt.Errorf("cordon tie-breaker node %s: %w", nodeName, err)
-			}
-			continue
+	for _, n := range list.Items {
+		labelValue := tieBreakerLabelUnset
+		wantCordon := false
+		if n.Name == tieName {
+			log.Printf("tiebreaker: labeling %s as tie-breaker", n.Name)
+			labelValue = tieBreakerLabelSet
+			wantCordon = true
+		} else {
+			log.Printf("tiebreaker: labeling %s as worker", n.Name)
 		}
-		log.Printf("tiebreaker: labeling %s as worker", nodeName)
-		if _, err := kubectl("label", "node", nodeName,
-			tieBreakerNodeLabel+"="+tieBreakerLabelUnset,
-			"--overwrite"); err != nil {
-			return fmt.Errorf("label node %s: %w", nodeName, err)
+		labelPatch := fmt.Sprintf(`{"metadata":{"labels":{"%s":"%s"}}}`,
+			tieBreakerNodeLabel, labelValue)
+		if _, err := nodes.Patch(ctx, n.Name,
+			types.MergePatchType, []byte(labelPatch), metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("label node %s: %w", n.Name, err)
 		}
-		if _, err := kubectl("uncordon", nodeName); err != nil {
-			return fmt.Errorf("uncordon node %s: %w", nodeName, err)
+		if err := setCordoned(ctx, nodes, n.Name, wantCordon); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// setCordoned flips spec.unschedulable on the named node.
+// Idempotent: patching to the same value is a no-op at the API server.
+// Replaces the previous `kubectl cordon`/`kubectl uncordon` calls,
+// which were one-liners over the same field.
+func setCordoned(ctx context.Context, nodes typedNodesInterface, name string, cordon bool) error {
+	patch := fmt.Sprintf(`{"spec":{"unschedulable":%v}}`, cordon)
+	if _, err := nodes.Patch(ctx, name,
+		types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
+		verb := "cordon"
+		if !cordon {
+			verb = "uncordon"
+		}
+		return fmt.Errorf("%s node %s: %w", verb, name, err)
+	}
+	return nil
+}
+
+// typedNodesInterface is the small subset of
+// corev1client.NodeInterface that setCordoned exercises. Declared
+// locally so the function signature doesn't drag in the whole
+// client-go typed interface and stays easy to fake in tests.
+type typedNodesInterface interface {
+	Patch(
+		ctx context.Context, name string, pt types.PatchType,
+		data []byte, opts metav1.PatchOptions, subresources ...string,
+	) (*corev1.Node, error)
+}
+
 // kubevirtConfig sets the KubeVirt control-plane replica count
 // (virt-operator Deployment + KubeVirt CR's .spec.infra.replicas).
 func kubevirtConfig(ctx context.Context, replicas int) error {
-	r := fmt.Sprintf("%d", replicas)
-	log.Printf("tiebreaker: scaling kubevirt to %s replicas", r)
-	if _, err := kubectl("scale", "deployment", "virt-operator",
-		"-n", "kubevirt", "--replicas="+r); err != nil {
+	log.Printf("tiebreaker: scaling kubevirt to %d replicas", replicas)
+	kc := kubeclient.Default()
+	deployPatch := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
+	if _, err := kc.Clientset.AppsV1().Deployments("kubevirt").
+		Patch(ctx, "virt-operator", types.MergePatchType,
+			[]byte(deployPatch), metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("scale virt-operator: %w", err)
 	}
-	patch := fmt.Sprintf(`{"spec":{"infra":{"replicas":%d}}}`, replicas)
-	if _, err := kubectl("patch", "kubevirt", "kubevirt",
-		"-n", "kubevirt", "--type=merge", "-p="+patch); err != nil {
+	crPatch := fmt.Sprintf(`{"spec":{"infra":{"replicas":%d}}}`, replicas)
+	kubevirtGVR := schema.GroupVersionResource{
+		Group: "kubevirt.io", Version: "v1", Resource: "kubevirts",
+	}
+	if _, err := kc.Dynamic.Resource(kubevirtGVR).Namespace("kubevirt").
+		Patch(ctx, "kubevirt", types.MergePatchType, []byte(crPatch),
+			metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("patch kubevirt CR replicas: %w", err)
 	}
 	return nil
@@ -189,35 +244,62 @@ func kubevirtConfig(ctx context.Context, replicas int) error {
 // tie-breaker (tie-breaker-node=false).
 func kubevirtTieBreakerConfigApply(ctx context.Context) error {
 	log.Printf("tiebreaker: patching kubevirt daemonsets with nodeSelector")
-	out, err := kubectl("get", "daemonsets", "-n", "kubevirt",
-		"-o", "jsonpath={.items[*].metadata.name}")
-	if err != nil {
-		return fmt.Errorf("list kubevirt daemonsets: %w", err)
-	}
-	patch := nodeSelectorPatch(tieBreakerNodeLabel, tieBreakerLabelUnset)
-	for _, ds := range strings.Fields(strings.TrimSpace(out)) {
-		if _, err := kubectl("patch", "daemonset", ds,
-			"-n", "kubevirt", "--type=merge", "-p="+patch); err != nil {
-			return fmt.Errorf("patch kubevirt daemonset %s: %w", ds, err)
-		}
-	}
-	return nil
+	return patchDaemonSetsInNamespace(ctx, "kubevirt", 1)
 }
 
 // cdiConfig patches every Deployment in the cdi namespace with the
 // tie-breaker nodeSelector.
 func cdiConfig(ctx context.Context) error {
 	log.Printf("tiebreaker: patching cdi deployments with nodeSelector")
-	out, err := kubectl("get", "deployments", "-n", "cdi",
-		"-o", "jsonpath={.items[*].metadata.name}")
+	kc := kubeclient.Default()
+	deps, err := kc.Clientset.AppsV1().Deployments("cdi").
+		List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list cdi deployments: %w", err)
 	}
 	patch := nodeSelectorPatch(tieBreakerNodeLabel, tieBreakerLabelUnset)
-	for _, deploy := range strings.Fields(strings.TrimSpace(out)) {
-		if _, err := kubectl("patch", "deployment", deploy,
-			"-n", "cdi", "--type=merge", "-p="+patch); err != nil {
-			return fmt.Errorf("patch cdi deployment %s: %w", deploy, err)
+	for _, d := range deps.Items {
+		if _, err := kc.Clientset.AppsV1().Deployments("cdi").
+			Patch(ctx, d.Name, types.MergePatchType, []byte(patch),
+				metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("patch cdi deployment %s: %w", d.Name, err)
+		}
+	}
+	return nil
+}
+
+// patchDaemonSetsInNamespace applies the tie-breaker nodeSelector
+// merge-patch to every DaemonSet in the given namespace, retrying
+// each patch up to maxRetries times. The retry count matters for
+// longhorn-system where longhorn-manager occasionally races us
+// during initial install; kubevirt namespace usage passes 1.
+func patchDaemonSetsInNamespace(ctx context.Context, ns string, maxRetries int) error {
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+	kc := kubeclient.Default()
+	dsClient := kc.Clientset.AppsV1().DaemonSets(ns)
+	list, err := dsClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list daemonsets in %s: %w", ns, err)
+	}
+	patch := nodeSelectorPatch(tieBreakerNodeLabel, tieBreakerLabelUnset)
+	for _, ds := range list.Items {
+		var lastErr error
+		for i := 0; i < maxRetries; i++ {
+			_, lastErr = dsClient.Patch(ctx, ds.Name,
+				types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+			if lastErr == nil {
+				break
+			}
+			if i < maxRetries-1 {
+				log.Printf("tiebreaker: retry %d/%d patching %s daemonset %s: %v",
+					i+1, maxRetries, ns, ds.Name, lastErr)
+			}
+		}
+		if lastErr != nil {
+			return fmt.Errorf("patch %s daemonset %s after %d retries: %w",
+				ns, ds.Name, maxRetries, lastErr)
 		}
 	}
 	return nil
@@ -247,29 +329,33 @@ func longhornNodeSetSched(ctx context.Context, nodeName string, enabled bool) er
 	sched := enabled
 	evict := !enabled
 
-	nodeJSON, err := kubectl("get", "nodes.longhorn.io", nodeName,
-		"-n", "longhorn-system", "-o", "json")
+	obj, err := kubeclient.Default().Dynamic.Resource(longhornNodesGVR).
+		Namespace("longhorn-system").Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get longhorn node %s: %w", nodeName, err)
 	}
+	raw, err := json.Marshal(obj.Object)
+	if err != nil {
+		return fmt.Errorf("marshal longhorn node %s: %w", nodeName, err)
+	}
 	var lhNode longhornNodeDisks
-	if err := json.Unmarshal([]byte(nodeJSON), &lhNode); err != nil {
+	if err := json.Unmarshal(raw, &lhNode); err != nil {
 		return fmt.Errorf("parse longhorn node %s: %w", nodeName, err)
 	}
 
-	if err := longhornJSONPatch(nodeName, "/spec/allowScheduling", sched); err != nil {
+	if err := longhornJSONPatch(ctx, nodeName, "/spec/allowScheduling", sched); err != nil {
 		return err
 	}
-	if err := longhornJSONPatch(nodeName, "/spec/evictionRequested", evict); err != nil {
+	if err := longhornJSONPatch(ctx, nodeName, "/spec/evictionRequested", evict); err != nil {
 		return err
 	}
 	for diskName := range lhNode.Spec.Disks {
-		if err := longhornJSONPatch(nodeName,
+		if err := longhornJSONPatch(ctx, nodeName,
 			fmt.Sprintf("/spec/disks/%s/allowScheduling", diskName),
 			sched); err != nil {
 			return fmt.Errorf("disk %s: %w", diskName, err)
 		}
-		if err := longhornJSONPatch(nodeName,
+		if err := longhornJSONPatch(ctx, nodeName,
 			fmt.Sprintf("/spec/disks/%s/evictionRequested", diskName),
 			evict); err != nil {
 			return fmt.Errorf("disk %s: %w", diskName, err)
@@ -279,11 +365,12 @@ func longhornNodeSetSched(ctx context.Context, nodeName string, enabled bool) er
 }
 
 // longhornJSONPatch applies a single-op JSON Patch to the named
-// Longhorn node.
-func longhornJSONPatch(nodeName, path string, value bool) error {
+// Longhorn node CR.
+func longhornJSONPatch(ctx context.Context, nodeName, path string, value bool) error {
 	patch := fmt.Sprintf(`[{"op":"replace","path":"%s","value":%v}]`, path, value)
-	if _, err := kubectl("patch", "nodes.longhorn.io", nodeName,
-		"-n", "longhorn-system", "--type=json", "-p="+patch); err != nil {
+	if _, err := kubeclient.Default().Dynamic.Resource(longhornNodesGVR).
+		Namespace("longhorn-system").Patch(ctx, nodeName,
+		types.JSONPatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("patch longhorn node %s %s: %w", nodeName, path, err)
 	}
 	return nil
@@ -294,41 +381,21 @@ func longhornJSONPatch(nodeName, path string, value bool) error {
 // tie-breaker nodeSelector. DaemonSet patches retry 5x because
 // longhorn-manager occasionally races us during initial install.
 func longhornRescale(ctx context.Context, replicas int) error {
-	r := fmt.Sprintf("%d", replicas)
-	log.Printf("tiebreaker: rescaling longhorn components to %s replicas", r)
+	log.Printf("tiebreaker: rescaling longhorn components to %d replicas", replicas)
+	kc := kubeclient.Default()
 
+	deployPatch := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
 	for _, deploy := range []string{
 		"csi-attacher", "csi-provisioner", "csi-resizer", "csi-snapshotter",
 	} {
-		if _, err := kubectl("scale", "deployment", deploy,
-			"-n", "longhorn-system", "--replicas="+r); err != nil {
+		if _, err := kc.Clientset.AppsV1().Deployments("longhorn-system").
+			Patch(ctx, deploy, types.MergePatchType,
+				[]byte(deployPatch), metav1.PatchOptions{}); err != nil {
 			return fmt.Errorf("scale longhorn deployment %s: %w", deploy, err)
 		}
 	}
 
-	out, err := kubectl("get", "daemonsets", "-n", "longhorn-system",
-		"-o", "jsonpath={.items[*].metadata.name}")
-	if err != nil {
-		return fmt.Errorf("list longhorn daemonsets: %w", err)
-	}
-	patch := nodeSelectorPatch(tieBreakerNodeLabel, tieBreakerLabelUnset)
-	for _, ds := range strings.Fields(strings.TrimSpace(out)) {
-		var patchErr error
-		for i := 0; i < 5; i++ {
-			if _, patchErr = kubectl("patch", "daemonset", ds,
-				"-n", "longhorn-system", "--type=merge",
-				"-p="+patch); patchErr == nil {
-				break
-			}
-			log.Printf("tiebreaker: retry %d/5 patching longhorn daemonset %s: %v",
-				i+1, ds, patchErr)
-		}
-		if patchErr != nil {
-			return fmt.Errorf("patch longhorn daemonset %s after 5 retries: %w",
-				ds, patchErr)
-		}
-	}
-	return nil
+	return patchDaemonSetsInNamespace(ctx, "longhorn-system", 5)
 }
 
 // ConfigApply is the entry point. Returns nil and logs the reason
@@ -397,8 +464,7 @@ func ConfigApply(ctx context.Context, selfUUID string) error {
 	}
 
 	log.Printf("tiebreaker: draining %s", tieName)
-	if _, err := kubectl("drain", tieName,
-		"--ignore-daemonsets", "--delete-emptydir-data", "--force"); err != nil {
+	if err := drainNode(ctx, tieName); err != nil {
 		return fmt.Errorf("drain tie-breaker node %s: %w", tieName, err)
 	}
 
@@ -409,10 +475,123 @@ func ConfigApply(ctx context.Context, selfUUID string) error {
 	return nil
 }
 
-// kubectl logs the invocation and forwards to kubectlx.Run.
-// Local wrapper because every tie-breaker action is a kubectl call
-// that we want surfaced in the daemon log for postmortem inspection.
-func kubectl(args ...string) (string, error) {
-	log.Printf("kubectl %s", strings.Join(args, " "))
-	return kubectlx.Run(args...)
+// drainNode is the client-go equivalent of `kubectl drain <node>
+// --ignore-daemonsets --delete-emptydir-data --force`. It:
+//   - lists every pod scheduled on the node,
+//   - skips DaemonSet-owned pods (they're re-created immediately
+//     anyway; kubectl's --ignore-daemonsets does the same),
+//   - issues an Eviction (respecting PodDisruptionBudgets) for every
+//     other pod,
+//   - waits until each evicted pod has actually disappeared from
+//     the node.
+//
+// `--delete-emptydir-data` is implicit here: the Eviction API
+// terminates pods regardless of emptyDir volumes, and any local
+// data goes with them — same effective behaviour as the kubectl
+// flag. `--force` semantics are also inherent: we evict every
+// unmanaged pod without prompting.
+func drainNode(ctx context.Context, nodeName string) error {
+	kc := kubeclient.Default()
+	nodes := kc.Clientset.CoreV1().Nodes()
+
+	// Ensure the node is cordoned before draining, matching kubectl
+	// drain's own precondition (kubectl cordons first if needed).
+	if err := setCordoned(ctx, nodes, nodeName, true); err != nil {
+		return err
+	}
+
+	pods, err := kc.Clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil {
+		return fmt.Errorf("list pods on node %s: %w", nodeName, err)
+	}
+
+	toEvict := make([]corev1.Pod, 0, len(pods.Items))
+	for _, p := range pods.Items {
+		if isDaemonSetPod(&p) {
+			continue
+		}
+		toEvict = append(toEvict, p)
+	}
+
+	for i := range toEvict {
+		p := &toEvict[i]
+		eviction := &policyv1.Eviction{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: p.Name, Namespace: p.Namespace,
+			},
+		}
+		if err := kc.Clientset.PolicyV1().
+			Evictions(p.Namespace).Evict(ctx, eviction); err != nil {
+			// NotFound = pod already gone (fine); TooManyRequests
+			// means a PDB blocks eviction — retry once after a
+			// short wait since drain is supposed to be forceful.
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if apierrors.IsTooManyRequests(err) {
+				time.Sleep(2 * time.Second)
+				if err := kc.Clientset.PolicyV1().Evictions(p.Namespace).
+					Evict(ctx, eviction); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("evict %s/%s: %w", p.Namespace, p.Name, err)
+				}
+				continue
+			}
+			return fmt.Errorf("evict %s/%s: %w", p.Namespace, p.Name, err)
+		}
+	}
+
+	return waitForPodsGone(ctx, nodeName, toEvict)
+}
+
+// isDaemonSetPod matches kubectl drain's --ignore-daemonsets rule:
+// any pod owned by a DaemonSet is skipped.
+func isDaemonSetPod(p *corev1.Pod) bool {
+	for _, ref := range p.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForPodsGone blocks until every pod in `evicted` has left the
+// node — either deleted or rescheduled elsewhere. Polls at 2s
+// intervals; caller's ctx bounds the overall wait.
+func waitForPodsGone(ctx context.Context, nodeName string, evicted []corev1.Pod) error {
+	if len(evicted) == 0 {
+		return nil
+	}
+	kc := kubeclient.Default()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		remaining := 0
+		for i := range evicted {
+			p := &evicted[i]
+			cur, err := kc.Clientset.CoreV1().Pods(p.Namespace).
+				Get(ctx, p.Name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err == nil && cur.Spec.NodeName != nodeName {
+				continue
+			}
+			remaining++
+		}
+		if remaining == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("drain %s: %d pods still on node after 5m",
+				nodeName, remaining)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }

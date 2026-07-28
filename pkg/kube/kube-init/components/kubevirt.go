@@ -9,7 +9,10 @@ import (
 	"log"
 	"strings"
 
+	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // standardFeatureGates is the EVE-expected set of KubeVirt feature
@@ -39,13 +42,19 @@ func MigrateKubeVirtFeatureGates(ctx context.Context) error {
 		return nil
 	}
 
-	out, err := kubectl("get", "kubevirt", "kubevirt", "-n", kubevirtNamespace,
-		"-o", "jsonpath={.spec.configuration.developerConfiguration.featureGates[*]}")
+	kubevirtGVR := kubevirtGVK.GroupVersion().WithResource("kubevirts")
+	obj, err := kubeclient.Default().Dynamic.Resource(kubevirtGVR).
+		Namespace(kubevirtNamespace).Get(ctx, "kubevirt", metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("query kubevirt feature gates: %w", err)
 	}
-	for _, g := range strings.Fields(strings.TrimSpace(out)) {
-		if g == "VideoConfig" {
+	// spec.configuration.developerConfiguration.featureGates: []string
+	spec, _ := obj.Object["spec"].(map[string]any)
+	config, _ := spec["configuration"].(map[string]any)
+	dev, _ := config["developerConfiguration"].(map[string]any)
+	rawGates, _ := dev["featureGates"].([]any)
+	for _, rg := range rawGates {
+		if g, _ := rg.(string); g == "VideoConfig" {
 			log.Printf("KubeVirt feature gates already up to date, skipping migration")
 			if err := state.Mark(state.KubevirtFeatureGatesMigrated); err != nil {
 				return fmt.Errorf("mark feature-gate migrated: %w", err)
@@ -56,8 +65,9 @@ func MigrateKubeVirtFeatureGates(ctx context.Context) error {
 
 	log.Printf("KubeVirt VideoConfig feature gate missing, patching CR")
 	patch := buildFeatureGatesPatch(standardFeatureGates)
-	if _, err := kubectl("patch", "kubevirt", "kubevirt", "-n", kubevirtNamespace,
-		"--type=merge", "-p="+patch); err != nil {
+	if _, err := kubeclient.Default().Dynamic.Resource(kubevirtGVR).
+		Namespace(kubevirtNamespace).Patch(ctx, "kubevirt",
+			types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("patch kubevirt feature gates: %w", err)
 	}
 	log.Printf("KubeVirt feature gates migrated")

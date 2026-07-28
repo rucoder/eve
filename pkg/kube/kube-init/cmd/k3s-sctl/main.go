@@ -10,6 +10,7 @@
 //	k3s-sctl restart   — graceful k3s restart (runs pre-restart hooks)
 //	k3s-sctl status    — one-line status report
 //	k3s-sctl stop      — stop the kube-init daemon
+//	k3s-sctl graph     — print the resolved deploy-graph edges
 //
 // Socket path overridable via K3S_SUPERVISOR_SOCKET for testing.
 package main
@@ -26,7 +27,7 @@ const defaultSocket = "/run/k3s-supervisor.sock"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <restart|status|stop>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <restart|status|stop|graph>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -49,14 +50,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Read every line the daemon writes until EOF. Multi-line
+	// responses (graph) print naturally; single-line responses
+	// (status / restart / stop) print exactly one line then EOF.
 	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if len(lines) == 0 {
 		fmt.Fprintf(os.Stderr, "k3s-sctl: no reply from daemon\n")
 		os.Exit(1)
 	}
-	resp := scanner.Text()
-	fmt.Println(resp)
-	if strings.HasPrefix(resp, "ERR") {
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	// Exit non-zero if the LAST line is an ERR — mirrors the
+	// previous single-line convention. Multi-line graph output
+	// only starts with ERR when the plan itself failed.
+	if strings.HasPrefix(lines[len(lines)-1], "ERR") {
 		os.Exit(1)
 	}
 }
