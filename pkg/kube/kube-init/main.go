@@ -432,6 +432,18 @@ type daemon struct {
 	// control socket.
 	hookResults []k3s.HookResult
 
+	// bootAt is when the daemon started and stateEnteredAt when the
+	// current state was entered. Both exist so every transition can log
+	// how long the previous state took and how far into the boot we are,
+	// which is what makes two boots comparable without hand-diffing
+	// timestamps.
+	bootAt         time.Time
+	stateEnteredAt time.Time
+
+	// cpuLoan is the widened cpuset held for the duration of a first
+	// boot, given back on reaching RUNNING.
+	cpuLoan *prereqs.CPUSetLoan
+
 	// signals carries component readiness for the control socket and
 	// for consumers whose producer is outside the deploy graph. Lives
 	// for the daemon's lifetime so a re-entered DEPLOYING keeps what
@@ -611,6 +623,8 @@ func main() {
 		monRestartCh:    make(chan monitor.RestartReason, 4),
 		psMgr:           psMgr,
 		signals:         deploy.NewBus(),
+		bootAt:          time.Now(),
+		stateEnteredAt:  time.Now(),
 	}
 
 	initialized, err := state.IsInitialized()
@@ -621,6 +635,11 @@ func main() {
 		log.Printf("previous initialization found")
 	} else {
 		log.Printf("first boot — full initialization required")
+		// Take the CPU loan for the whole first boot rather than just the
+		// deploy: k3s unpack (INSTALLING) and the tarball imports
+		// (IMPORTING) are decompression-heavy and run before DEPLOYING.
+		// Restored on reaching RUNNING.
+		d.cpuLoan = prereqs.WidenEVECPUs()
 	}
 	// Phase is recomputed inside the INIT goroutine after
 	// RunAll, where we also handle the convert-to-single-node
@@ -1288,7 +1307,12 @@ func (d *daemon) transition(ctx context.Context, newState State, reason string) 
 		d.stopBackoffTimer()
 	}
 
-	log.Printf("%s → %s (reason: %s)", oldState, newState, reason)
+	now := time.Now()
+	log.Printf("%s → %s (reason: %s, %s took %s, boot+%s)",
+		oldState, newState, reason, oldState,
+		now.Sub(d.stateEnteredAt).Round(time.Second),
+		now.Sub(d.bootAt).Round(time.Second))
+	d.stateEnteredAt = now
 	d.state = newState
 	d.enterStateFn(ctx)
 }
@@ -1631,6 +1655,16 @@ func (d *daemon) enterRunning(ctx context.Context) {
 	}
 	log.Printf("RUNNING — k3s pid=%d, phase=%s, restarts=%d",
 		pid, d.phase, d.restartCount)
+
+	// Deploy is over; hand the borrowed CPUs back so steady state runs
+	// inside the limits the device was configured with.
+	if d.cpuLoan != nil {
+		log.Printf("FIRST BOOT COMPLETE in %s (cpus=%d while borrowed)",
+			time.Since(d.bootAt).Round(time.Second), prereqs.KubeCPUCount())
+		d.cpuLoan.Restore()
+		d.cpuLoan = nil
+		log.Printf("steady-state cpus=%d", prereqs.KubeCPUCount())
+	}
 
 	// One-shot status line so operators can see the registration
 	// state without scrolling through silent health-tick output.

@@ -29,6 +29,7 @@ import (
 	"github.com/lf-edge/eve/pkg/kube/kube-init/edgenodeinfo"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/prereqs"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -155,9 +156,10 @@ type NodeAddress struct {
 // would fire prematurely.
 //
 // MaxParallel bounds concurrent Apply work so a first boot does not put
-// every operator install and manifest parse on the node at once, which
-// matters most on a device whose EVE cpuset is a single CPU. Ready waits
-// run outside that bound — see runOne.
+// every operator install and manifest parse on the node at once. Ready
+// waits run outside that bound — see runOne. The count comes from the
+// live kube cpuset rather than runtime.NumCPU, which caches the mask at
+// process start and so would not see the first-boot widening.
 //
 // AllComponentsInitialized / NodeLabelsInitialized are deliberately
 // NOT written here — the caller writes them only after the post-deploy
@@ -193,6 +195,19 @@ func DeployAll(
 	}
 	log.Printf("all components initialized")
 	return nil
+}
+
+// applyConcurrency caps concurrent Apply work at the CPUs the kube
+// cgroup may currently use. The floor of two keeps a single-CPU device
+// from serialising completely, since an Apply interleaves parsing with
+// API round-trips rather than spinning.
+func applyConcurrency() int {
+	n := prereqs.KubeCPUCount()
+	if n <= 0 {
+		// No cpuset to read (cgroup v2, or an unconfined host).
+		n = runtime.NumCPU()
+	}
+	return max(2, n)
 }
 
 // ensureEveKubeAppNamespace creates the namespace that hosts EVE app
@@ -240,7 +255,7 @@ func GraphEdges(installKubevirt bool) ([]deploy.Edge, error) {
 // PolicyDeps.
 func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool) deploy.Graph {
 	g := deploy.Graph{
-		MaxParallel: max(2, runtime.NumCPU()),
+		MaxParallel: applyConcurrency(),
 		Components: []deploy.Component{
 			{
 				// The namespace hosts EVE app workloads and holds the
