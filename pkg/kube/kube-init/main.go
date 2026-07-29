@@ -425,6 +425,10 @@ type daemon struct {
 	// control socket.
 	hookResults []k3s.HookResult
 
+	// cpuLoan is the widened cpuset held across a first-boot deploy,
+	// given back on reaching RUNNING.
+	cpuLoan *prereqs.CPUSetLoan
+
 	// signals carries component readiness for the control socket and
 	// for consumers whose producer is outside the deploy graph. Lives
 	// for the daemon's lifetime so a re-entered DEPLOYING keeps what
@@ -1225,6 +1229,11 @@ func (d *daemon) enterState(ctx context.Context) {
 		}, EvK3sReady)
 
 	case StateDeploying:
+		// The deploy is the heaviest load kube-init ever puts on the
+		// control plane, and nothing is competing for CPU yet.
+		if d.cpuLoan == nil {
+			d.cpuLoan = prereqs.WidenEVECPUs()
+		}
 		d.startAsync(ctx, d.workDeploy, EvDeployDone)
 
 	case StateRunning:
@@ -1544,6 +1553,11 @@ func (d *daemon) enterRunning(ctx context.Context) {
 	}
 	log.Printf("RUNNING — k3s pid=%d, phase=%s, restarts=%d",
 		pid, d.phase, d.restartCount)
+
+	// Deploy is over; hand the borrowed CPUs back so steady state runs
+	// inside the limits the device was configured with.
+	d.cpuLoan.Restore()
+	d.cpuLoan = nil
 
 	// One-shot status line so operators can see the registration
 	// state without scrolling through silent health-tick output.
