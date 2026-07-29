@@ -581,9 +581,14 @@ func InstallCDI(ctx context.Context) error {
 	if err := kubectlx.ApplyURL(ctx, kc, cdiOperatorURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply CDI operator: %w", err)
 	}
+	// A timeout must not skip the CR below: nothing retries this step, so CDI
+	// would never reconcile and every app volume needing an upload parks in
+	// DELIVERED for the life of the boot. Apply anyway and let ApplyURL's
+	// backoff absorb an operator webhook that is not serving yet.
 	if err := kubectlx.WaitDeploymentReady(ctx, kc, kubectlx.CDINamespace,
 		cdiOperatorDeployment, cdiOperatorWaitTimeout); err != nil {
-		return fmt.Errorf("wait cdi-operator ready: %w", err)
+		log.Printf("WARNING: cdi-operator not ready within %s (%v); applying the CDI CR anyway",
+			cdiOperatorWaitTimeout, err)
 	}
 	if err := kubectlx.ApplyURL(ctx, kc, cdiCRURL, kubectlx.ApplyOptions{}); err != nil {
 		return fmt.Errorf("apply CDI CR: %w", err)
