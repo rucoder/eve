@@ -107,6 +107,20 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 			continue
 		}
 		registered++
+		// The external-boot-image must also be reachable as :latest.
+		// pillar's kubevirt hypervisor hardcodes that tag in every
+		// container-as-VM VMIRS (with imagePullPolicy: Never) precisely
+		// so the reference survives a baseOS upgrade, which prunes the
+		// versioned tag — see lf-edge/eve#6100. Registering only the
+		// versioned ref leaves virt-launcher wedged in ErrImageNeverPull.
+		if img.RefName == externalBootLayoutRef {
+			latestRef := ExternalBootImageName + ":latest"
+			if err := putImage(ctx, is, latestRef, img.Manifest); err != nil {
+				log.Printf("WARNING: alias %s -> %s: %v", name, latestRef, err)
+			} else {
+				log.Printf("kube-images: aliased %s as %s", name, latestRef)
+			}
+		}
 		// Pre-convert into the erofs snapshotter now, sequentially, so the
 		// deploy waves find a ready snapshot at CreateContainer. Lazy per-pod
 		// conversion otherwise herds: a wave bringing up several images at once
@@ -198,7 +212,22 @@ func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
 			copied++
 		}
 	}
-	image := ctrdimages.Image{Name: name, Target: img.Manifest}
+	if err := putImage(ctx, is, name, img.Manifest); err != nil {
+		return err
+	}
+	log.Printf("kube-images: registered %s (%d blobs, %d zero-copy, %d copied)",
+		name, len(img.Blobs), zerocopy, copied)
+	return nil
+}
+
+// putImage creates the image record for name, or repoints an existing
+// record at target. The update path is what makes re-tagging safe: the
+// content store lives on /persist and survives upgrades, so a stable
+// alias like :latest already exists pointing at the previous release,
+// and a plain Create would fail with AlreadyExists (the equivalent of
+// `ctr image tag --force`).
+func putImage(ctx context.Context, is ctrdimages.Store, name string, target ocispec.Descriptor) error {
+	image := ctrdimages.Image{Name: name, Target: target}
 	if _, err := is.Create(ctx, image); err != nil {
 		if !errdefs.IsAlreadyExists(err) {
 			return fmt.Errorf("create image: %w", err)
@@ -208,7 +237,5 @@ func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
 			return fmt.Errorf("create/update image: create=%w update=%w", err, uerr)
 		}
 	}
-	log.Printf("kube-images: registered %s (%d blobs, %d zero-copy, %d copied)",
-		name, len(img.Blobs), zerocopy, copied)
 	return nil
 }
