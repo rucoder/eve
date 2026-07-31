@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
@@ -87,7 +88,8 @@ var ErrApplyExhausted = errors.New("kubectlx apply: max attempts exhausted")
 // Objects are applied in document order, so authors can rely on
 // "CRDs before CRs" within a single manifest — the CRD-just-installed
 // race between docs is resolved by the RESTMapper reset + retry in
-// applyOne.
+// applyOne, including the case where the previous generation of the CRD
+// is still terminating (see isCRDLifecycleRace).
 //
 // Returns the first non-nil per-object error. Callers that want
 // best-effort semantics across multiple objects should split the
@@ -323,16 +325,55 @@ func isNoKindMatch(err error) bool {
 	return errors.As(err, &nkm)
 }
 
+// isCRDLifecycleRace reports whether err is a CR apply that lost a race
+// with its CRD's lifecycle. Both shapes below are permanent verdicts in
+// general — which is why isRetryable rejects Forbidden and NotFound
+// outright — but here they are pure timing:
+//
+//   - Forbidden "...while custom resource definition is terminating":
+//     the previous CRD is still finalizing, so the apiserver refuses new
+//     CRs of that kind. Once it is gone and re-Established the apply
+//     succeeds.
+//   - NotFound "the server could not find the requested resource": the
+//     kind is not served yet. NoKindMatchError covers the client-side
+//     RESTMapper miss, but once the mapper holds a (stale) mapping the
+//     request reaches the apiserver and comes back as a 404 on the
+//     resource endpoint instead. A server-side apply creates the object,
+//     so a 404 here is never "this object is missing".
+//
+// Matching on message text is unavoidable: the apiserver reports both
+// through generic Forbidden/NotFound status errors with no machine-
+// readable reason distinguishing them from the permanent cases.
+func isCRDLifecycleRace(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if apierrors.IsForbidden(err) &&
+		strings.Contains(msg, "custom resource definition is terminating") {
+		return true
+	}
+	if apierrors.IsNotFound(err) &&
+		strings.Contains(msg, "could not find the requested resource") {
+		return true
+	}
+	return false
+}
+
 // isRetryable returns true for errors that are worth another attempt:
 // server-side timeouts, service unavailable, transient throttling,
-// generic i/o problems, and CRD-race NoKindMatchError. It intentionally
-// excludes NotFound (Get semantics — the caller decides) and Forbidden
-// / Unauthorized / Invalid (permanent).
+// generic i/o problems, CRD-race NoKindMatchError, and the CRD-lifecycle
+// races isCRDLifecycleRace identifies. It intentionally excludes NotFound
+// (Get semantics — the caller decides) and Forbidden / Unauthorized /
+// Invalid (permanent) in every other case.
 func isRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	if isNoKindMatch(err) {
+		return true
+	}
+	if isCRDLifecycleRace(err) {
 		return true
 	}
 	if apierrors.IsServerTimeout(err) ||
