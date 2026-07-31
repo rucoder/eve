@@ -387,7 +387,16 @@ func removeIfExists(path string) error {
 
 func writeBootstrapConfig(path string, cs *ClusterStatus, isFirstBoot bool) error {
 	var buf strings.Builder
-	if isFirstBoot {
+	// A bootstrap node has to initialize the etcd cluster unless it has
+	// already done so. isFirstBoot alone is the wrong predicate: on a
+	// single→cluster transition the device is long past first boot, yet
+	// its managed-etcd datastore has never been initialized (it ran
+	// single-node against kine). Emitting the rejoin stanza there points
+	// the node at its own apiserver, which cannot come up until bootstrap
+	// data exists — k3s then dies on every restart with "Managed etcd
+	// cluster not yet initialized" plus a connection refused to itself,
+	// and the node never recovers.
+	if isFirstBoot || !etcdClusterInitialized() {
 		buf.WriteString("cluster-init: true\n")
 	} else {
 		// Restart: rejoin our own cluster rather than re-bootstrap.
@@ -402,8 +411,27 @@ func writeBootstrapConfig(path string, cs *ClusterStatus, isFirstBoot bool) erro
 	if err := state.AtomicWriteFile(path, []byte(buf.String()), 0644); err != nil {
 		return fmt.Errorf("write bootstrap config: %w", err)
 	}
-	log.Printf("bootstrap config written (firstBoot=%v)", isFirstBoot)
+	log.Printf("bootstrap config written (firstBoot=%v, etcdInitialized=%v)",
+		isFirstBoot, etcdClusterInitialized())
 	return nil
+}
+
+// etcdMemberDir is k3s' managed-etcd member directory. Declared as a var
+// so tests can shadow it.
+var etcdMemberDir = "/var/lib/rancher/k3s/server/db/etcd/member"
+
+// etcdClusterInitialized reports whether this node already holds an
+// initialized managed-etcd datastore.
+//
+// member/ is the only trustworthy signal. k3s creates the parent
+// .../db/etcd/ directory (and a "name" file in it) on any server start,
+// including a single-node/kine one that never runs etcd at all — so
+// neither the directory nor that file distinguishes "etcd bootstrapped"
+// from "etcd was never initialized". etcd itself creates member/ only
+// once it has written its datastore.
+func etcdClusterInitialized() bool {
+	fi, err := os.Stat(etcdMemberDir)
+	return err == nil && fi.IsDir()
 }
 
 func writeJoinConfig(ctx context.Context, path string, cs *ClusterStatus, isFirstBoot bool) error {

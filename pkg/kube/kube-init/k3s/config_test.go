@@ -47,6 +47,23 @@ func shadowPaths(t *testing.T) (configDir, userOverrideSrc string) {
 	return
 }
 
+// shadowEtcdInitialized points etcdMemberDir at an existing directory
+// (initialized=true) or a path that does not exist (false), so tests can
+// pick which side of the bootstrap-vs-rejoin decision they exercise
+// without touching the real /var/lib/rancher tree.
+func shadowEtcdInitialized(t *testing.T, initialized bool) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "etcd", "member")
+	if initialized {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("mkdir etcd member dir: %v", err)
+		}
+	}
+	orig := etcdMemberDir
+	etcdMemberDir = dir
+	t.Cleanup(func() { etcdMemberDir = orig })
+}
+
 func TestBracketIPv6(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -360,6 +377,10 @@ func TestWriteBootstrapConfigShape(t *testing.T) {
 		t.Errorf("first-boot must NOT contain server:\n%s", body)
 	}
 
+	// Restart of a node that HAS already bootstrapped etcd: rejoin our
+	// own cluster. The initialized datastore is what makes the rejoin
+	// stanza correct here.
+	shadowEtcdInitialized(t, true)
 	if err := writeBootstrapConfig(path, cs, false); err != nil {
 		t.Fatalf("writeBootstrapConfig restart: %v", err)
 	}
@@ -369,6 +390,37 @@ func TestWriteBootstrapConfigShape(t *testing.T) {
 	}
 	if strings.Contains(body, "cluster-init:") {
 		t.Errorf("restart must NOT contain cluster-init:\n%s", body)
+	}
+}
+
+// TestWriteBootstrapConfigSingleToCluster covers the single→cluster
+// transition: the device is past first boot (isFirstBoot=false) but has
+// never initialized a managed-etcd datastore, because it was running
+// single-node against kine. It must still cluster-init. Emitting the
+// rejoin stanza points the node at its own apiserver, which cannot come
+// up until bootstrap data exists, and k3s then dies on every restart
+// with "Managed etcd cluster not yet initialized".
+func TestWriteBootstrapConfigSingleToCluster(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "01-cluster.yaml")
+	cs := &ClusterStatus{
+		ClusterInterface: "eth0",
+		JoinServerIP:     "10.0.0.1",
+		EncryptedToken:   "tok",
+		ClusterIP:        "10.0.0.1", // bootstrap node: JoinServerIP == own IP
+		ClusterIPIsReady: true,
+		ClusterID:        "u",
+	}
+	shadowEtcdInitialized(t, false)
+	if err := writeBootstrapConfig(path, cs, false); err != nil {
+		t.Fatalf("writeBootstrapConfig single→cluster: %v", err)
+	}
+	body := readFile(t, path)
+	if !strings.Contains(body, "cluster-init: true\n") {
+		t.Errorf("uninitialized etcd must cluster-init:\n%s", body)
+	}
+	if strings.Contains(body, "server:") {
+		t.Errorf("must NOT point at its own apiserver (deadlock):\n%s", body)
 	}
 }
 
@@ -383,6 +435,8 @@ func TestWriteBootstrapConfigBracketsIPv6(t *testing.T) {
 		ClusterIPIsReady: true,
 		ClusterID:        "u",
 	}
+	// Rejoin stanza only renders once etcd is initialized.
+	shadowEtcdInitialized(t, true)
 	if err := writeBootstrapConfig(path, cs, false); err != nil {
 		t.Fatalf("writeBootstrapConfig: %v", err)
 	}
