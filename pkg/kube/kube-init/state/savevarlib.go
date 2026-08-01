@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -94,6 +95,72 @@ func RestoreVarLib() error {
 	return restoreVarLibFrom(KubeSaveVarLib, "/var/lib")
 }
 
+// varLibStatePaths are the /var/lib subtrees that carry real node
+// identity and must survive a cluster→single rollback. Everything else
+// under /var/lib is re-derivable: rancher/k3s/server/data (the unpacked
+// k3s bundle), cni (CNI binaries) and k3s (k3s binaries) account for
+// ~419MB of a ~443MB tree and are reproduced by the install path.
+//
+// Copied live: each of these is written once at k3s init and does not
+// churn afterwards, so no quiesce is needed. Missing entries are
+// skipped — a node that never got as far as writing one has no state
+// there to preserve.
+// Audited against a live first-boot node. Everything else present under
+// /var/lib there is deliberately excluded:
+//
+//	server/etc         k3s regenerates egress-selector/cloud-config from
+//	                   the config drop-ins; a stale copy could contradict
+//	                   a changed config.
+//	server/manifests   auto-deploy manifests, re-staged from the image.
+//	server/static      static pod manifests, likewise.
+//	longhorn/          engine-binaries + a socket dir, extracted from the
+//	                   Longhorn image on demand.
+//	kubelet/           runtime only, and restoring it is worse than not:
+//	                   prereqs already deletes stale cpu_manager_state on
+//	                   boot precisely because carrying it over breaks
+//	                   kubelet.
+//	kubevirt-node-labeller/, cni/, k3s/, rancher/k3s/server/data
+//	                   re-derivable.
+var varLibStatePaths = []string{
+	"rancher/k3s/server/tls",         // server + CA certs
+	"rancher/k3s/server/cred",        // node password, ipsec psk
+	"rancher/k3s/server/token",       // cluster token
+	"rancher/k3s/server/node-token",  // symlink -> token
+	"rancher/k3s/server/agent-token", // symlink -> token
+	"rancher/k3s/agent",              // node identity: client certs + kubeconfigs
+}
+
+// varLibMarkerGlob matches the component markers kube-init keeps at the
+// top of /var/lib (all_components_initialized, longhorn_initialized,
+// node-labels-initialized, …). They are part of the restored state:
+// the snapshot is taken before they are written, so a restored tree
+// reads "components installed, not yet initialized".
+const varLibMarkerGlob = "*initialized"
+
+// kineDBRelPath is the kine datastore, the one file that IS written
+// continuously and therefore cannot be copied byte-for-byte under a
+// live writer. Snapshotted with SQLite's online-consistent copy instead.
+//
+// Note this is kine/SQLite, not etcd: server/db/etcd/ is a vestigial
+// stub holding only "name" on a single-node server, so `k3s
+// etcd-snapshot` does not apply here. Re-check if EVE ever moves
+// single-node k3s to embedded etcd.
+const kineDBRelPath = "rancher/k3s/server/db/state.db"
+
+// clusterOnlyVarLibPaths are artifacts a cluster-mode k3s leaves behind
+// that must NOT survive a rollback to single-node. The restore is an
+// overlay copy, so anything the snapshot does not contain stays on disk
+// unless it is removed explicitly.
+//
+// server/db/etcd matters most: in cluster mode k3s runs embedded etcd
+// and writes a real member/ directory there. Leaving it next to a
+// restored kine datastore gives k3s two conflicting datastores, and it
+// also makes etcdClusterInitialized() (k3s/config.go) report a
+// bootstrapped cluster that no longer exists.
+var clusterOnlyVarLibPaths = []string{
+	"rancher/k3s/server/db/etcd",
+}
+
 // saveVarLibTo / restoreVarLibFrom are the inner halves of the
 // public pair, with paths injected so tests can run against temp
 // dirs.
@@ -111,7 +178,7 @@ func saveVarLibTo(src, dst string) error {
 	if err := os.RemoveAll(staging); err != nil {
 		return fmt.Errorf("save: clean staging %s: %w", staging, err)
 	}
-	if err := copyTree(src+"/.", staging+"/", "save"); err != nil {
+	if err := saveVarLibState(src, staging); err != nil {
 		// Make sure we don't leak a half-populated staging dir on
 		// failure — RestoreVarLib must never see one.
 		_ = os.RemoveAll(staging)
@@ -129,6 +196,103 @@ func saveVarLibTo(src, dst string) error {
 	return nil
 }
 
+// saveVarLibState populates staging with the state-only snapshot: the
+// varLibStatePaths subtrees, the top-level markers, and an
+// online-consistent copy of the kine datastore.
+func saveVarLibState(src, staging string) error {
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return fmt.Errorf("save: mkdir staging %s: %w", staging, err)
+	}
+	for _, rel := range varLibStatePaths {
+		from := filepath.Join(src, rel)
+		fi, err := os.Lstat(from)
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("state: save: %s absent, skipping", rel)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("save: stat %s: %w", rel, err)
+		}
+		to := filepath.Join(staging, rel)
+		if err := os.MkdirAll(filepath.Dir(to), 0700); err != nil {
+			return fmt.Errorf("save: mkdir %s: %w", filepath.Dir(to), err)
+		}
+		if fi.IsDir() {
+			if err := copyTree(from+"/.", to+"/", "save"); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := copyEntry(from, to, fs.FileInfoToDirEntry(fi)); err != nil {
+			return fmt.Errorf("save: copy %s: %w", rel, err)
+		}
+	}
+
+	markers, err := filepath.Glob(filepath.Join(src, varLibMarkerGlob))
+	if err != nil {
+		return fmt.Errorf("save: glob markers: %w", err)
+	}
+	for _, m := range markers {
+		fi, err := os.Lstat(m)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		to := filepath.Join(staging, filepath.Base(m))
+		if err := copyFileContents(m, to, fi.Mode().Perm()); err != nil {
+			return fmt.Errorf("save: copy marker %s: %w", filepath.Base(m), err)
+		}
+	}
+
+	db := filepath.Join(src, kineDBRelPath)
+	if _, err := os.Stat(db); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No kine datastore: either k3s never reached the point of
+			// creating one, or this server is on embedded etcd. Nothing
+			// to snapshot here either way.
+			log.Printf("state: save: %s absent, skipping datastore copy",
+				kineDBRelPath)
+			return nil
+		}
+		return fmt.Errorf("save: stat datastore: %w", err)
+	}
+	to := filepath.Join(staging, kineDBRelPath)
+	if err := os.MkdirAll(filepath.Dir(to), 0700); err != nil {
+		return fmt.Errorf("save: mkdir %s: %w", filepath.Dir(to), err)
+	}
+	if err := sqliteVacuumInto(db, to); err != nil {
+		return fmt.Errorf("save: snapshot datastore: %w", err)
+	}
+	return nil
+}
+
+// sqliteVacuumInto writes an online-consistent copy of the SQLite
+// database at src to dst. Declared as a var so tests can stub it.
+//
+// VACUUM INTO runs inside a read transaction, so the result is a
+// point-in-time image even while k3s writes — that is what lets the
+// snapshot run without stopping k3s. It also compacts, so the copy is
+// smaller than the live file.
+//
+// Shelling out to sqlite3 keeps kube-init a static CGO_ENABLED=0 binary:
+// the cgo driver would force dynamic linking and the pure-Go one is a
+// very large vendor addition, both for a single statement.
+var sqliteVacuumInto = func(src, dst string) error {
+	// dst must not exist — VACUUM INTO refuses to overwrite.
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear %s: %w", dst, err)
+	}
+	// busy_timeout so a concurrent kine write cannot fail the snapshot
+	// outright; VACUUM INTO only needs a read lock, so this is a margin
+	// against lock churn rather than an expected wait.
+	cmd := exec.Command("sqlite3", "-cmd", ".timeout 60000", src,
+		fmt.Sprintf("VACUUM INTO '%s'", dst))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("sqlite3 VACUUM INTO %s: %w (output: %s)",
+			dst, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func restoreVarLibFrom(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -137,7 +301,23 @@ func restoreVarLibFrom(src, dst string) error {
 		}
 		return fmt.Errorf("stat backup dir %s: %w", src, err)
 	}
-	return copyTree(src+"/.", dst+"/", "restore")
+	if err := copyTree(src+"/.", dst+"/", "restore"); err != nil {
+		return err
+	}
+	// The copy above is an overlay: it replaces what the snapshot holds
+	// and leaves everything else — including cluster-mode artifacts the
+	// single-node tree must not inherit.
+	for _, rel := range clusterOnlyVarLibPaths {
+		p := filepath.Join(dst, rel)
+		if _, err := os.Lstat(p); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		log.Printf("state: restore: removing cluster-mode artifact %s", rel)
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("restore: remove %s: %w", rel, err)
+		}
+	}
+	return nil
 }
 
 // volatileVarLibPaths are trees whose contents are recreated at runtime

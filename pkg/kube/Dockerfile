@@ -24,7 +24,7 @@ FROM lfedge/eve-alpine:3fbd7d66c2689521f38872c3ad8d30a2910a4456 AS build
 ARG TARGETARCH
 ENV PKGS="alpine-baselayout musl-utils iproute2 iptables curl openrc \
          open-iscsi libvirt libvirt-client util-linux grep findutils jq \
-         cni-plugins nfs-utils inotify-tools erofs-utils"
+         cni-plugins nfs-utils inotify-tools erofs-utils sqlite"
 # Build-stage-only deps (installed into the build root, not /out) for
 # compiling patched erofs-utils from source below.
 ENV BUILD_PKGS="build-base autoconf automake libtool pkgconf lz4-dev \

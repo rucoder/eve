@@ -244,14 +244,16 @@ func TestTransitionTable(t *testing.T) {
 			wantState: StateSnapshot,
 		},
 		{
-			name:      "Snapshot/SnapshotDone->StartingK3s and sets PhaseSteady",
+			// k3s is never stopped for the snapshot, so there is no
+			// restart to make: go straight to the readiness check.
+			name:      "Snapshot/SnapshotDone->WaitK3sReady and sets PhaseSteady",
 			initState: StateSnapshot,
 			initPhase: PhaseFirstBoot,
 			event:     Event{Type: EvSnapshotDone},
-			wantState: StateStartingK3s,
+			wantState: StateWaitK3sReady,
 			checkFn: func(t *testing.T, d *daemon) {
 				if d.phase != PhaseSteady {
-					t.Errorf("phase = %v, want PhaseSteady so the restart skips DEPLOYING", d.phase)
+					t.Errorf("phase = %v, want PhaseSteady so it skips DEPLOYING", d.phase)
 				}
 			},
 		},

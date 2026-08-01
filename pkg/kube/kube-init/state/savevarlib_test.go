@@ -95,10 +95,12 @@ func TestSaveAndRestoreRoundTrip(t *testing.T) {
 	backup := filepath.Join(backupParent, "kube-save-var-lib")
 	restored := t.TempDir()
 
-	if err := os.MkdirAll(filepath.Join(varLib, "rancher/k3s"), 0755); err != nil {
+	// Must be a path the state-only snapshot actually carries; see
+	// varLibStatePaths.
+	if err := os.MkdirAll(filepath.Join(varLib, "rancher/k3s/server"), 0755); err != nil {
 		t.Fatalf("seed varLib: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(varLib, "rancher/k3s/server-token"),
+	if err := os.WriteFile(filepath.Join(varLib, "rancher/k3s/server/token"),
 		[]byte("topsecret"), 0600); err != nil {
 		t.Fatalf("seed token: %v", err)
 	}
@@ -106,7 +108,7 @@ func TestSaveAndRestoreRoundTrip(t *testing.T) {
 	if err := saveVarLibTo(varLib, backup); err != nil {
 		t.Fatalf("saveVarLibTo: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(backup, "rancher/k3s/server-token"))
+	got, err := os.ReadFile(filepath.Join(backup, "rancher/k3s/server/token"))
 	if err != nil {
 		t.Fatalf("read backup file: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestSaveAndRestoreRoundTrip(t *testing.T) {
 	if err := restoreVarLibFrom(backup, restored); err != nil {
 		t.Fatalf("restoreVarLibFrom: %v", err)
 	}
-	got, err = os.ReadFile(filepath.Join(restored, "rancher/k3s/server-token"))
+	got, err = os.ReadFile(filepath.Join(restored, "rancher/k3s/server/token"))
 	if err != nil {
 		t.Fatalf("read restored file: %v", err)
 	}
@@ -136,7 +138,11 @@ func TestSaveReplacesPriorBackupAtomically(t *testing.T) {
 	backup := filepath.Join(t.TempDir(), "kube-save-var-lib")
 
 	// Stage 1: save with one payload.
-	if err := os.WriteFile(filepath.Join(varLib, "f"), []byte("v1"), 0600); err != nil {
+	tokenRel := "rancher/k3s/server/token"
+	if err := os.MkdirAll(filepath.Join(varLib, "rancher/k3s/server"), 0755); err != nil {
+		t.Fatalf("seed varLib: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(varLib, tokenRel), []byte("v1"), 0600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := saveVarLibTo(varLib, backup); err != nil {
@@ -148,19 +154,19 @@ func TestSaveReplacesPriorBackupAtomically(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(backup, "stale"), []byte("old"), 0600); err != nil {
 		t.Fatalf("seed stale: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(varLib, "f"), []byte("v2"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(varLib, tokenRel), []byte("v2"), 0600); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 	if err := saveVarLibTo(varLib, backup); err != nil {
 		t.Fatalf("second saveVarLibTo: %v", err)
 	}
 
-	got, err := os.ReadFile(filepath.Join(backup, "f"))
+	got, err := os.ReadFile(filepath.Join(backup, tokenRel))
 	if err != nil {
-		t.Fatalf("read backup f: %v", err)
+		t.Fatalf("read backup token: %v", err)
 	}
 	if string(got) != "v2" {
-		t.Errorf("backup f = %q, want %q (second save did not replace contents)",
+		t.Errorf("backup token = %q, want %q (second save did not replace contents)",
 			string(got), "v2")
 	}
 	if _, err := os.Stat(filepath.Join(backup, "stale")); !errors.Is(err, os.ErrNotExist) {

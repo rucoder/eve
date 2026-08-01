@@ -1067,21 +1067,22 @@ func (d *daemon) handleBackoff(ctx context.Context, ev Event) {
 // at the end of first boot.
 func (d *daemon) handleSnapshot(ctx context.Context, ev Event) {
 	switch ev.Type {
-	case EvStopDone:
-		d.startAsync(ctx, d.workSnapshot, EvSnapshotDone)
-
 	case EvK3sExited:
-		// We asked for this exit. enterSnapshot's Stop goroutine still
-		// reports EvStopDone once the ports are released.
+		// No longer expected: the snapshot runs against a live k3s, so
+		// an exit here is a genuine failure rather than one we asked
+		// for. Absorbed anyway — the WaitK3sReady below is what
+		// notices a dead k3s and routes to BACKOFF, and killing the
+		// snapshot on a spurious exit would lose the rollback point.
 		log.Printf("absorbed EvK3sExited during SNAPSHOT")
 
 	case EvSnapshotDone:
-		// Markers are on disk, so PhaseSteady sends the restart below
-		// through WaitK3sReady to RUNNING rather than back into
-		// DEPLOYING.
+		// k3s was never stopped, so there is nothing to restart.
+		// PhaseSteady + WaitK3sReady confirms the API is still serving
+		// and routes to RUNNING instead of back into DEPLOYING; against
+		// a healthy k3s that check returns nearly instantly.
 		d.lastError = nil
 		d.phase = PhaseSteady
-		d.transition(ctx, StateStartingK3s, "snapshot-done")
+		d.transition(ctx, StateWaitK3sReady, "snapshot-done")
 
 	case EvError:
 		// A failed snapshot must not be shrugged off: without it the
@@ -1107,27 +1108,16 @@ func (d *daemon) handleSnapshot(ctx context.Context, ev Event) {
 // boot, and the copy that follows takes far longer than the ports need
 // to clear before k3s is restarted.
 func (d *daemon) enterSnapshot(ctx context.Context) {
-	log.Printf("SNAPSHOT — stopping k3s to snapshot /var/lib at rest")
-	d.startAsync(ctx, func(_ context.Context) error {
-		if d.supervisor == nil {
-			return nil
-		}
-		err := d.supervisor.Stop()
-		if errors.Is(err, k3s.ErrPortsStillBound) {
-			log.Printf("SNAPSHOT: %v — k3s has exited, which is all the "+
-				"snapshot needs; continuing", err)
-			return nil
-		}
-		return err
-	}, EvStopDone)
+	log.Printf("SNAPSHOT — saving /var/lib state (k3s keeps running)")
+	d.startAsync(ctx, d.workSnapshot, EvSnapshotDone)
 }
 
 // workSnapshot flushes, snapshots /var/lib and writes the first-boot
 // markers. Runs with k3s stopped.
 func (d *daemon) workSnapshot(_ context.Context) error {
-	// k3s is stopped so nothing is writing, and the copy reads through
-	// the same page cache either way. This is for durability of what
-	// k3s just wrote, matching the shell's `sync` before the copy.
+	// Durability of what k3s has written so far. The datastore copy
+	// does not rely on this — VACUUM INTO is consistent against a live
+	// writer — but the flat files in the snapshot are copied directly.
 	unix.Sync()
 
 	log.Printf("saving /var/lib snapshot")
