@@ -10,10 +10,17 @@ import (
 )
 
 // TestNodeClusterSuite is the top-level entry point for cluster tests.
-// It runs TestSingleNodeCluster followed by TestThreeNodesCluster,
-// reusing the evetest harness (Adam controller, SDN, broker) across both
-// subtests for efficiency. Both subtests pin the device to the Kubevirt
-// hypervisor (cluster tests are the only ones that use Kubevirt).
+// It runs TestSingleNodeCluster, TestThreeNodesCluster and then
+// TestClusterToSingleConversion, reusing the evetest harness (Adam
+// controller, SDN, broker) across the subtests for efficiency. All
+// subtests pin the device to the Kubevirt hypervisor (cluster tests are
+// the only ones that use Kubevirt).
+//
+// TestClusterToSingleConversion runs last and shares the three-device,
+// SeparateClusterPort requirements of TestThreeNodesCluster so the VMs
+// are reused. It is ordered after it deliberately: it converts a node
+// out of the cluster, which is a destructive change to the topology the
+// preceding test relies on.
 //
 // Test parameters
 // ---------------
@@ -34,6 +41,9 @@ func TestNodeClusterSuite(test *testing.T) {
 		},
 		evetest.TestCase{
 			Test: TestThreeNodesCluster,
+		},
+		evetest.TestCase{
+			Test: TestClusterToSingleConversion,
 		},
 	)
 }
