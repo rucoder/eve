@@ -105,6 +105,19 @@ endif
 	@# never available; omit the flag so the container starts and QEMU falls back
 	@# to TCG software emulation.
 	$(eval KVM_DEVICE := $(shell [ -e /dev/kvm ] && echo '--device=/dev/kvm'))
+	@# Mount the EVE build output directory so a locally built live.qcow2 is
+	@# visible inside the container. Same absolute path on both sides so that
+	@# EVETEST_EVE_DIST_DIR is valid both inside the container and in any error
+	@# message a developer sees on the host. Read-write: the harness caches the
+	@# image's sha256 in a sidecar file next to it. Only added when a local
+	@# build exists, so nothing breaks without one.
+	$(eval EVETEST_DIST_DIR := $(or $(EVETEST_EVE_DIST_DIR),$(REPO_ROOT)/dist))
+	$(eval DIST_DIR_MOUNT :=)
+	$(eval DIST_DIR_ENV :=)
+	$(if $(wildcard $(EVETEST_DIST_DIR)), \
+		$(eval DIST_DIR_MOUNT := -v $(EVETEST_DIST_DIR):$(EVETEST_DIST_DIR)) \
+		$(eval DIST_DIR_ENV := -e EVETEST_EVE_DIST_DIR=$(EVETEST_DIST_DIR)) \
+	)
 	@if docker inspect --type container evetest-$(EVETEST_API_PORT) >/dev/null 2>&1; then \
 		echo ""; \
 		echo "Error: evetest instance 'evetest-$(EVETEST_API_PORT)' is already running."; \
@@ -138,11 +151,13 @@ endif
 		$(EVETEST_HOME_MOUNT) \
 		$(BROKER_IMAGE_MOUNT) \
 		$(BROKER_PROXY_CA_MOUNT) \
+		$(DIST_DIR_MOUNT) \
 		$(GO_CACHE_MOUNT) \
 		$(DOCKER_CONFIG_MOUNT) \
 		$(ENV_VARS) \
 		$(EVE_VERSION_ENV) \
 		$(BROKER_IMAGE_ENV) \
+		$(DIST_DIR_ENV) \
 		$(GO_CACHE_ENV) \
 		-e EVETEST_NAME=$(EVETEST_NAME) \
 		-e EVETEST_HOME=$(EVETEST_HOME_DIR) \
@@ -150,6 +165,10 @@ endif
 		-e EVETEST_HOST_GID=$(EVETEST_HOST_GID) \
 		$(EVETEST_IMAGE)
 
+# Only builds when the image is missing -- a locally built image is never
+# rebuilt just because harness source changed, so after editing evetest code
+# run `make build-container` explicitly before `make evetest`, or the run
+# silently uses the stale, previously-built harness.
 ensure-evetest-image:
 	@if ! docker image inspect $(EVETEST_IMAGE) >/dev/null 2>&1; then \
 		echo "Docker image $(EVETEST_IMAGE) not found locally, trying to pull..."; \

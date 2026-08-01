@@ -311,10 +311,13 @@ type testSuiteState struct {
 }
 
 type deviceState struct {
-	name         string
-	requirement  RequireEdgeDevice
-	imageRef     *api.ImageRef
-	imageName    string
+	name        string
+	requirement RequireEdgeDevice
+	imageRef    *api.ImageRef
+	imageName   string
+	// liveImage is set only when EVETEST_EVE_LIVE_IMAGE selects a locally
+	// built live.qcow2 in place of an EVE container image.
+	liveImage    *api.LiveImageRef
 	spec         *api.EVEDevice
 	ID           uuid.UUID
 	onboardCert  *x509.Certificate

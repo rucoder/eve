@@ -4,6 +4,7 @@
 package evetest
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/x509"
@@ -14,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,9 +32,16 @@ import (
 	"github.com/spf13/viper"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+// liveImageChunkBytes is the gRPC chunk size used for both the container
+// image push (pushEVEImageToBroker) and the live image push
+// (pushLiveImageToBroker), so the two paths behave the same way on the wire.
+const liveImageChunkBytes = 1024 * 1024
 
 // prepareEVEDeviceForOnboarding generates serial number and onboarding certificates
 // for the device.
@@ -81,6 +90,19 @@ func (th *TestHarness) selectArch() api.ArchType {
 	return fallback
 }
 
+// zarchDirName converts arch into the ZARCH-named dist directory (e.g.
+// dist/amd64/current) that `make live` builds into.
+func zarchDirName(arch api.ArchType) (string, error) {
+	switch arch {
+	case api.ArchType_ARCH_AMD64:
+		return "amd64", nil
+	case api.ArchType_ARCH_ARM64:
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("unsupported architecture: %v", arch)
+	}
+}
+
 // prepareImageForEVEDevice prepares an EVE image reference for the given device
 // and ensures that the corresponding EVE (live or installer) VM image is built
 // on the broker.
@@ -97,9 +119,6 @@ func (th *TestHarness) prepareImageForEVEDevice(dev *deviceState) {
 	if eveVersion == "" {
 		eveVersion = viper.GetString(constants.EVEVersionEnv)
 	}
-	if eveVersion == "" {
-		th.t.Fatalf("EVE version is not defined")
-	}
 	var err error
 	var hypervisor api.HypervisorType
 	switch dev.requirement.WithHypervisor {
@@ -114,6 +133,40 @@ func (th *TestHarness) prepareImageForEVEDevice(dev *deviceState) {
 		hypervisor = api.HypervisorType_HV_KUBEVIRT
 	}
 	arch := th.selectArch()
+
+	zarch, err := zarchDirName(arch)
+	if err != nil {
+		th.t.Fatalf("%v", err)
+	}
+	localImg, err := resolveLocalLiveImage(zarch)
+	if err != nil {
+		// The developer explicitly asked for a local image (via
+		// EVETEST_EVE_LIVE_IMAGE); silently falling back to the container
+		// path would run the test against a different EVE build.
+		th.t.Fatalf("Failed to resolve local EVE live image: %v", err)
+	}
+	if localImg != nil {
+		sum, err := liveImageSHA256(localImg.DiskPath)
+		if err != nil {
+			th.t.Fatalf("Failed to hash local EVE live image %q: %v",
+				localImg.DiskPath, err)
+		}
+		dev.liveImage = &api.LiveImageRef{Sha256: sum, Version: localImg.Version}
+		if localImg.Version != "" {
+			eveVersion = localImg.Version
+		}
+		if !generics.ContainsItem(
+			th.brokerCapabilities, api.Capability_CAPABILITY_LOCAL_LIVE_IMAGE) {
+			th.t.Fatalf("the broker does not support local live images " +
+				"(EVETEST_EVE_LIVE_IMAGE is set): either it predates this feature " +
+				"and must be updated, or its device provider builds images per " +
+				"device and cannot consume one")
+		}
+	}
+	if eveVersion == "" {
+		th.t.Fatalf("EVE version is not defined")
+	}
+
 	dev.imageRef = &api.ImageRef{
 		Repo:       viper.GetString(constants.EVERepoEnv),
 		Version:    eveVersion,
@@ -223,6 +276,7 @@ func (th *TestHarness) prepareImageForEVEDevice(dev *deviceState) {
 		ClientId:      th.brokerClientID,
 		DeviceName:    dev.name,
 		Image:         dev.imageRef,
+		LiveImage:     dev.liveImage,
 		MakeInstaller: dev.requirement.DeviceReusePolicy == CreateFromScratchWithInstaller,
 		DiskBytes:     uint64(diskSizeInMiB) << 20,
 		Config: &api.EveConfig{
@@ -260,6 +314,22 @@ func (th *TestHarness) prepareImageForEVEDevice(dev *deviceState) {
 			th.t.Fatalf("Broker is missing EVE container image even after push.")
 		}
 		th.log.Infof("BuildImage %q succeeded after pushing image.",
+			dev.imageName)
+	} else if buildResp.MissingEveLiveImage {
+		th.log.Warn("Broker is missing the local EVE live image — pushing it now...")
+		th.pushLiveImageToBroker(localImg, dev.liveImage.Sha256)
+
+		// Retry build
+		ctx, cancel = context.WithTimeout(th.ctx, brokerBuildImageTimeout)
+		buildResp, err = th.brokerClient.BuildImage(ctx, buildReq)
+		cancel()
+		if err != nil {
+			th.t.Fatalf("BuildImage %q (retry) failed: %v", dev.imageName, err)
+		}
+		if buildResp.MissingEveLiveImage {
+			th.t.Fatalf("Broker is missing the local EVE live image even after push.")
+		}
+		th.log.Infof("BuildImage %q succeeded after pushing live image.",
 			dev.imageName)
 	} else {
 		th.log.Infof("BuildImage %q succeeded (docker image was already present).",
@@ -324,7 +394,7 @@ func (th *TestHarness) pushEVEImageToBroker(imageRef *api.ImageRef) {
 
 	var sentBytes int64
 	nextLogPercent := int64(10)
-	buf := make([]byte, 1024*1024) // 1MB chunks
+	buf := make([]byte, liveImageChunkBytes)
 	earlyClose := false
 
 	for {
@@ -371,6 +441,158 @@ func (th *TestHarness) pushEVEImageToBroker(imageRef *api.ImageRef) {
 		th.log.Info("EVE container image already exists on broker.")
 	} else {
 		th.log.Info("EVE container image pushed successfully.")
+	}
+}
+
+// pushLiveImageToBroker streams a locally built EVE live image to the broker
+// as a tar (disk.qcow2, config.img, firmware/<name>), built in-process and
+// written straight into the client-streaming gRPC call -- the tar is never
+// assembled on disk or fully buffered in memory.
+//
+// The qcow2's clusters are already zlib-compressed by `qemu-img convert -c`,
+// so unlike pushEVEImageToBroker this stream is not gzipped: recompressing
+// already-compressed data would only burn CPU.
+//
+// A broker that predates local live image support rejects the RPC with
+// codes.Unimplemented; that case fails with a message telling the operator to
+// update the broker rather than silently falling back to the container path.
+//
+// A broker that already has this hash staged calls SendAndClose without
+// draining the stream, exactly as PushEVEContainerImage does: every Send after
+// that fails (typically with EOF), which is not this client's failure to
+// report -- it means the concurrent upload that is about to be reported via
+// AlreadyExists got there first. earlyClose records that so it can be treated
+// as benign instead of fatal, mirroring pushEVEImageToBroker's structure.
+func (th *TestHarness) pushLiveImageToBroker(img *localLiveImage, sum string) {
+	ctx, cancel := context.WithTimeout(th.ctx, brokerPushEVEImageTimeout)
+	defer cancel()
+
+	stream, err := th.brokerClient.PushEVELiveImage(ctx)
+	if err != nil {
+		th.t.Fatalf("PushEVELiveImage failed: %v", err)
+	}
+
+	earlyClose := false
+	send := func(chunk *api.PushLiveImageChunk, action string) error {
+		if err := stream.Send(chunk); err != nil {
+			if status.Code(err) == codes.Unimplemented {
+				th.t.Fatalf("this broker predates local live image support; " +
+					"update the broker")
+			}
+			earlyClose = true
+			return err
+		}
+		return nil
+	}
+
+	// The metadata Send itself may already be the one the broker abandons, so
+	// its error is not fatal either; the loop below and tw.Close() all check
+	// earlyClose rather than treating any of this as an unexpected failure.
+	_ = send(&api.PushLiveImageChunk{
+		Payload: &api.PushLiveImageChunk_Request{
+			Request: &api.PushLiveImageRequest{
+				ClientId:  th.brokerClientID,
+				LiveImage: &api.LiveImageRef{Sha256: sum, Version: img.Version},
+			},
+		},
+	}, "failed to send live image metadata")
+
+	tw := tar.NewWriter(&liveImageChunkWriter{send: func(data []byte) error {
+		return send(&api.PushLiveImageChunk{
+			Payload: &api.PushLiveImageChunk_DataChunk{DataChunk: data},
+		}, "failed to send live image data")
+	}})
+
+	buf := make([]byte, liveImageChunkBytes)
+	th.writeTarFile(tw, buf, "disk.qcow2", img.DiskPath, &earlyClose)
+	th.writeTarFile(tw, buf, "config.img", img.ConfigImgPath, &earlyClose)
+
+	firmwareFiles, err := os.ReadDir(img.FirmwareDir)
+	if err != nil {
+		th.t.Fatalf("failed to read firmware dir %q: %v", img.FirmwareDir, err)
+	}
+	for _, f := range firmwareFiles {
+		if f.IsDir() {
+			continue
+		}
+		fp := filepath.Join(img.FirmwareDir, f.Name())
+		th.writeTarFile(tw, buf, "firmware/"+f.Name(), fp, &earlyClose)
+	}
+	if err := tw.Close(); err != nil && !earlyClose {
+		th.t.Fatalf("failed to finalize live image tar stream: %v", err)
+	}
+
+	pushResp, err := stream.CloseAndRecv()
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			th.t.Fatalf("this broker predates local live image support; " +
+				"update the broker")
+		}
+		th.t.Fatalf("PushEVELiveImage failed: %v", err)
+	}
+
+	if earlyClose && !pushResp.AlreadyExists {
+		th.t.Fatalf("Server closed live image upload stream early " +
+			"but did not report the image as already existing")
+	}
+	if pushResp.AlreadyExists {
+		th.log.Info("EVE live image already exists on broker.")
+	} else {
+		th.log.Info("EVE live image pushed successfully.")
+	}
+}
+
+// liveImageChunkWriter adapts the PushEVELiveImage client stream to an
+// io.Writer, so archive/tar can write tar entries directly into the gRPC
+// stream one chunk at a time.
+type liveImageChunkWriter struct {
+	send func(data []byte) error
+}
+
+func (w *liveImageChunkWriter) Write(p []byte) (int, error) {
+	// io.Writer requires a zero-length Write to be a harmless no-op; both
+	// archive/tar and io.CopyBuffer can legitimately call Write(nil/[]byte{}).
+	// Sending it anyway would put an empty chunk on the wire for the broker
+	// to reject.
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := w.send(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// writeTarFile writes one tar header plus its contents, copied via buf so
+// that streaming a multi-gigabyte disk image never holds more than
+// len(buf) bytes in memory at once.
+//
+// earlyClose is checked before treating a tar-writing error as fatal: once it
+// is true, tw has already recorded that error internally and every further
+// call on it returns the same cached error without touching the underlying
+// gRPC stream again, so it is safe to keep calling this for the remaining
+// files.
+func (th *TestHarness) writeTarFile(tw *tar.Writer, buf []byte, name, path string, earlyClose *bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		th.t.Fatalf("failed to open %q: %v", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		th.t.Fatalf("failed to stat %q: %v", path, err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: info.Size()}); err != nil {
+		if *earlyClose {
+			return
+		}
+		th.t.Fatalf("failed to write tar header for %q: %v", name, err)
+	}
+	if _, err := io.CopyBuffer(tw, f, buf); err != nil {
+		if *earlyClose {
+			return
+		}
+		th.t.Fatalf("failed to stream %q into tar: %v", path, err)
 	}
 }
 

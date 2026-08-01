@@ -122,9 +122,17 @@ func (p *LibvirtProvider) GetSupportedDeviceArchs() ([]api.ArchType, error) {
 
 // Capabilities returns the full capability set: the libvirt provider runs on the
 // local host and applies the host-level tweaks required to forward link-local
-// L2 protocols, and supports emulated TPM.
+// L2 protocols, and supports emulated TPM. It also advertises
+// CAPABILITY_LOCAL_LIVE_IMAGE whenever its disk image strategy is not
+// DiskImageLegacyBuild, since that is exactly the condition under which it
+// attaches a locally built live image directly rather than requiring a
+// per-device container build.
 func (p *LibvirtProvider) Capabilities() []api.Capability {
-	return fullCapabilitySet()
+	caps := fullCapabilitySet()
+	if p.DiskImageStrategy() != DiskImageLegacyBuild {
+		caps = append(caps, api.Capability_CAPABILITY_LOCAL_LIVE_IMAGE)
+	}
+	return caps
 }
 
 // DiskImageStrategy returns DiskImageOverlay: libvirt attaches local files

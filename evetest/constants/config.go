@@ -77,6 +77,21 @@ const (
 	// This is read by the evetest container.
 	EVERepoEnv = "EVE_REPO"
 
+	// EVELiveImageEnv selects a locally built live qcow2 instead of an EVE
+	// container image. Unset means the container path. The literal "current"
+	// resolves to dist/<arch>/current/live.qcow2; anything else is a path.
+	EVELiveImageEnv = "EVE_LIVE_IMAGE"
+
+	// EVEFirmwareDirEnv overrides firmware discovery, which otherwise looks in
+	// <dir-of-image>/installer/firmware.
+	EVEFirmwareDirEnv = "EVE_FIRMWARE_DIR"
+
+	// EVEDistDirEnv locates the EVE build output directory holding
+	// <arch>/current/live.qcow2. It must be an absolute path: the harness runs
+	// inside a container, so a relative path would resolve against the
+	// container's working directory rather than the developer's checkout.
+	EVEDistDirEnv = "EVE_DIST_DIR"
+
 	// HomeDirEnv specifies the evetest data directory on the host ($HOME/.evetest).
 	// It is passed by the Makefile as EVETEST_HOME=$(HOME)/.evetest and must be
 	// bind-mounted into the container at the same path so that Docker bind-mounts
@@ -377,6 +392,9 @@ func InitViperConfig() {
 	// EVE image config
 	viper.SetDefault(EVEVersionEnv, "") // Empty = derive from repo
 	viper.SetDefault(EVERepoEnv, DefaultEVERepo)
+	viper.SetDefault(EVELiveImageEnv, "")
+	viper.SetDefault(EVEFirmwareDirEnv, "")
+	viper.SetDefault(EVEDistDirEnv, "")
 	viper.SetDefault(PreferredArchEnv, DefaultPreferredArch)
 
 	// Adam image config
