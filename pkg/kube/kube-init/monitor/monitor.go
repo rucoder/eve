@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/components"
+	"github.com/lf-edge/eve/pkg/kube/kube-init/encconfig"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/encstatus"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/k3s"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
@@ -391,6 +392,19 @@ func ClusterConfig(ctx context.Context, restartCh chan<- RestartReason) error {
 		}
 		switch {
 		case !encExists && inClusterMode:
+			// zedagent publishes EdgeNodeClusterConfig and zedkube
+			// derives EdgeNodeClusterStatus from it; on a reboot the
+			// two can be seconds apart. Config still present means
+			// the controller wants this node clustered and the status
+			// is merely late — converting here would throw away a
+			// live cluster membership and restore the pre-cluster
+			// /var/lib. Only a config that is gone (or zeroed) is a
+			// real withdrawal.
+			if encconfig.Present() {
+				log.Printf("EdgeNodeClusterStatus missing but " +
+					"EdgeNodeClusterConfig still present — waiting for zedkube")
+				return
+			}
 			log.Printf("EdgeNodeClusterStatus missing while in cluster mode — " +
 				"signalling cluster→single transition")
 			if err := state.Unmark(state.EdgeNodeClusterMode); err != nil {

@@ -95,6 +95,24 @@ func Get() (types.EdgeNodeClusterConfig, bool) {
 	return cached, have
 }
 
+// Present reports whether the controller currently wants this node in
+// a cluster: a delivery has occurred AND the ClusterID UUID is
+// non-zero. Mirrors encstatus.Present — on this non-Persistent topic a
+// controller-side delete leaves the publication in place with its
+// content zeroed, so "have a config" is not the same as "there is a
+// cluster".
+//
+// The cluster-config monitor uses this to tell a real withdrawal from
+// a boot where zedagent has published the config but zedkube has not
+// yet published the matching status. Converting to single-node on the
+// latter would discard a cluster membership the controller still
+// wants.
+func Present() bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	return have && cached.ClusterID.UUID != uuid.Nil
+}
+
 // ClusterType returns the cluster type from the cached config.
 // On no delivery, returns types.ClusterTypeNone — the caller
 // (k3s.GetClusterType) maps that onto ClusterTypeReplicated to

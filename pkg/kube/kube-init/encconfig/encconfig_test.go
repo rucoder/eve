@@ -76,3 +76,48 @@ func TestHandleModify_LatestWins(t *testing.T) {
 		t.Errorf("ClusterType() = %v, want latest write ReplicatedStorage", ct)
 	}
 }
+
+// TestPresent_DistinguishesWithdrawalFromLateDelivery pins the rule the
+// cluster-config monitor relies on to avoid converting a live cluster
+// member back to a single node. The three states are genuinely
+// different and only the last is a withdrawal:
+//
+//	no delivery yet   -> not present (say nothing, we know nothing)
+//	real ClusterID    -> present     (controller wants a cluster)
+//	zero ClusterID    -> not present (controller deleted the cluster;
+//	                                  the non-Persistent publication
+//	                                  stays but is zeroed)
+func TestPresent_DistinguishesWithdrawalFromLateDelivery(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	if Present() {
+		t.Error("Present() = true before any delivery")
+	}
+
+	setCached(types.EdgeNodeClusterConfig{
+		ClusterID: types.UUIDandVersion{
+			UUID: uuid.FromStringOrNil("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+		},
+	})
+	if !Present() {
+		t.Error("Present() = false with a non-zero ClusterID")
+	}
+
+	// Controller-side delete on a non-Persistent topic: the publication
+	// remains, its content is zeroed. Must read as "no cluster".
+	setCached(types.EdgeNodeClusterConfig{})
+	if Present() {
+		t.Error("Present() = true for a zeroed ClusterID (controller deleted the cluster)")
+	}
+
+	setCached(types.EdgeNodeClusterConfig{
+		ClusterID: types.UUIDandVersion{
+			UUID: uuid.FromStringOrNil("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+		},
+	})
+	handleDelete(nil, "", nil)
+	if Present() {
+		t.Error("Present() = true after handleDelete")
+	}
+}
