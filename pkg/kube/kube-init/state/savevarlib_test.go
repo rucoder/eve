@@ -346,3 +346,40 @@ func TestCopyTreePreservesModesAndSymlinks(t *testing.T) {
 		t.Errorf("link target = %q, %v; want \"secret\", nil", got, err)
 	}
 }
+
+// TestWipeOrphanedReplicas covers the cluster→single cleanup: replica
+// directories go, the replica directory itself stays (Longhorn's
+// default disk points at its parent and must remain stattable).
+func TestWipeOrphanedReplicas(t *testing.T) {
+	root := t.TempDir()
+	replicas := filepath.Join(root, "replicas")
+	for _, name := range []string{"pvc-aaa-r1", "pvc-bbb-r2"} {
+		d := filepath.Join(replicas, name)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "volume.meta"), []byte("{}"), 0644); err != nil {
+			t.Fatalf("seed %s: %v", d, err)
+		}
+	}
+
+	if err := wipeReplicasIn(replicas); err != nil {
+		t.Fatalf("wipeReplicasIn: %v", err)
+	}
+
+	entries, err := os.ReadDir(replicas)
+	if err != nil {
+		t.Fatalf("replica dir must survive: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("replica dir not empty: %d entries left", len(entries))
+	}
+}
+
+// TestWipeOrphanedReplicasMissingDir covers a node converted before
+// Longhorn ever wrote a replica: nothing to clean is not an error.
+func TestWipeOrphanedReplicasMissingDir(t *testing.T) {
+	if err := wipeReplicasIn(filepath.Join(t.TempDir(), "nope")); err != nil {
+		t.Errorf("missing dir must be a no-op, got %v", err)
+	}
+}

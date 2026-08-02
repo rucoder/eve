@@ -95,6 +95,55 @@ func RestoreVarLib() error {
 	return restoreVarLibFrom(KubeSaveVarLib, "/var/lib")
 }
 
+// longhornReplicaDir holds Longhorn's replica data for this node,
+// under its default disk path (/persist/vault/volumes).
+const longhornReplicaDir = "/persist/vault/volumes/replicas"
+
+// WipeOrphanedReplicas empties the Longhorn replica directory. Called
+// on the cluster→single boot, immediately after RestoreVarLib.
+//
+// The restored /var/lib predates this node's cluster membership, so
+// Longhorn's metadata in it has no record of any replica created while
+// the node was a member — but the replica directories are on /persist
+// and survive the rollback. Left in place they are unreferenced by any
+// volume: dead weight on the persist partition that nothing will ever
+// reclaim, sitting on the disk Longhorn is about to re-inventory.
+//
+// The directory itself is kept (Longhorn's default disk points at its
+// parent and must stay stattable), only its contents go. A missing
+// directory is not an error — a node converted before Longhorn ever
+// came up has nothing to clean.
+func WipeOrphanedReplicas() error {
+	return wipeReplicasIn(longhornReplicaDir)
+}
+
+// wipeReplicasIn is WipeOrphanedReplicas with an injectable path.
+func wipeReplicasIn(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dir, err)
+	}
+
+	var joined error
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		if rmErr := os.RemoveAll(p); rmErr != nil {
+			joined = errors.Join(joined, fmt.Errorf("remove %s: %w", p, rmErr))
+		}
+	}
+	if joined != nil {
+		return joined
+	}
+	if len(entries) > 0 {
+		log.Printf("wiped %d unreferenced Longhorn replica(s) from %s",
+			len(entries), dir)
+	}
+	return nil
+}
+
 // varLibStatePaths are the /var/lib subtrees that carry real node
 // identity and must survive a cluster→single rollback. Everything else
 // under /var/lib is re-derivable: rancher/k3s/server/data (the unpacked

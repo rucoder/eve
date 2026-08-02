@@ -1464,6 +1464,13 @@ func (d *daemon) workInit(workCtx context.Context) error {
 		if err := state.RestoreVarLib(); err != nil {
 			return fmt.Errorf("convert-to-single: restore /var/lib (cannot proceed with mixed state): %w", err)
 		}
+		// Replicas written while this node was a cluster member are
+		// unreferenced by the /var/lib we just restored. Non-fatal:
+		// leaving them wastes persist space but does not stop the
+		// node from coming up single.
+		if err := state.WipeOrphanedReplicas(); err != nil {
+			log.Printf("WARNING: convert-to-single: wipe orphaned replicas: %v", err)
+		}
 		// Unmark failure must abort too: if the marker persists,
 		// the next boot will again try to restore, this time over
 		// the freshly-written single-node state — a self-
