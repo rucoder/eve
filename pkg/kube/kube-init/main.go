@@ -454,9 +454,14 @@ type daemon struct {
 	eventCh chan Event
 
 	// Background workers.
-	mon        *monitor.Monitor
-	cancelWork context.CancelFunc // cancel current async work goroutine
-	cancelExit context.CancelFunc // cancel k3s exit watcher
+	mon *monitor.Monitor
+
+	// joinStageReached is the furthest joinStageRank this join episode
+	// has reached, so the watchdog is kicked on advance rather than on
+	// every state change. Reset when a join completes.
+	joinStageReached int
+	cancelWork       context.CancelFunc // cancel current async work goroutine
+	cancelExit       context.CancelFunc // cancel k3s exit watcher
 
 	// RUNNING-scoped context. Cancelled when leaving RUNNING so
 	// bridgeMonitorRestarts and forwardHealthTicks exit promptly
@@ -1355,7 +1360,56 @@ func (d *daemon) transition(ctx context.Context, newState State, reason string) 
 		now.Sub(d.bootAt).Round(time.Second))
 	d.stateEnteredAt = now
 	d.state = newState
+	d.noteJoinProgress(newState)
 	d.enterStateFn(ctx)
+}
+
+// joinStageRank orders the states a joining node passes through, so the
+// join watchdog can tell "advancing slowly" from "wedged". Only the
+// forward path is ranked; BACKOFF, STOPPING_K3S and friends are 0
+// because revisiting them is not progress — a crash-looping node cycles
+// STARTING_K3S → WAIT_K3S_READY → BACKOFF indefinitely and must not
+// keep the watchdog fed.
+func joinStageRank(s State) int {
+	switch s {
+	case StateStartingK3s:
+		return 1
+	case StateImporting:
+		return 2
+	case StateWaitK3sReady:
+		return 3
+	case StateDeploying:
+		return 4
+	case StateSnapshot:
+		return 5
+	case StateRunning:
+		return 6
+	default:
+		return 0
+	}
+}
+
+// noteJoinProgress reports forward movement to the join watchdog, and
+// the arrival at RUNNING as outright success.
+//
+// Reaching RUNNING means WaitReady returned, which subsumes "this node
+// is registered and Ready in the cluster" — so it is the join-completed
+// event, known locally and without an API call. Asking the cluster for
+// a node count instead needs a kubeclient that does not exist until
+// EvK3sReady, which is why the previous version rebooted a healthy
+// edge-dev2 on 2026-08-02.
+func (d *daemon) noteJoinProgress(newState State) {
+	rank := joinStageRank(newState)
+	if rank == 0 || rank <= d.joinStageReached {
+		return
+	}
+	d.joinStageReached = rank
+	if newState == StateRunning {
+		monitor.MarkJoinComplete()
+		d.joinStageReached = 0
+		return
+	}
+	monitor.NoteJoinProgress(newState.String())
 }
 
 // ===========================================================================

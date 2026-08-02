@@ -1147,3 +1147,61 @@ func TestGraphReportEmptyAndNilBus(t *testing.T) {
 		t.Errorf("nil bus: got %q", got)
 	}
 }
+
+// TestJoinStageRankOnlyCountsForwardProgress pins what "progress" means
+// for the join watchdog. A crash-looping node cycles
+// STARTING_K3S → WAIT_K3S_READY → BACKOFF forever; if any of that read
+// as progress the watchdog would never fire on the failure it exists
+// for. Equally, a slow join that keeps advancing must keep kicking it.
+func TestJoinStageRankOnlyCountsForwardProgress(t *testing.T) {
+	forward := []State{
+		StateStartingK3s, StateImporting, StateWaitK3sReady,
+		StateDeploying, StateSnapshot, StateRunning,
+	}
+	last := 0
+	for _, s := range forward {
+		r := joinStageRank(s)
+		if r <= last {
+			t.Errorf("joinStageRank(%v) = %d, want > %d — the join path must be strictly ordered",
+				s, r, last)
+		}
+		last = r
+	}
+
+	for _, s := range []State{
+		StateBackoff, StateStoppingK3s, StateRunningHooks,
+		StateClusterTransition, StateInit, StateInstalling,
+		StateStartingCtrd, StateConfiguring, StateShuttingDown,
+	} {
+		if r := joinStageRank(s); r != 0 {
+			t.Errorf("joinStageRank(%v) = %d, want 0 — revisiting this is not progress", s, r)
+		}
+	}
+}
+
+// TestNoteJoinProgressIgnoresRepeats: the crash loop in full. Only the
+// first arrival at each stage advances; going round again does not.
+func TestNoteJoinProgressIgnoresRepeats(t *testing.T) {
+	d := newTestDaemon()
+
+	d.noteJoinProgress(StateStartingK3s)
+	d.noteJoinProgress(StateWaitK3sReady)
+	peak := d.joinStageReached
+
+	// ... and now it crash-loops.
+	for range 3 {
+		d.noteJoinProgress(StateBackoff)
+		d.noteJoinProgress(StateStartingK3s)
+		d.noteJoinProgress(StateWaitK3sReady)
+	}
+	if d.joinStageReached != peak {
+		t.Errorf("joinStageReached = %d after a crash loop, want %d unchanged",
+			d.joinStageReached, peak)
+	}
+
+	// Reaching RUNNING is completion and resets the episode.
+	d.noteJoinProgress(StateRunning)
+	if d.joinStageReached != 0 {
+		t.Errorf("joinStageReached = %d after RUNNING, want 0", d.joinStageReached)
+	}
+}

@@ -114,19 +114,6 @@ func TestParseTransitionMarker(t *testing.T) {
 	}
 }
 
-// TestCountReadyNodesWithoutClient pins the no-panic contract the join
-// watchdog depends on. It polls from boot, long before the FSM installs
-// the default kubeclient — and on the stuck join it exists to catch,
-// the client is never installed at all. Default() would panic there;
-// "no client" has to read as "nothing is Ready" instead.
-func TestCountReadyNodesWithoutClient(t *testing.T) {
-	// kubeclient.SetDefault is never called in this package's tests, so
-	// the process-wide client is nil here — the state a stuck join sees.
-	if got := countReadyNodes(context.Background()); got != 0 {
-		t.Errorf("countReadyNodes with no client = %d, want 0", got)
-	}
-}
-
 // TestStartJoinWatchdogWithoutMarker checks the watchdog stays dormant
 // when no join is in flight: no marker, no goroutine, and the
 // double-start guard left clear so a later real join can start one.
@@ -140,4 +127,60 @@ func TestStartJoinWatchdogWithoutMarker(t *testing.T) {
 	if joinWatchdogActive.Load() {
 		t.Error("watchdog marked active with no transition marker on disk")
 	}
+}
+
+// TestSinceJoinProgressFallsBackToMarker: with no advance recorded yet
+// this boot (daemon restarted mid-join), the stall clock has to run
+// from the marker's own timestamp rather than reading as "no time has
+// passed", which would make the watchdog unable to ever fire.
+func TestSinceJoinProgressFallsBackToMarker(t *testing.T) {
+	resetJoinProgress(t)
+	written := time.Now().Add(-90 * time.Second)
+	if got := sinceJoinProgress(written); got < 80*time.Second {
+		t.Errorf("sinceJoinProgress = %v with no recorded progress, want ~90s from the marker", got)
+	}
+}
+
+// TestNoteJoinProgressKicksTheClock is the property that stops a slow
+// join being rebooted: any advance restarts the stall window, however
+// long the join has already been running.
+func TestNoteJoinProgressKicksTheClock(t *testing.T) {
+	resetJoinProgress(t)
+	written := time.Now().Add(-30 * time.Minute)
+
+	NoteJoinProgress("WAIT_K3S_READY")
+
+	got := sinceJoinProgress(written)
+	if got > time.Second {
+		t.Errorf("sinceJoinProgress = %v after progress, want ~0 — a join that is "+
+			"still advancing must never trip the stall limit", got)
+	}
+	if got >= joinStallTimeout {
+		t.Errorf("a just-advanced join would be rebooted (%v >= %v)", got, joinStallTimeout)
+	}
+}
+
+// TestMarkJoinCompleteIsSafeWithoutAMarker — the FSM calls this on every
+// arrival at RUNNING, including boots where no join is in flight.
+func TestMarkJoinCompleteIsSafeWithoutAMarker(t *testing.T) {
+	resetJoinProgress(t)
+	if _, err := os.Stat(string(state.TransitionToCluster)); !os.IsNotExist(err) {
+		t.Skipf("host has a real %s marker", state.TransitionToCluster)
+	}
+	MarkJoinComplete() // must not panic or create anything
+	if _, err := os.Stat(string(state.TransitionToCluster)); !os.IsNotExist(err) {
+		t.Error("MarkJoinComplete created a transition marker")
+	}
+}
+
+func resetJoinProgress(t *testing.T) {
+	t.Helper()
+	joinProgress.mu.Lock()
+	joinProgress.at = time.Time{}
+	joinProgress.mu.Unlock()
+	t.Cleanup(func() {
+		joinProgress.mu.Lock()
+		joinProgress.at = time.Time{}
+		joinProgress.mu.Unlock()
+	})
 }

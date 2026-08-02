@@ -10,32 +10,78 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
-	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
 	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	// transitionTimeout caps how long a non-bootstrap node may sit
-	// in the joining state before we reboot to retry.
-	transitionTimeout = 5 * time.Minute
+	// joinStallTimeout caps how long a join may make no forward
+	// progress before we reboot to retry. Deliberately a stall limit
+	// and not a duration budget: the total time a join needs depends
+	// on disk speed, image count and pod scheduling and cannot be
+	// predicted, whereas "nothing has advanced for this long" means
+	// the same thing on every device.
+	joinStallTimeout = 5 * time.Minute
 
 	// transitionMaxReboots caps the reboot-retry count before giving
 	// up. Three is empirical: by the third attempt either the join
 	// has stuck for a fundamental reason or the controller config
 	// has changed and we are reading a stale marker.
 	transitionMaxReboots = 3
-
-	// transitionReadyNodes is the Ready-node count that defines a
-	// successful join. Two is the minimum for an HA pair plus the
-	// joining node either ready or in-progress.
-	transitionReadyNodes = 2
 )
+
+// joinProgress records when this join last reached a stage it had not
+// reached before. Zero means "nothing yet this boot", in which case the
+// stall clock runs from the marker's own timestamp.
+var joinProgress struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+// NoteJoinProgress records that the join advanced. Called by the FSM
+// when it enters a stage further along than any reached since the
+// transition began — not on every state change, because a crash loop
+// changes state continuously without getting anywhere.
+func NoteJoinProgress(stage string) {
+	joinProgress.mu.Lock()
+	joinProgress.at = time.Now()
+	joinProgress.mu.Unlock()
+	log.Printf("cluster join progress: reached %s", stage)
+}
+
+// MarkJoinComplete is the success event: the node reached RUNNING after
+// a join, so WaitReady succeeded and this node is Ready in the cluster.
+// Clears the marker, which retires the watchdog on its next tick. Safe
+// to call when no join is in flight.
+func MarkJoinComplete() {
+	marked, err := state.IsMarked(state.TransitionToCluster)
+	if err != nil || !marked {
+		return
+	}
+	log.Printf("cluster join complete — node is Ready, clearing transition marker")
+	if err := state.Unmark(state.TransitionToCluster); err != nil {
+		log.Printf("warning: remove transition marker: %v", err)
+	}
+	joinProgress.mu.Lock()
+	joinProgress.at = time.Time{}
+	joinProgress.mu.Unlock()
+}
+
+// sinceJoinProgress returns how long it has been since the join last
+// advanced, falling back to the marker timestamp when this boot has
+// seen no advance yet (e.g. the daemon restarted mid-join).
+func sinceJoinProgress(markerWritten time.Time) time.Duration {
+	joinProgress.mu.Lock()
+	at := joinProgress.at
+	joinProgress.mu.Unlock()
+	if at.IsZero() {
+		at = markerWritten
+	}
+	return time.Since(at)
+}
 
 // joinWatchdogActive guards against a second watchdog goroutine: both
 // start sites (daemon boot and the end of the transition runner) can
@@ -113,16 +159,15 @@ func CheckClusterTransitionDone(ctx context.Context) bool {
 		return false
 	}
 
-	log.Printf("checking cluster transition status...")
-
-	if countReadyNodes(ctx) >= transitionReadyNodes {
-		log.Printf("cluster transition complete: %d+ Ready nodes",
-			transitionReadyNodes)
-		if err := state.Unmark(state.TransitionToCluster); err != nil {
-			log.Printf("warning: remove transition marker: %v", err)
-		}
-		return false
-	}
+	// Success is not detected here. NoteJoinProgress/MarkJoinComplete
+	// are driven by the FSM, which knows the join worked the moment it
+	// reaches RUNNING — WaitReady having succeeded subsumes "this node
+	// is Ready in the cluster". Asking the cluster instead used to be
+	// this function's job and was strictly worse: it needs a kubeclient
+	// that does not exist until EvK3sReady, so on every tick of a
+	// still-joining node the count came back zero and was indistinguish-
+	// able from a broken cluster. On 2026-08-02 that rebooted edge-dev2,
+	// a node which had joined perfectly well, at exactly five minutes.
 
 	transitionTS, rebootCount, err := parseTransitionMarker(string(state.TransitionToCluster))
 	if err != nil {
@@ -132,12 +177,23 @@ func CheckClusterTransitionDone(ctx context.Context) bool {
 		return true
 	}
 
-	elapsed := time.Since(time.Unix(transitionTS, 0))
-	if elapsed < transitionTimeout {
-		log.Printf("still waiting for cluster transition: %v elapsed (timeout: %v)",
-			elapsed.Truncate(time.Second), transitionTimeout)
+	// Stall, not duration. How long a join takes is unknowable — it
+	// covers a k3s restart, an image import, registration and every
+	// kube-system pod — and any budget for it is a guess that some
+	// slower device will fail. How long the join may make *no progress
+	// at all* is a stable quantity. Every advance to a stage this join
+	// has not reached before kicks the timer, so a slow-but-advancing
+	// join is never rebooted, while a genuinely wedged one trips
+	// promptly. A crash loop does not count: it revisits stages rather
+	// than advancing, which is why "the state changed recently" is not
+	// the same question.
+	since := sinceJoinProgress(time.Unix(transitionTS, 0))
+	if since < joinStallTimeout {
+		log.Printf("cluster join still advancing: %v since last progress (stall limit: %v)",
+			since.Truncate(time.Second), joinStallTimeout)
 		return true
 	}
+	log.Printf("cluster join stalled: no progress for %v", since.Truncate(time.Second))
 
 	rebootCount++
 	if rebootCount > transitionMaxReboots {
@@ -168,39 +224,6 @@ func CheckClusterTransitionDone(ctx context.Context) bool {
 	// RebootWithReason blocks until reboot; if it returns we are
 	// in a degraded state but still mid-transition.
 	return true
-}
-
-// countReadyNodes runs `k3s kubectl get nodes` and counts rows
-// whose Ready condition is True. Cordoned nodes (spec.unschedulable=true)
-// count too — they're still Ready for control-plane counting purposes.
-// Non-True Ready collapses to "not counted".
-func countReadyNodes(ctx context.Context) int {
-	// The watchdog runs from boot, before the FSM reaches the state
-	// that installs the default client — and on a join that never
-	// completes, that state is never reached at all. No client means
-	// the API was never usable, which is the same answer as an empty
-	// node list, so report it rather than panicking in Default().
-	c := kubeclient.DefaultOrNil()
-	if c == nil {
-		return 0
-	}
-	nodes, err := c.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return 0
-	}
-	return countReady(nodes.Items)
-}
-
-// countReady is the pure half of countReadyNodes, factored out for
-// unit tests. Counts nodes whose Ready condition is True.
-func countReady(nodes []corev1.Node) int {
-	count := 0
-	for i := range nodes {
-		if kubectlx.IsNodeReady(&nodes[i]) {
-			count++
-		}
-	}
-	return count
 }
 
 // parseTransitionMarker reads path and returns (unix_timestamp,
