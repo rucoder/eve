@@ -211,9 +211,19 @@ func (r *Runner) StepRotateTokenIfBootstrap(ctx context.Context) error {
 // the rendered template (so ApplyMultusCNI re-renders with the new
 // cluster IP), and re-applies pinned to ClusterIP/32.
 //
-// Asymmetric error policy by intent: apply must succeed because
-// Multus owns pod networking for the new ClusterIP. A stale
-// daemonset is recoverable; a missing one is not.
+// Best-effort throughout, including the apply. That is a deliberate
+// reversal: the apply used to be fatal on the grounds that Multus owns
+// pod networking for the new ClusterIP, which is true but is not worth
+// what failing here costs. Everything after this step — stop-k3s,
+// clear-tls-if-join, provision-config — is what actually makes the node
+// able to join, and skipping them is unrecoverable, whereas a Multus
+// daemonset carrying the old node IP is re-applied by the deploy graph
+// on the next pass. On 2026-08-02 a transient CRD race here failed the
+// transition and left a node permanently unable to join.
+//
+// This also restores the shell's effective behaviour: cluster-init.sh
+// only *rendered* the YAML during the transition and left the apply to
+// its main loop, so it had no way to fail a transition on Multus.
 func (r *Runner) StepMultusReset(ctx context.Context) error {
 	if err := components.UninstallMultus(ctx); err != nil {
 		log.Printf("warning: uninstall multus: %v", err)
@@ -223,7 +233,14 @@ func (r *Runner) StepMultusReset(ctx context.Context) error {
 	}
 	addr := components.NodeAddress{IP: r.cs.ClusterIP, Prefix: "/32"}
 	if err := components.ApplyMultusCNI(ctx, addr); err != nil {
-		return fmt.Errorf("apply multus with cluster IP: %w", err)
+		// Unmark so the deploy graph re-applies Multus rather than
+		// treating the half-installed state as done.
+		if unmarkErr := state.Unmark(state.MultusInitialized); unmarkErr != nil {
+			log.Printf("warning: unmark multus-initialized: %v", unmarkErr)
+		}
+		log.Printf("WARNING: apply multus with cluster IP: %v — continuing; "+
+			"the deploy graph re-applies it, and aborting here would skip "+
+			"clear-tls-if-join and leave the node unable to join", err)
 	}
 	return nil
 }
