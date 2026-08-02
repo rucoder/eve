@@ -83,13 +83,27 @@ func (o *ApplyOptions) withDefaults() {
 // still inspect it with errors.Is / errors.As.
 var ErrApplyExhausted = errors.New("kubectlx apply: max attempts exhausted")
 
+// crdEstablishTimeout bounds the wait for a just-applied CRD to become
+// Established. Establishment is normally sub-second; this only has to
+// cover a previous generation of the same CRD still finalizing.
+const crdEstablishTimeout = 2 * time.Minute
+
 // Apply parses one or more objects from raw YAML/JSON bytes (multi-doc
 // YAML supported) and server-side-applies each via the dynamic client.
 // Objects are applied in document order, so authors can rely on
-// "CRDs before CRs" within a single manifest — the CRD-just-installed
-// race between docs is resolved by the RESTMapper reset + retry in
-// applyOne, including the case where the previous generation of the CRD
-// is still terminating (see isCRDLifecycleRace).
+// "CRDs before CRs" within a single manifest.
+//
+// After applying a CustomResourceDefinition, Apply blocks until that CRD
+// reports Established before moving to the next document. Ordering alone
+// is not enough: a CR whose CRD was created microseconds earlier is
+// rejected with a 404 until the apiserver has Established the kind and
+// begun serving it. applyOne does classify that 404 as retryable
+// (isCRDLifecycleRace) and retries, but a bounded retry budget against
+// an unbounded wait is a race we lose sometimes — on 2026-08-02 the
+// NetworkAttachmentDefinition in multus-daemonset.yaml exhausted five
+// attempts over 38s, failing the cluster transition and bricking the
+// node. Waiting on the condition removes the race instead of racing it
+// faster: the 404 never happens, so there is nothing to classify.
 //
 // Returns the first non-nil per-object error. Callers that want
 // best-effort semantics across multiple objects should split the
@@ -105,8 +119,27 @@ func Apply(ctx context.Context, kc *kubeclient.Client, data []byte, opts ApplyOp
 			return fmt.Errorf("kubectlx apply doc[%d] (%s): %w",
 				i, describeObj(obj), err)
 		}
+		if name, ok := crdName(obj); ok {
+			if err := WaitCRDEstablished(ctx, kc, name, crdEstablishTimeout); err != nil {
+				return fmt.Errorf("kubectlx apply doc[%d] (%s): wait Established: %w",
+					i, describeObj(obj), err)
+			}
+		}
 	}
 	return nil
+}
+
+// crdName returns the metadata.name of obj when it is a v1
+// CustomResourceDefinition, so Apply knows to gate on its
+// establishment. The apiextensions group is matched without its version
+// so a future v2 still gates.
+func crdName(obj *unstructured.Unstructured) (string, bool) {
+	gk := obj.GroupVersionKind().GroupKind()
+	if gk.Group != "apiextensions.k8s.io" || gk.Kind != "CustomResourceDefinition" {
+		return "", false
+	}
+	name := obj.GetName()
+	return name, name != ""
 }
 
 // ApplyFile reads a manifest from disk and applies it via Apply.
