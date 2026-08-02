@@ -179,6 +179,18 @@ func Default() *Client {
 	return defaultClient
 }
 
+// DefaultOrNil returns the process-wide *Client, or nil if SetDefault
+// has not run yet.
+//
+// For the few callers that legitimately run before the k3s API is
+// reachable — the cluster-join watchdog polls precisely while the API
+// may never have come up — where "no client" is a meaningful answer
+// rather than a lifecycle bug. Everything else should use Default and
+// take the panic.
+func DefaultOrNil() *Client {
+	return defaultClient
+}
+
 // WaitForKubeconfig polls for the kubeconfig file at kubeconfigPath
 // until it becomes readable or ctx is cancelled. Returns immediately
 // if the file already exists.

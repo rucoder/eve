@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubeclient"
@@ -35,6 +36,56 @@ const (
 	// joining node either ready or in-progress.
 	transitionReadyNodes = 2
 )
+
+// joinWatchdogActive guards against a second watchdog goroutine: both
+// start sites (daemon boot and the end of the transition runner) can
+// fire for the same join, and two of them would race to increment the
+// marker's reboot count.
+var joinWatchdogActive atomic.Bool
+
+// StartJoinWatchdog runs CheckClusterTransitionDone on a ticker for as
+// long as the transition-to-cluster marker is on disk, then stops.
+// Returns immediately if there is no marker or a watchdog is already
+// running.
+//
+// The watchdog is deliberately not part of the monitor goroutine set:
+// those only start once the FSM reaches RUNNING, which requires the
+// node to be Ready — the exact thing a stuck join never achieves. Tying
+// the watchdog to the marker instead of to an FSM state is what makes
+// it reachable in the failure it exists for. ctx must be the daemon's
+// long-lived context, not a per-state one.
+func StartJoinWatchdog(ctx context.Context) {
+	marked, err := state.IsMarked(state.TransitionToCluster)
+	if err != nil {
+		log.Printf("warning: check transition marker for watchdog: %v", err)
+		return
+	}
+	if !marked {
+		return
+	}
+	if !joinWatchdogActive.CompareAndSwap(false, true) {
+		return
+	}
+
+	log.Printf("cluster-join watchdog started (checking every %v)",
+		clusterJoinRetryInterval)
+	go func() {
+		defer joinWatchdogActive.Store(false)
+		ticker := time.NewTicker(clusterJoinRetryInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !CheckClusterTransitionDone(ctx) {
+					log.Printf("cluster-join watchdog stopped")
+					return
+				}
+			}
+		}
+	}()
+}
 
 // CheckClusterTransitionDone progresses the cluster-join retry
 // state machine for a non-bootstrap node.
@@ -124,7 +175,16 @@ func CheckClusterTransitionDone(ctx context.Context) bool {
 // count too — they're still Ready for control-plane counting purposes.
 // Non-True Ready collapses to "not counted".
 func countReadyNodes(ctx context.Context) int {
-	nodes, err := kubeclient.Default().Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	// The watchdog runs from boot, before the FSM reaches the state
+	// that installs the default client — and on a join that never
+	// completes, that state is never reached at all. No client means
+	// the API was never usable, which is the same answer as an empty
+	// node list, so report it rather than panicking in Default().
+	c := kubeclient.DefaultOrNil()
+	if c == nil {
+		return 0
+	}
+	nodes, err := c.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return 0
 	}

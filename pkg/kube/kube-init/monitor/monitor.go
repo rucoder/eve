@@ -45,10 +45,9 @@ import (
 var (
 	healthCheckInterval  = 15 * time.Second
 	overridePollInterval = 15 * time.Second
-	// clusterJoinRetryInterval bounds how often
-	// CheckClusterTransitionDone re-runs while the single→cluster
-	// transition is mid-flight. Only active during a transition;
-	// the cluster-config monitor is otherwise fully event-driven on
+	// clusterJoinRetryInterval is the tick of StartJoinWatchdog, which
+	// runs only while a single→cluster join is in flight. The
+	// cluster-config monitor itself is fully event-driven on
 	// EdgeNodeClusterStatus pubsub edges.
 	clusterJoinRetryInterval = 15 * time.Second
 )
@@ -349,10 +348,9 @@ func (m *Monitor) CheckContainerd() {
 //     AllComponentsInitialized goes true. No polling.
 //
 //   - Steady state: wakes only on EdgeNodeClusterStatus pubsub
-//     edges or on a slow retry tick that is active *only* while
-//     a single→cluster join is in flight (the join may need
-//     several polls of CheckClusterTransitionDone before the
-//     transition marker clears).
+//     edges. Progressing an in-flight join is not this loop's job —
+//     StartJoinWatchdog owns that, because it has to keep running in
+//     states this monitor never reaches.
 //
 // EdgeNodeClusterMode is read once from the on-disk marker at
 // startup; from then on the loop tracks its own in-memory copy
@@ -374,24 +372,6 @@ func ClusterConfig(ctx context.Context, restartCh chan<- RestartReason) error {
 		return fmt.Errorf("check cluster-mode marker: %w", err)
 	}
 
-	// Retry ticker — only enabled while a join is in flight.
-	var joinTicker *time.Ticker
-	var joinTickC <-chan time.Time
-	startJoinTicker := func() {
-		if joinTicker == nil {
-			joinTicker = time.NewTicker(clusterJoinRetryInterval)
-			joinTickC = joinTicker.C
-		}
-	}
-	stopJoinTicker := func() {
-		if joinTicker != nil {
-			joinTicker.Stop()
-			joinTicker = nil
-			joinTickC = nil
-		}
-	}
-	defer stopJoinTicker()
-
 	evaluate := func() {
 		// ClusterStatusPresent folds file-missing and zero-UUID
 		// delete into a single "no live cluster" answer. See its
@@ -409,7 +389,6 @@ func ClusterConfig(ctx context.Context, restartCh chan<- RestartReason) error {
 				log.Printf("warning: unmark cluster mode: %v", err)
 			}
 			inClusterMode = false
-			stopJoinTicker()
 			trySend(restartCh, RestartClusterToSingle, "cluster→single")
 		case encExists && !inClusterMode:
 			log.Printf("EdgeNodeClusterStatus found, node not in cluster mode — " +
@@ -418,16 +397,7 @@ func ClusterConfig(ctx context.Context, restartCh chan<- RestartReason) error {
 				log.Printf("warning: mark cluster mode: %v", err)
 			}
 			inClusterMode = true
-			startJoinTicker()
 			trySend(restartCh, RestartSingleToCluster, "single→cluster")
-		case encExists && inClusterMode:
-			// Join in progress: CheckClusterTransitionDone is
-			// idempotent and clears the in-flight marker once
-			// kube-apiserver reports the node count we expect.
-			CheckClusterTransitionDone(ctx)
-			startJoinTicker()
-		case !encExists && !inClusterMode:
-			stopJoinTicker()
 		}
 	}
 
@@ -437,8 +407,6 @@ func ClusterConfig(ctx context.Context, restartCh chan<- RestartReason) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-encCh:
-			evaluate()
-		case <-joinTickC:
 			evaluate()
 		}
 	}

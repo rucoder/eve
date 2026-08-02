@@ -4,10 +4,13 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/lf-edge/eve/pkg/kube/kube-init/state"
 )
 
 func TestParseTransitionMarker(t *testing.T) {
@@ -108,5 +111,33 @@ func TestParseTransitionMarker(t *testing.T) {
 	// any field parsing runs).
 	if _, _, err := parseTransitionMarker(dir + "/does-not-exist"); err == nil {
 		t.Errorf("missing file: expected error, got nil")
+	}
+}
+
+// TestCountReadyNodesWithoutClient pins the no-panic contract the join
+// watchdog depends on. It polls from boot, long before the FSM installs
+// the default kubeclient — and on the stuck join it exists to catch,
+// the client is never installed at all. Default() would panic there;
+// "no client" has to read as "nothing is Ready" instead.
+func TestCountReadyNodesWithoutClient(t *testing.T) {
+	// kubeclient.SetDefault is never called in this package's tests, so
+	// the process-wide client is nil here — the state a stuck join sees.
+	if got := countReadyNodes(context.Background()); got != 0 {
+		t.Errorf("countReadyNodes with no client = %d, want 0", got)
+	}
+}
+
+// TestStartJoinWatchdogWithoutMarker checks the watchdog stays dormant
+// when no join is in flight: no marker, no goroutine, and the
+// double-start guard left clear so a later real join can start one.
+func TestStartJoinWatchdogWithoutMarker(t *testing.T) {
+	if _, err := os.Stat(string(state.TransitionToCluster)); !os.IsNotExist(err) {
+		t.Skipf("host has a real %s marker", state.TransitionToCluster)
+	}
+
+	StartJoinWatchdog(context.Background())
+
+	if joinWatchdogActive.Load() {
+		t.Error("watchdog marked active with no transition marker on disk")
 	}
 }

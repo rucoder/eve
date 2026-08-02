@@ -658,6 +658,12 @@ func (d *daemon) run(ctx context.Context) {
 	go d.signalForwarder(ctx)
 	go d.listenSocket(ctx)
 
+	// A join left in flight by the previous boot has to be picked back
+	// up here: if it stays stuck the FSM never reaches RUNNING, so the
+	// monitor that would otherwise drive it never starts. No-op unless
+	// the marker is on disk.
+	monitor.StartJoinWatchdog(ctx)
+
 	d.transition(ctx, StateInit, "startup")
 
 	for {
@@ -1183,6 +1189,10 @@ func (d *daemon) handleClusterTransition(ctx context.Context, ev Event) {
 		d.setTransitionStep("")
 		d.restartCount = 0
 		d.phase = PhaseRecycle
+		// The runner has just written the join marker (non-bootstrap
+		// only). rootCtx, not ctx: the watchdog has to outlive every
+		// state the FSM passes through from here.
+		monitor.StartJoinWatchdog(d.rootCtx)
 		d.transition(ctx, StateStartingK3s, "transition-done/recycle")
 
 	case EvK3sExited:
