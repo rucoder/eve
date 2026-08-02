@@ -587,6 +587,68 @@ func TestClassifyHTTPErr(t *testing.T) {
 	}
 }
 
+// TestRemoveServerTLSDirEmptiesTree pins the property the join path
+// depends on: nothing signed by the retired CA may survive under
+// server/tls — dynamic-cert.json and the nested etcd/ dir included —
+// while the directory itself stays put.
+func TestRemoveServerTLSDirEmptiesTree(t *testing.T) {
+	root := t.TempDir()
+	tlsRoot := filepath.Join(root, "server", "tls")
+	ipsecPSK := filepath.Join(root, "server", "cred", "ipsec.psk")
+
+	for _, rel := range []string{
+		"server-ca.crt", "server-ca.key", "client-ca.crt", "client-ca.key",
+		"dynamic-cert.json", "serving-kube-apiserver.crt", "service.current.key",
+		"etcd/peer-ca.crt", "etcd/server-ca.crt", "temporary-certs/keep-out",
+		"kube-scheduler/kube-scheduler.crt",
+	} {
+		p := filepath.Join(tlsRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		if err := os.WriteFile(p, []byte("stale"), 0600); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(ipsecPSK), 0700); err != nil {
+		t.Fatalf("mkdir cred: %v", err)
+	}
+	if err := os.WriteFile(ipsecPSK, []byte("psk"), 0600); err != nil {
+		t.Fatalf("write ipsec.psk: %v", err)
+	}
+
+	if err := removeServerTLSDir(tlsRoot, ipsecPSK); err != nil {
+		t.Fatalf("removeServerTLSDir: %v", err)
+	}
+
+	entries, err := os.ReadDir(tlsRoot)
+	if err != nil {
+		t.Fatalf("tls dir must survive: %v", err)
+	}
+	if len(entries) != 0 {
+		var left []string
+		for _, e := range entries {
+			left = append(left, e.Name())
+		}
+		t.Errorf("tls dir not empty, left behind: %v", left)
+	}
+	if _, err := os.Stat(ipsecPSK); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ipsec.psk still present (stat err = %v)", err)
+	}
+}
+
+// TestRemoveServerTLSDirMissingTree covers a first-boot node that never
+// wrote server/tls: absent paths are not an error.
+func TestRemoveServerTLSDirMissingTree(t *testing.T) {
+	root := t.TempDir()
+	err := removeServerTLSDir(
+		filepath.Join(root, "server", "tls"),
+		filepath.Join(root, "server", "cred", "ipsec.psk"))
+	if err != nil {
+		t.Errorf("missing paths must be a no-op, got %v", err)
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

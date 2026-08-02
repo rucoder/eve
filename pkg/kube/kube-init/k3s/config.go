@@ -759,39 +759,53 @@ func bracketIPv6(addr string) string {
 	return "[" + addr + "]"
 }
 
-// RemoveServerTLSDir deletes the k3s server CA/key material so the
-// next k3s start regenerates a clean PKI. Used by the cluster→single
-// transition flow.
+// RemoveServerTLSDir empties the k3s server TLS directory so a joining
+// node is re-issued its whole PKI under the bootstrap node's CA. Used by
+// the single→cluster transition on non-bootstrap nodes.
 //
-// Missing files are silently ignored. The first non-ENOENT error is
-// returned; further errors during the same call are joined onto it.
+// Everything under server/tls goes, not a named subset of CA files.
+// k3s rewrites what it manages as bootstrap data from the datastore on
+// the next start ("Updating bootstrap data on disk from datastore"), so
+// deleting too much costs nothing — whereas anything left behind that
+// was signed by the retired single-node CA keeps being used.
+// dynamic-cert.json is the one that bites: it caches the whole
+// kube-system/k3s-serving Secret and is preloaded before the datastore
+// is up, so a surviving copy makes the local supervisor serve a cert the
+// adopted cluster CA cannot verify, and the node's own k3s agent then
+// loops forever on "CA cert validation failed" against 127.0.0.1:6443
+// without ever registering. The directory itself is kept so its 0700
+// mode survives.
+//
+// Missing paths are silently ignored. Errors are joined and returned
+// together so one undeletable file does not hide the rest.
 func RemoveServerTLSDir() error {
-	const tlsRoot = "/var/lib/rancher/k3s/server/tls"
-	const credRoot = "/var/lib/rancher/k3s/server/cred"
-	if _, err := os.Stat(tlsRoot); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+	return removeServerTLSDir(
+		"/var/lib/rancher/k3s/server/tls",
+		"/var/lib/rancher/k3s/server/cred/ipsec.psk")
+}
+
+// removeServerTLSDir is RemoveServerTLSDir with injectable paths.
+func removeServerTLSDir(tlsRoot, ipsecPSK string) error {
+	var joined error
+	entries, err := os.ReadDir(tlsRoot)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Nothing to clear; still drop the PSK below.
+	case err != nil:
+		joined = fmt.Errorf("read %s: %w", tlsRoot, err)
+	default:
+		for _, e := range entries {
+			p := filepath.Join(tlsRoot, e.Name())
+			if err := os.RemoveAll(p); err != nil {
+				log.Printf("warning: remove %s: %v", p, err)
+				joined = errors.Join(joined, fmt.Errorf("remove %s: %w", p, err))
+			}
 		}
-		return fmt.Errorf("stat %s: %w", tlsRoot, err)
 	}
 
-	files := []string{
-		tlsRoot + "/request-header-ca.key",
-		tlsRoot + "/server-ca.key",
-		tlsRoot + "/etcd/peer-ca.key",
-		tlsRoot + "/etcd/server-ca.crt",
-		tlsRoot + "/request-header-ca.crt",
-		tlsRoot + "/etcd/server-ca.key",
-		credRoot + "/ipsec.psk",
-		tlsRoot + "/server-ca.crt",
-		tlsRoot + "/service.key",
-	}
-	var joined error
-	for _, f := range files {
-		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("warning: remove %s: %v", f, err)
-			joined = errors.Join(joined, fmt.Errorf("remove %s: %w", f, err))
-		}
+	if err := removeIfExists(ipsecPSK); err != nil {
+		log.Printf("warning: remove %s: %v", ipsecPSK, err)
+		joined = errors.Join(joined, fmt.Errorf("remove %s: %w", ipsecPSK, err))
 	}
 	return joined
 }
