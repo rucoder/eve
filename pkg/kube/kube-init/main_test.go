@@ -596,16 +596,24 @@ func TestTransitionTable(t *testing.T) {
 			},
 		},
 		{
-			name:      "ClusterTransition/Error->Configuring (recycle fallback)",
+			// Must STAY in CLUSTER_TRANSITION and retry. Leaving for
+			// any other state skips the steps after the failed one —
+			// clear-tls-if-join among them — while the cluster-mode
+			// marker is already set, so the next state starts k3s in
+			// join mode against the single-node CA and crash-loops
+			// forever. Observed 2026-08-02: a transient CRD race in
+			// multus-reset bricked a node this way.
+			name:      "ClusterTransition/Error retries, never falls through",
 			initState: StateClusterTransition,
 			event:     Event{Type: EvError, Err: errors.New("step failed")},
-			wantState: StateConfiguring,
+			wantState: StateClusterTransition,
 			checkFn: func(t *testing.T, d *daemon) {
-				if d.phase != PhaseRecycle {
-					t.Errorf("phase = %v", d.phase)
-				}
 				if d.lastError == nil {
 					t.Error("lastError should be set")
+				}
+				if d.transitionStep != "" {
+					t.Errorf("transitionStep = %q, want cleared before retry",
+						d.transitionStep)
 				}
 			},
 		},

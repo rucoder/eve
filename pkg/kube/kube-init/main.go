@@ -1227,17 +1227,30 @@ func (d *daemon) handleClusterTransition(ctx context.Context, ev Event) {
 		log.Printf("absorbed EvK3sExited during CLUSTER_TRANSITION")
 
 	case EvError:
-		// Mid-flight transition failure. For non-bootstrap nodes
-		// the monitor's CheckClusterTransitionDone watchdog will
-		// eventually reboot. Otherwise we fall back to a recycle
-		// path that re-enters CONFIGURING with fresh config.
+		// Retry the transition, never fall through to another state.
+		//
+		// The steps run in a fixed order and later ones undo the
+		// assumptions of earlier ones: clear-tls-if-join sits behind
+		// multus-reset and stop-k3s. Leaving CLUSTER_TRANSITION on a
+		// failure means those steps never run while the
+		// edge-node-cluster-mode marker is already set, so the next
+		// state writes a join config and starts k3s against the
+		// single-node CA. That crash-loops forever on
+		// "certificate signed by unknown authority" — a transient,
+		// correctly-retried step failure turned into a bricked node
+		// (observed 2026-08-02, multus-reset losing a CRD race).
+		//
+		// The steps are idempotent, so re-running the sequence from
+		// the top is safe and is the only exit that cannot leave the
+		// node half-transitioned. A genuinely stuck transition is
+		// bounded by the join watchdog, which reboots after five
+		// minutes and gives up after three attempts.
 		d.lastError = ev.Err
 		failedStep := d.getTransitionStep()
 		d.setTransitionStep("")
-		log.Printf("CLUSTER_TRANSITION error at step %q: %v — falling back to recycle",
-			failedStep, ev.Err)
-		d.phase = PhaseRecycle
-		d.transition(ctx, StateConfiguring, "transition-error/recycle")
+		log.Printf("CLUSTER_TRANSITION error at step %q: %v — retrying the transition in %v",
+			failedStep, ev.Err, errorRetryDelay)
+		d.retryCurrentState(ctx)
 
 	case EvSocketRestart, EvSIGHUP, EvConfigChange,
 		EvClusterRecycle, EvSingleToCluster, EvClusterToSingle:
