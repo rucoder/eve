@@ -383,3 +383,58 @@ func TestWipeOrphanedReplicasMissingDir(t *testing.T) {
 		t.Errorf("missing dir must be a no-op, got %v", err)
 	}
 }
+
+// TestRestoreRemovesStaleDatastoreSidecars is the cluster→single
+// rollback's sharpest edge. The restore is an overlay, so a -wal left
+// beside the replaced state.db is read by SQLite as that database's own
+// journal and replayed into it — which corrupts the freshly restored
+// datastore and leaves k3s dead with "database disk image is
+// malformed". The snapshot never carries these files, so they must
+// always go.
+func TestRestoreRemovesStaleDatastoreSidecars(t *testing.T) {
+	snap := t.TempDir()
+	live := t.TempDir()
+
+	dbDir := "rancher/k3s/server/db"
+	if err := os.MkdirAll(filepath.Join(snap, dbDir), 0700); err != nil {
+		t.Fatalf("mkdir snapshot db dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snap, dbDir, "state.db"),
+		[]byte("clean-snapshot"), 0644); err != nil {
+		t.Fatalf("seed snapshot db: %v", err)
+	}
+
+	// The live tree as a converting node leaves it: cluster-mode
+	// datastore plus its journal sidecars and the etcd member dir.
+	if err := os.MkdirAll(filepath.Join(live, dbDir, "etcd"), 0700); err != nil {
+		t.Fatalf("mkdir live etcd dir: %v", err)
+	}
+	for _, f := range []string{
+		"state.db", "state.db-wal", "state.db-shm", "state.db-journal",
+	} {
+		if err := os.WriteFile(filepath.Join(live, dbDir, f),
+			[]byte("cluster-mode-leftover"), 0644); err != nil {
+			t.Fatalf("seed live %s: %v", f, err)
+		}
+	}
+
+	if err := restoreVarLibFrom(snap, live); err != nil {
+		t.Fatalf("restoreVarLibFrom: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(live, dbDir, "state.db"))
+	if err != nil {
+		t.Fatalf("read restored db: %v", err)
+	}
+	if string(got) != "clean-snapshot" {
+		t.Errorf("restored state.db = %q, want the snapshot's contents", got)
+	}
+
+	for _, f := range []string{"state.db-wal", "state.db-shm", "state.db-journal", "etcd"} {
+		p := filepath.Join(live, dbDir, f)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s survived the restore (stat err = %v) — SQLite will "+
+				"replay it into the restored datastore", f, err)
+		}
+	}
+}

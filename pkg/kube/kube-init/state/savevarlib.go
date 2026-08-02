@@ -208,6 +208,25 @@ const kineDBRelPath = "rancher/k3s/server/db/state.db"
 // bootstrapped cluster that no longer exists.
 var clusterOnlyVarLibPaths = []string{
 	"rancher/k3s/server/db/etcd",
+
+	// The datastore's write-ahead log and shared-memory index belong to
+	// the cluster-mode database, not to the one we just restored over
+	// it. SQLite treats a -wal sitting next to a database as that
+	// database's own journal and replays it on open, so leaving them
+	// here feeds pages from the old datastore into the new one: the
+	// restored file grows past its snapshot size, integrity_check
+	// reports "invalid page number", and k3s dies with "database disk
+	// image is malformed" on every start with no way back.
+	//
+	// Observed 2026-08-02 on edge-dev3: the snapshot passed
+	// integrity_check while the restored copy failed it, and the file
+	// was 18403328 bytes against the snapshot's 17821696.
+	//
+	// The snapshot never contains these — VACUUM INTO writes a single
+	// self-contained file — so removing them is unconditional.
+	"rancher/k3s/server/db/state.db-wal",
+	"rancher/k3s/server/db/state.db-shm",
+	"rancher/k3s/server/db/state.db-journal",
 }
 
 // saveVarLibTo / restoreVarLibFrom are the inner halves of the
