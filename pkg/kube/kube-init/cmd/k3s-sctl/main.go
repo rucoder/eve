@@ -11,6 +11,8 @@
 //	k3s-sctl status    — one-line status report
 //	k3s-sctl stop      — stop the kube-init daemon
 //	k3s-sctl graph     — print the resolved deploy-graph edges
+//	k3s-sctl break …   — set/clear/list operator breakpoints (local,
+//	                     works with the daemon down)
 //
 // Socket path overridable via K3S_SUPERVISOR_SOCKET for testing.
 package main
@@ -27,11 +29,18 @@ const defaultSocket = "/run/k3s-supervisor.sock"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <restart|status|stop|graph>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <restart|status|stop|graph|break>\n", os.Args[0])
 		os.Exit(1)
 	}
 
 	cmd := os.Args[1]
+
+	// break is handled locally: it only touches files under
+	// /persist, and must keep working when the daemon is down —
+	// which is precisely when staging a breakpoint matters.
+	if cmd == "break" {
+		os.Exit(runBreak(os.Args[2:]))
+	}
 	socketPath := os.Getenv("K3S_SUPERVISOR_SOCKET")
 	if socketPath == "" {
 		socketPath = defaultSocket

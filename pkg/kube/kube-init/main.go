@@ -1986,6 +1986,14 @@ func (d *daemon) statusString() string {
 		fmt.Sprintf("restarts=%d", d.restartCount),
 		fmt.Sprintf("phase=%s", d.phase))
 
+	// A staged breakpoint file is visible to anyone with a shell; what
+	// only the daemon knows is whether it has actually reached that
+	// point and stopped there. Report it prominently — a held daemon
+	// otherwise looks identical to a stuck one.
+	if item, since, ok := state.HeldBreakpoint(); ok {
+		parts = append(parts, fmt.Sprintf("breakpoint=%s held=%s",
+			item, time.Since(since).Truncate(time.Second)))
+	}
 	if d.lastError != nil {
 		parts = append(parts, fmt.Sprintf("last-error=%q", d.lastError.Error()))
 	}
