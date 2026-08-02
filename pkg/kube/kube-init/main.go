@@ -664,6 +664,14 @@ func (d *daemon) run(ctx context.Context) {
 	// the marker is on disk.
 	monitor.StartJoinWatchdog(ctx)
 
+	// Cluster-config edges are watched for the daemon's whole life, not
+	// just in RUNNING — a node that is not Ready still has to obey a
+	// controller that adds or withdraws its cluster config. The bridge
+	// that turns those signals into FSM events therefore has to be
+	// equally long-lived.
+	go d.bridgeMonitorRestarts(ctx)
+	monitor.StartClusterConfigMonitor(ctx, d.monRestartCh)
+
 	d.transition(ctx, StateInit, "startup")
 
 	for {
@@ -722,6 +730,22 @@ func (d *daemon) handleEvent(ctx context.Context, ev Event) {
 		log.Printf("retrying state %s", d.state)
 		d.enterStateFn(ctx)
 		return
+	case EvClusterToSingle:
+		// Handled here rather than per-state because it must not wait
+		// for RUNNING. Withdrawing the cluster config makes EVE drop
+		// the node's cluster IP, which takes k3s down; a node still
+		// working towards Ready when that lands never gets there, so
+		// deferring the request to RUNNING defers it forever. The
+		// runner needs nothing from k3s — it marks
+		// ConvertToSingleNode and reboots into the /var/lib restore.
+		// CLUSTER_TRANSITION is the exception: its handler queues the
+		// request rather than re-entering itself mid-transition.
+		if d.state != StateClusterTransition && d.state != StateShuttingDown {
+			d.restartReason = restartClusterToSingle
+			d.backoff = minBackoff
+			d.transition(ctx, StateClusterTransition, "cluster-to-single")
+			return
+		}
 	}
 
 	switch d.state {
@@ -860,7 +884,8 @@ func (d *daemon) handleStartingK3s(ctx context.Context, ev Event) {
 		log.Printf("STARTING_K3S error: %v — retrying in %v", ev.Err, errorRetryDelay)
 		d.retryCurrentState(ctx)
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -881,7 +906,8 @@ func (d *daemon) handleImporting(ctx context.Context, ev Event) {
 		log.Printf("IMPORTING error: %v — retrying in %v", ev.Err, errorRetryDelay)
 		d.retryCurrentState(ctx)
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -916,7 +942,8 @@ func (d *daemon) handleWaitK3sReady(ctx context.Context, ev Event) {
 		log.Printf("WAIT_K3S_READY error: %v — retrying in %v", ev.Err, errorRetryDelay)
 		d.retryCurrentState(ctx)
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -943,7 +970,8 @@ func (d *daemon) handleDeploying(ctx context.Context, ev Event) {
 		log.Printf("DEPLOYING error: %v — retrying in %v", ev.Err, errorRetryDelay)
 		d.retryCurrentState(ctx)
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -990,11 +1018,8 @@ func (d *daemon) handleRunning(ctx context.Context, ev Event) {
 		d.backoff = minBackoff
 		d.transition(ctx, StateClusterTransition, "single-to-cluster")
 
-	case EvClusterToSingle:
-		// One-shot cleanup + reboot. The runner does not return.
-		d.restartReason = restartClusterToSingle
-		d.backoff = minBackoff
-		d.transition(ctx, StateClusterTransition, "cluster-to-single")
+	// EvClusterToSingle is intercepted in handleEvent for every state,
+	// this one included.
 
 	case EvHealthTick:
 		if d.mon == nil {
@@ -1098,7 +1123,8 @@ func (d *daemon) handleSnapshot(ctx context.Context, ev Event) {
 		log.Printf("SNAPSHOT error: %v — retrying in %v", ev.Err, errorRetryDelay)
 		d.retryCurrentState(ctx)
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -1168,7 +1194,8 @@ func (d *daemon) handleStoppingK3s(ctx context.Context, ev Event) {
 		// cleanup completes.
 		log.Printf("absorbed EvK3sExited during STOPPING_K3S")
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 
 	case EvError:
@@ -1262,7 +1289,8 @@ func (d *daemon) handleRunningHooks(ctx context.Context, ev Event) {
 		d.phase = PhaseSteady
 		d.transition(ctx, StateStartingK3s, "hooks-error/proceeding")
 
-	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle:
+	case EvSocketRestart, EvSIGHUP, EvConfigChange, EvClusterRecycle,
+		EvSingleToCluster:
 		d.queueRestart(restartForEvent(ev.Type))
 	}
 }
@@ -1713,7 +1741,9 @@ func (d *daemon) enterRunning(ctx context.Context) {
 	d.mon = monitor.New(d.deviceName, d.uuid, d.eveRelease, d.installKubevirt)
 	d.mon.StartWithRestartCh(d.runningCtx, d.monRestartCh)
 
-	go d.bridgeMonitorRestarts(d.runningCtx)
+	// bridgeMonitorRestarts is started once in run() on the root context
+	// — the cluster-config monitor feeds the same channel from outside
+	// RUNNING, so a per-RUNNING bridge would drop those signals.
 
 	d.healthTicker = time.NewTicker(healthCheckInterval)
 	go d.forwardHealthTicks(d.runningCtx)

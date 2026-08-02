@@ -45,6 +45,11 @@ import (
 var (
 	healthCheckInterval  = 15 * time.Second
 	overridePollInterval = 15 * time.Second
+	// clusterConfigRetryDelay backs off StartClusterConfigMonitor after
+	// the loop returns an error (a bad cluster-mode marker read). Short:
+	// while it is down, cluster-config edges are missed.
+	clusterConfigRetryDelay = 5 * time.Second
+
 	// clusterJoinRetryInterval is the tick of StartJoinWatchdog, which
 	// runs only while a single→cluster join is in flight. The
 	// cluster-config monitor itself is fully event-driven on
@@ -164,9 +169,12 @@ func (m *Monitor) StartWithRestartCh(ctx context.Context, externalCh chan<- Rest
 }
 
 // startInternal wires the core monitoring goroutines.
+//
+// The cluster-config monitor is deliberately NOT among them — it runs
+// for the daemon's lifetime via StartClusterConfigMonitor. See that
+// function for why.
 func (m *Monitor) startInternal(ctx context.Context, restartCh chan<- RestartReason) {
 	log.Printf("starting monitor goroutines (device=%s)", m.deviceName)
-	m.spawn(ctx, func(c context.Context) { m.monitorClusterConfigLoop(c, restartCh) })
 	m.spawn(ctx, func(c context.Context) { m.monitorUserOverridesLoop(c, restartCh) })
 	m.spawn(ctx, m.logRotationLoop)
 	m.spawn(ctx, m.kubeconfigSyncLoop)
@@ -615,12 +623,43 @@ func SyncKubeconfig() {
 // Internal goroutine wrappers
 // ---------------------------------------------------------------------------
 
-func (m *Monitor) monitorClusterConfigLoop(ctx context.Context, restartCh chan<- RestartReason) {
-	if err := ClusterConfig(ctx, restartCh); err != nil {
-		if ctx.Err() == nil {
-			log.Printf("cluster config monitor error: %v", err)
+// StartClusterConfigMonitor runs the ClusterConfig loop for the
+// daemon's lifetime, restarting it if it errors out.
+//
+// It is not part of the Monitor goroutine set, which lives only while
+// the FSM is in RUNNING. Cluster-config edges must be observed from any
+// state, in both directions:
+//
+//   - cluster→single: withdrawing the config makes EVE drop the node's
+//     cluster IP, which takes k3s down within seconds. A node that is
+//     not already in RUNNING when that lands can never get there
+//     afterwards, so gating the watcher on RUNNING deadlocks the node —
+//     the conversion that would repair it is the very thing it can no
+//     longer notice. Observed: a joining node lost 10.244.244.4 three
+//     seconds after the withdrawal and sat in WAIT_K3S_READY forever.
+//
+//   - single→cluster: same reasoning in reverse; a node still churning
+//     towards Ready should not miss a cluster config that arrives
+//     meanwhile.
+//
+// ctx must be the daemon's long-lived context. Restart signals go to
+// restartCh, whose reader must likewise outlive RUNNING.
+func StartClusterConfigMonitor(ctx context.Context, restartCh chan<- RestartReason) {
+	go func() {
+		for {
+			err := ClusterConfig(ctx, restartCh)
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("cluster config monitor error: %v — restarting in %v",
+				err, clusterConfigRetryDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(clusterConfigRetryDelay):
+			}
 		}
-	}
+	}()
 }
 
 func (m *Monitor) monitorUserOverridesLoop(ctx context.Context, restartCh chan<- RestartReason) {

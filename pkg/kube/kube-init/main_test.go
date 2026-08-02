@@ -203,6 +203,43 @@ func TestTransitionTable(t *testing.T) {
 			event:     Event{Type: EvK3sExited},
 			wantState: StateBackoff,
 		},
+		{
+			// The deadlock this guards against: withdrawing the
+			// cluster config takes the node's cluster IP away, so a
+			// node waiting for readiness when it lands never becomes
+			// Ready and never reaches RUNNING. Queueing the request
+			// until RUNNING would queue it forever, so it has to be
+			// acted on right here.
+			name:      "WaitK3sReady/ClusterToSingle->ClusterTransition",
+			initState: StateWaitK3sReady,
+			event:     Event{Type: EvClusterToSingle},
+			wantState: StateClusterTransition,
+			checkFn: func(t *testing.T, d *daemon) {
+				if d.restartReason != restartClusterToSingle {
+					t.Errorf("restartReason = %v, want restartClusterToSingle",
+						restartReasonString(d.restartReason))
+				}
+			},
+		},
+		{
+			// Single→cluster genuinely needs a live k3s (token
+			// rotation, multus re-apply), so it queues rather than
+			// running here — but it must not be dropped, which is
+			// what happened before the monitor outlived RUNNING.
+			name:      "WaitK3sReady/SingleToCluster queues",
+			initState: StateWaitK3sReady,
+			event:     Event{Type: EvSingleToCluster},
+			wantState: StateWaitK3sReady,
+			checkFn: func(t *testing.T, d *daemon) {
+				if d.pendingRestart == nil {
+					t.Fatal("expected pending restart")
+				}
+				if *d.pendingRestart != restartSingleToCluster {
+					t.Errorf("pendingRestart = %v, want restartSingleToCluster",
+						restartReasonString(*d.pendingRestart))
+				}
+			},
+		},
 
 		// === DEPLOYING ===
 		{
@@ -513,6 +550,32 @@ func TestTransitionTable(t *testing.T) {
 			checkFn: func(t *testing.T, d *daemon) {
 				if d.restartReason != restartClusterToSingle {
 					t.Errorf("restartReason = %d", d.restartReason)
+				}
+			},
+		},
+		{
+			// Sampled from a state as far from RUNNING as the FSM
+			// gets, to pin that the interception is state-independent
+			// rather than a list of states someone remembered.
+			name:      "Backoff/ClusterToSingle->ClusterTransition",
+			initState: StateBackoff,
+			event:     Event{Type: EvClusterToSingle},
+			wantState: StateClusterTransition,
+		},
+		{
+			// The one exception: a transition already in flight is
+			// not re-entered, the request is queued behind it.
+			name:      "ClusterTransition/ClusterToSingle queues, no re-entry",
+			initState: StateClusterTransition,
+			event:     Event{Type: EvClusterToSingle},
+			wantState: StateClusterTransition,
+			checkFn: func(t *testing.T, d *daemon) {
+				if d.pendingRestart == nil {
+					t.Fatal("expected pending restart")
+				}
+				if *d.pendingRestart != restartClusterToSingle {
+					t.Errorf("pendingRestart = %v, want restartClusterToSingle",
+						restartReasonString(*d.pendingRestart))
 				}
 			},
 		},
