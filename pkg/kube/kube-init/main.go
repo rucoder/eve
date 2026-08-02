@@ -1362,7 +1362,10 @@ func (d *daemon) enterState(ctx context.Context) {
 		d.startAsync(ctx, d.workInstall, EvInstallDone)
 
 	case StateStartingCtrd:
-		d.startAsync(ctx, prereqs.StartContainerd, EvContainerdReady)
+		d.startAsync(ctx, func(workCtx context.Context) error {
+			state.WaitForItem(workCtx, "containerd")
+			return prereqs.StartContainerd(workCtx)
+		}, EvContainerdReady)
 
 	case StateConfiguring:
 		d.startAsync(ctx, d.workConfigure, EvConfigureDone)
@@ -1509,6 +1512,7 @@ func (d *daemon) workInit(workCtx context.Context) error {
 // proceed with whatever binary is already on disk so a transient
 // network outage cannot trap a fresh device in INSTALLING forever.
 func (d *daemon) workInstall(workCtx context.Context) error {
+	state.WaitForItem(workCtx, "k3s-install")
 	updated, err := update.CheckNodeComponents(workCtx, d.supervisor)
 	if err != nil {
 		log.Printf("WARNING: k3s version check failed: %v (continuing with whatever is on disk)",
@@ -2276,6 +2280,12 @@ func (d *daemon) runHealthWorker(ctx context.Context, mon *monitor.Monitor, sup 
 		case <-ctx.Done():
 		}
 	}()
+
+	// Steady-state breakpoint: holding this stops the per-tick
+	// housekeeping — k3s restarts, manifest re-apply, drift checks —
+	// so a node can be worked on by hand without the daemon undoing
+	// it. The shell's wait_for_item "wait", once per main loop.
+	state.WaitForItem(ctx, "wait")
 
 	if mon != nil {
 		mon.RunHealthChecks(ctx)

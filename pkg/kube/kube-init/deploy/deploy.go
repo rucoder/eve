@@ -55,6 +55,18 @@ type Graph struct {
 	// logs.
 	RetryCallback RetryCallback
 
+	// BeforeApply, when set, is called with the component name
+	// immediately before that component's Apply runs, and may block
+	// for as long as it likes. Its purpose is the operator
+	// breakpoint (state.WaitForItem): hold the graph just before a
+	// named component installs so a device can be inspected at that
+	// point. Kept as a hook rather than a direct call so this
+	// package stays free of filesystem paths.
+	//
+	// Blocking here holds one component and everything downstream of
+	// it; peers with no dependency on it keep running.
+	BeforeApply func(ctx context.Context, name string)
+
 	// Bus receives the signals components emit, and serves Awaits for
 	// signals whose producer is outside the graph. Pass a
 	// daemon-scoped Bus to let the control socket report readiness;
@@ -319,7 +331,7 @@ func (g Graph) runScheduler(
 			defer release()
 
 			runOne(runCtx, c, results, g.RetryCtx, g.RetryPolicy, g.RetryCallback,
-				bus, awaits[c.Name], release)
+				bus, awaits[c.Name], release, g.BeforeApply)
 		}()
 	}
 
@@ -405,6 +417,7 @@ func runOne(
 	ctx context.Context, c *Component, results chan<- result,
 	retryCtx context.Context, retryPolicy RetryPolicy, retryCallback RetryCallback,
 	bus *Bus, awaitSigs []Signal, releaseSlot func(),
+	beforeApply func(context.Context, string),
 ) {
 	start := time.Now()
 
@@ -436,6 +449,9 @@ func runOne(
 	}
 
 	if c.Apply != nil {
+		if beforeApply != nil {
+			beforeApply(ctx, c.Name)
+		}
 		log.Printf("deploy: %s: apply starting", c.Name)
 		if err := c.Apply(ctx); err != nil {
 			if c.BestEffort {

@@ -256,6 +256,11 @@ func GraphEdges(installKubevirt bool) ([]deploy.Edge, error) {
 func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool) deploy.Graph {
 	g := deploy.Graph{
 		MaxParallel: applyConcurrency(),
+		// Operator breakpoint per component, so /persist/k3s/wait_longhorn
+		// holds the graph just before Longhorn applies. Covers the shell's
+		// kubevirt/cdi/longhorn/descheduler wait points and every other
+		// component for free, since the names are the graph's own.
+		BeforeApply: state.WaitForItem,
 		Components: []deploy.Component{
 			{
 				// The namespace hosts EVE app workloads and holds the
