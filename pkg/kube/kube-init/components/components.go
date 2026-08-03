@@ -101,6 +101,12 @@ const (
 	multusReadyTimeout  = 5 * time.Minute
 	eveKubeAppNamespace = "eve-kube-app"
 
+	// The multus manifest declares this CRD and, in the same apply, an
+	// instance of that kind. The apiserver admits the instance only once the
+	// CRD is established, so the apply has to be able to wait and retry.
+	nadCRDName    = "network-attachment-definitions.k8s.cni.cncf.io"
+	nadCRDTimeout = 60 * time.Second
+
 	// KubeVirt readiness identities.
 	kubevirtOperatorDeployment    = "virt-operator"
 	kubevirtCRName                = "kubevirt"
@@ -408,6 +414,17 @@ func ApplyMultusCNI(ctx context.Context, addr NodeAddress) error {
 	}
 	log.Printf("rendered multus daemonset with IP prefix %s", ipPrefix)
 
+	// The NetworkAttachmentDefinition instance in this manifest is rejected if
+	// it reaches the apiserver before its CRD is established, so tolerate the
+	// first apply failing, establish the CRD, and apply again (idempotent).
+	firstErr := kubectlApply(ctx, MultusYAMLDst)
+	if err := kubectlx.WaitCRDEstablished(ctx, kubeclient.Default(), nadCRDName, nadCRDTimeout); err != nil {
+		if firstErr != nil {
+			return fmt.Errorf("apply multus daemonset: %w (CRD %s not established: %v)",
+				firstErr, nadCRDName, err)
+		}
+		return fmt.Errorf("CRD %s not established: %w", nadCRDName, err)
+	}
 	if err := kubectlApply(ctx, MultusYAMLDst); err != nil {
 		return fmt.Errorf("apply multus daemonset: %w", err)
 	}
