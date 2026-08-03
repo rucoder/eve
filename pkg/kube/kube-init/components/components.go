@@ -76,7 +76,14 @@ const (
 	kubevirtCRURL = "https://github.com/kubevirt/kubevirt/releases/download/v1.7.3/kubevirt-cr.yaml"
 	cdiVersion    = "v1.57.1"
 
-	longhornWaitTimeout = 10 * time.Minute
+	// longhornWaitTimeout is a NO-PROGRESS window, not a wall clock:
+	// the component sets Progress, so the budget restarts whenever
+	// containerd reports more bytes pulled. The ceiling bounds the
+	// total for a component that reports progress but never
+	// converges. Longhorn is ~280 MB across three images, which on a
+	// slow link legitimately exceeds the window while advancing.
+	longhornWaitTimeout  = 10 * time.Minute
+	longhornReadyCeiling = 40 * time.Minute
 
 	nvidiaVendorDir = "/opt/vendor/nvidia"
 
@@ -94,12 +101,15 @@ const (
 	kubevirtCRName                = "kubevirt"
 	kubevirtOperatorWaitTimeout   = 5 * time.Minute
 	kubevirtCRDeployedWaitTimeout = 10 * time.Minute
+	kubevirtCRReadyCeiling        = 40 * time.Minute
 
 	// CDI readiness identities.
 	cdiOperatorDeployment    = "cdi-operator"
 	cdiCRName                = "cdi"
 	cdiOperatorWaitTimeout   = 5 * time.Minute
 	cdiCRDeployedWaitTimeout = 10 * time.Minute
+	cdiOperatorReadyCeiling  = 20 * time.Minute
+	cdiCRReadyCeiling        = 30 * time.Minute
 )
 
 // Multus + DHCP-daemon + debug-user paths. Exported because the
@@ -190,6 +200,8 @@ func DeployAll(
 	// so a slow component keeps reconciling in the background; they
 	// die on daemon shutdown when retryCtx is cancelled.
 	g.RetryCtx = retryCtx
+	// Lets the daemon tell 'Run returned' from 'nothing is still working'.
+	g.Retries = retryTracker
 	if err := g.Run(ctx); err != nil {
 		return err
 	}
@@ -303,6 +315,8 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				Emits:        []deploy.Signal{deploy.LonghornReady},
 				BestEffort:   true,
 				ReadyTimeout: longhornWaitTimeout,
+				Progress:     componentProgress(kubectlx.LonghornNamespace),
+				ReadyCeiling: longhornReadyCeiling,
 			},
 			{
 				Name:  "descheduler",
@@ -319,6 +333,8 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				Ready:        WaitKubeVirtReady,
 				BestEffort:   true,
 				ReadyTimeout: kubevirtCRDeployedWaitTimeout,
+				Progress:     componentProgress(kubectlx.KubeVirtNamespace),
+				ReadyCeiling: kubevirtCRReadyCeiling,
 			},
 			deploy.Component{
 				Name:         "cdi-operator",
@@ -328,6 +344,8 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				Emits:        []deploy.Signal{deploy.CDIOperatorReady},
 				BestEffort:   true,
 				ReadyTimeout: cdiOperatorWaitTimeout,
+				Progress:     componentProgress(kubectlx.CDINamespace),
+				ReadyCeiling: cdiOperatorReadyCeiling,
 			},
 			deploy.Component{
 				// MultusCNIReady comes transitively via cdi-operator.
@@ -338,6 +356,8 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				Emits:        []deploy.Signal{deploy.CDIReady},
 				BestEffort:   true,
 				ReadyTimeout: cdiCRDeployedWaitTimeout,
+				Progress:     componentProgress(kubectlx.CDINamespace),
+				ReadyCeiling: cdiCRReadyCeiling,
 			},
 		)
 	}
@@ -587,7 +607,7 @@ func WaitKubeVirtReady(ctx context.Context) error {
 	return kubectlx.WaitForCondition(ctx, kubeclient.Default(),
 		kubevirtGVK, kubectlx.KubeVirtNamespace, kubevirtCRName,
 		"{.status.phase}", "Deployed",
-		kubevirtCRDeployedWaitTimeout)
+		kubectlx.WaitFromContext)
 }
 
 // kubeVirtConfigReplicas patches virt-operator Deployment replicas
@@ -662,7 +682,7 @@ func InstallCDIOperator(ctx context.Context) error {
 // WaitCDIOperatorReady blocks until cdi-operator is Available.
 func WaitCDIOperatorReady(ctx context.Context) error {
 	return kubectlx.WaitDeploymentReady(ctx, kubeclient.Default(),
-		kubectlx.CDINamespace, cdiOperatorDeployment, cdiOperatorWaitTimeout)
+		kubectlx.CDINamespace, cdiOperatorDeployment, kubectlx.WaitFromContext)
 }
 
 // InstallCDICR applies the CDI CR. Gated on CDIOperatorReady, so the
@@ -683,7 +703,7 @@ func WaitCDIReady(ctx context.Context) error {
 	return kubectlx.WaitForCondition(ctx, kubeclient.Default(),
 		cdiGVK, "", cdiCRName,
 		"{.status.phase}", "Deployed",
-		cdiCRDeployedWaitTimeout)
+		kubectlx.WaitFromContext)
 }
 
 // ---------------------------------------------------------------------------
@@ -800,9 +820,9 @@ func InstallLonghorn(ctx context.Context, deviceName string) error {
 // filtered informer factories scoped to the wait ctx; times out after
 // longhornWaitTimeout.
 func WaitLonghornReady(ctx context.Context) error {
-	log.Printf("waiting for Longhorn readiness (timeout %v)", longhornWaitTimeout)
+	log.Printf("waiting for Longhorn readiness (deadline from caller)")
 
-	waitCtx, cancel := context.WithTimeout(ctx, longhornWaitTimeout)
+	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	kc := kubeclient.Default()
@@ -858,11 +878,9 @@ func WaitLonghornReady(ctx context.Context) error {
 		log.Printf("Longhorn is ready")
 		return nil
 	case <-waitCtx.Done():
-		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("timed out waiting for Longhorn readiness after %v",
-				longhornWaitTimeout)
-		}
-		return waitCtx.Err()
+		// The caller owns the deadline, so it labels the outcome —
+		// stalled, ceiling, or its own cancellation.
+		return fmt.Errorf("waiting for Longhorn readiness: %w", waitCtx.Err())
 	}
 }
 
@@ -1235,4 +1253,97 @@ func readDeviceK8sName() string {
 		return ""
 	}
 	return state.ToK8sName(name)
+}
+
+// ingestProbeTimeout bounds one containerd progress probe. Short: the
+// probe runs on a poll loop and a hung containerd must not stall it.
+const ingestProbeTimeout = 10 * time.Second
+
+// retryTracker counts the BestEffort retry loops still converging after
+// DeployAll returns, so the daemon can avoid tearing k3s down on top of
+// one. Package-level because the graph is rebuilt per deploy pass while
+// the retries outlive it.
+var retryTracker = &deploy.RetryTracker{}
+
+// AwaitRetriesQuiescent blocks until no component is still retrying in
+// the background, at most for budget. A non-nil error means the budget
+// expired and work is still outstanding; callers log it and continue —
+// a wedged component must never hold up the state machine.
+func AwaitRetriesQuiescent(ctx context.Context, budget time.Duration) error {
+	return retryTracker.AwaitQuiescent(ctx, budget)
+}
+
+// ingestProgress reports containerd's in-flight ingest volume: bytes
+// written into content ingests plus how many are open. It advances
+// while an image is downloading — but goes quiet the moment a pull
+// moves from download to unpack, which is why it is only half the
+// signal.
+//
+// A fresh connection per probe: containerd is itself restarted during
+// bring-up, and a cached client would outlive the daemon it dialled.
+func ingestProgress(ctx context.Context) (string, error) {
+	cc, err := kubectlx.NewContainerd(ctx, state.ContainerdSocket)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = cc.Close() }()
+	bytes, active, err := cc.ActiveIngestBytes(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ingest=%d/%d", bytes, active), nil
+}
+
+// podProgress summarises a namespace's pods: how many exist, how many
+// containers are ready, and the total restart count. It changes as pods
+// are scheduled, as containers come up one by one, and when one
+// crash-loops — covering the unpack and post-pull phases that the
+// ingest counter cannot see.
+func podProgress(ctx context.Context, namespace string) (string, error) {
+	pods, err := kubeclient.Default().Clientset.CoreV1().Pods(namespace).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", err
+	}
+	ready, restarts := 0, 0
+	for i := range pods.Items {
+		for _, cs := range pods.Items[i].Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+			restarts += int(cs.RestartCount)
+		}
+	}
+	return fmt.Sprintf("pods=%d ready=%d restarts=%d", len(pods.Items), ready, restarts), nil
+}
+
+// componentProgress builds the Progress hook for a component whose work
+// lands in one namespace. Either source advancing counts as progress:
+// downloads show up in the ingest counter, everything after them —
+// unpack, scheduling, containers starting, a crash-loop — shows up in
+// the pod summary. Reporting only one of them is what made an earlier
+// version of this guard read a busy unpack as a stall.
+//
+// A failing sub-probe degrades to its error text rather than failing the
+// whole token, so containerd being briefly unreachable does not erase
+// the Kubernetes-side signal.
+func componentProgress(namespace string) deploy.ProgressFunc {
+	return func(ctx context.Context) (string, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, ingestProbeTimeout)
+		defer cancel()
+
+		ing, ingErr := ingestProgress(probeCtx)
+		if ingErr != nil {
+			ing = "ingest=?"
+		}
+		pods, podErr := podProgress(probeCtx, namespace)
+		if podErr != nil {
+			pods = "pods=?"
+		}
+		if ingErr != nil && podErr != nil {
+			return "", fmt.Errorf("progress probe %s: containerd: %v; kubernetes: %w",
+				namespace, ingErr, podErr)
+		}
+		return ing + " " + pods, nil
+	}
 }

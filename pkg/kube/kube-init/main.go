@@ -1096,6 +1096,12 @@ func (d *daemon) handleSnapshot(ctx context.Context, ev Event) {
 	}
 }
 
+// snapshotQuiesceBudget caps how long SNAPSHOT waits for in-flight
+// BestEffort retries before stopping k3s anyway. Sized above a cold
+// Longhorn pull so the common case converges first, and well below any
+// operator-visible boot expectation.
+const snapshotQuiesceBudget = 10 * time.Minute
+
 // enterSnapshot stops k3s so the snapshot sees a datastore at rest.
 //
 // ErrPortsStillBound is tolerated here, unlike on the restart paths. All
@@ -1107,8 +1113,18 @@ func (d *daemon) handleSnapshot(ctx context.Context, ev Event) {
 // boot, and the copy that follows takes far longer than the ports need
 // to clear before k3s is restarted.
 func (d *daemon) enterSnapshot(ctx context.Context) {
-	log.Printf("SNAPSHOT — stopping k3s to snapshot /var/lib at rest")
-	d.startAsync(ctx, func(_ context.Context) error {
+	d.startAsync(ctx, func(asyncCtx context.Context) error {
+		// Stopping k3s takes kubelet with it and cancels every image pull
+		// underneath, including one a BestEffort retry is still waiting
+		// on — the interrupted layer has to be pulled and extracted
+		// again. Reaching this state means every component either
+		// converged or was best-effort'd past, so work can still be in
+		// flight; hold off for it. Never indefinitely: a genuinely wedged
+		// component must not block the snapshot.
+		if err := components.AwaitRetriesQuiescent(asyncCtx, snapshotQuiesceBudget); err != nil {
+			log.Printf("SNAPSHOT: %v — proceeding anyway", err)
+		}
+		log.Printf("SNAPSHOT — stopping k3s to snapshot /var/lib at rest")
 		if d.supervisor == nil {
 			return nil
 		}

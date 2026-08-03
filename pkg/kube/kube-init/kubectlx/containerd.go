@@ -159,3 +159,31 @@ func (cc *ContainerdClient) ListImages(ctx context.Context) ([]string, error) {
 	}
 	return refs, nil
 }
+
+// ActiveIngestBytes sums the bytes written so far into every in-flight
+// content ingest, and returns the number of ingests alongside it. An
+// ingest is containerd's staging area for a blob being pulled: its
+// Offset advances as bytes land, so a rising sum means a pull is doing
+// work even when nothing has become Ready yet.
+//
+// This is the signal that separates "slow but advancing" from "stuck",
+// which a wall-clock timeout cannot. Callers poll it and treat a
+// changed (bytes, count) pair as progress.
+//
+// A pull that has finished downloading and is unpacking reports no
+// active ingest, so callers must treat a stable non-zero count as
+// progress-unknown rather than proof of a stall; pair it with a
+// component-level readiness check.
+func (cc *ContainerdClient) ActiveIngestBytes(ctx context.Context) (bytes int64, active int, err error) {
+	if cc == nil || cc.client == nil {
+		return 0, 0, fmt.Errorf("kubectlx containerd: nil client")
+	}
+	statuses, err := cc.client.ContentStore().ListStatuses(cc.nsCtx(ctx))
+	if err != nil {
+		return 0, 0, fmt.Errorf("kubectlx containerd: list ingest statuses: %w", err)
+	}
+	for _, s := range statuses {
+		bytes += s.Offset
+	}
+	return bytes, len(statuses), nil
+}

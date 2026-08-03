@@ -16,6 +16,13 @@ type StepFunc func(ctx context.Context) error
 // Ready condition or the caller's context / ReadyTimeout expires.
 type ReadyPredicate = StepFunc
 
+// ProgressFunc reports an opaque token summarising how much work a
+// Component has completed. Successive tokens are compared for equality
+// only — any change counts as progress and the value is never
+// interpreted. An error is treated as "progress unknown" and leaves
+// the no-progress timer running.
+type ProgressFunc func(ctx context.Context) (string, error)
+
 // Manifest is one apply-able input to a Component. Exactly one of
 // File / URL / Bytes is set. Used as a source-of-truth for
 // structural dep derivation.
@@ -64,7 +71,29 @@ type Component struct {
 	// Zero applies defaultReadyTimeout for BestEffort components;
 	// non-BestEffort components run under the caller's ctx when
 	// ReadyTimeout is zero.
+	//
+	// When Progress is set this becomes a NO-PROGRESS deadline: the
+	// budget restarts every time Progress reports a changed token, and
+	// ReadyCeiling bounds the total instead.
 	ReadyTimeout time.Duration
+
+	// Progress optionally reports whether Ready is advancing. Setting
+	// it converts ReadyTimeout from a wall clock into a no-progress
+	// deadline, so a component that is slow but working is not
+	// cancelled — which matters because cancelling discards the work
+	// (an interrupted image pull loses its in-flight layer, and the
+	// process-group stop that follows a completed deploy cancels any
+	// pull still running).
+	//
+	// Nil keeps the plain wall-clock behaviour.
+	Progress ProgressFunc
+
+	// ReadyCeiling bounds Ready in wall-clock terms when Progress is
+	// set, so a component that reports progress forever without ever
+	// becoming Ready still terminates. Ignored when Progress is nil.
+	//
+	// Zero applies defaultReadyCeilingFactor x ReadyTimeout.
+	ReadyCeiling time.Duration
 
 	// PolicyDeps names other components in the same graph that
 	// must reach Ready before this component's Apply runs. Reserved

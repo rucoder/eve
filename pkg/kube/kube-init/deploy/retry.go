@@ -5,7 +5,6 @@ package deploy
 
 import (
 	"context"
-	"errors"
 	"log"
 	"math/rand"
 	"time"
@@ -20,6 +19,7 @@ func spawnBestEffortRetry(
 	policy RetryPolicy,
 	callback RetryCallback,
 	bus *Bus,
+	retries *RetryTracker,
 	firstErr error,
 	firstStep string,
 ) {
@@ -27,7 +27,11 @@ func spawnBestEffortRetry(
 		return
 	}
 	policy = policy.withDefaults()
-	go retryLoop(retryCtx, c, policy, callback, bus, firstErr, firstStep)
+	// Registered before the goroutine is scheduled: a caller that
+	// checks quiescence immediately after Run returns must not see
+	// zero because the loop has not been scheduled yet.
+	retries.add()
+	go retryLoop(retryCtx, c, policy, callback, bus, retries, firstErr, firstStep)
 }
 
 // retryLoop is the runnable body of the retry goroutine.
@@ -37,9 +41,11 @@ func retryLoop(
 	policy RetryPolicy,
 	callback RetryCallback,
 	bus *Bus,
+	retries *RetryTracker,
 	firstErr error,
 	firstStep string,
 ) {
+	defer retries.done()
 	log.Printf("deploy: %s: BEST-EFFORT retry scheduled after %s failure: %v",
 		c.Name, firstStep, firstErr)
 
@@ -69,7 +75,17 @@ func retryLoop(
 		if readyTimeout <= 0 {
 			readyTimeout = defaultReadyTimeout
 		}
-		attemptCtx, cancel = context.WithTimeout(retryCtx, readyTimeout+policy.Cap)
+		// With Progress set, readyTimeout is a no-progress window and the
+		// real bound is the ceiling; sizing this ctx off the window would
+		// cancel an advancing pull and lose its in-flight layer.
+		attemptBound := readyTimeout
+		if c.Progress != nil {
+			attemptBound = c.ReadyCeiling
+			if attemptBound <= 0 {
+				attemptBound = defaultReadyCeilingFactor * readyTimeout
+			}
+		}
+		attemptCtx, cancel = context.WithTimeout(retryCtx, attemptBound+policy.Cap)
 		err := runApplyThenReady(attemptCtx, c, readyTimeout)
 		cancel()
 
@@ -133,18 +149,10 @@ func runApplyThenReady(ctx context.Context, c *Component, readyTimeout time.Dura
 	if c.Ready == nil {
 		return nil
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, readyTimeout)
-	defer cancel()
-	if err := c.Ready(readyCtx); err != nil {
-		// DeadlineExceeded is surfaced explicitly so the caller can
-		// distinguish "Ready is still converging" from "Apply produced
-		// a permanent error"; today the retry loop treats both the
-		// same (schedule another attempt), but a future refinement
-		// could shortcut permanent errors.
-		if errors.Is(readyCtx.Err(), context.DeadlineExceeded) {
-			return context.DeadlineExceeded
-		}
-		return err
-	}
-	return nil
+	// DeadlineExceeded stays distinguishable via errors.Is so the caller
+	// can tell "Ready is still converging" from "Apply produced a
+	// permanent error"; today the retry loop treats both the same
+	// (schedule another attempt), but a future refinement could shortcut
+	// permanent errors.
+	return runReadyGuarded(ctx, c, readyTimeout)
 }

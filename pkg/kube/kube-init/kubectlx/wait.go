@@ -34,6 +34,13 @@ import (
 // the boot.
 const defaultWaitTimeout = 5 * time.Minute
 
+// WaitFromContext, passed as a Wait* helper's timeout, means the helper
+// imposes no deadline of its own and the caller's ctx governs. Needed
+// because a zero timeout already means "apply the default", so there
+// was no way to express "the caller is managing the deadline" — which a
+// progress-guarded caller must, or its guard never gets to act.
+const WaitFromContext time.Duration = -1
+
 // ErrWaitDeleted is returned when the object being watched is deleted
 // while a Wait* call is in progress. Callers can use errors.Is to
 // distinguish this from a plain timeout.
@@ -58,10 +65,12 @@ func waitOn(
 	exampleType runtime.Object,
 	predicate func(runtime.Object) (bool, error),
 ) error {
-	if timeout <= 0 {
+	if timeout == WaitFromContext {
+		timeout = 0
+	} else if timeout <= 0 {
 		timeout = defaultWaitTimeout
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	waitCtx, cancel := withOptionalTimeout(ctx, timeout)
 	defer cancel()
 
 	// Every Wait* call currently supported is a name-lookup — the
@@ -290,7 +299,9 @@ func WaitForCondition(
 	gvk schema.GroupVersionKind, namespace, name, jsonPath, want string,
 	timeout time.Duration,
 ) error {
-	if timeout <= 0 {
+	if timeout == WaitFromContext {
+		timeout = 0
+	} else if timeout <= 0 {
 		timeout = defaultWaitTimeout
 	}
 	log.Printf("kubectlx: waiting for %s %s/%s %s=%s (timeout=%s)",
@@ -313,7 +324,7 @@ func WaitForCondition(
 		return fmt.Errorf("kubectlx wait: rest mapping for %s: %w", gvk, err)
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	waitCtx, cancel := withOptionalTimeout(ctx, timeout)
 	defer cancel()
 
 	sel := fields.OneTermEqualSelector("metadata.name", name).String()
@@ -386,8 +397,21 @@ func evalJSONPath(jp *jsonpath.JSONPath, obj map[string]any) (string, error) {
 // unlike the old formatTimeout it doesn't need to satisfy kubectl's
 // argv grammar.
 func timeoutStr(d time.Duration) string {
+	if d == WaitFromContext {
+		return "from ctx"
+	}
 	if d <= 0 {
 		d = defaultWaitTimeout
 	}
 	return d.String()
+}
+
+// withOptionalTimeout derives a ctx bounded by timeout, or a plain
+// cancellable child when timeout is zero — the WaitFromContext case,
+// where the caller owns the deadline.
+func withOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
 }

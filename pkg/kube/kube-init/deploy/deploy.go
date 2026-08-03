@@ -60,6 +60,13 @@ type Graph struct {
 	// daemon-scoped Bus to let the control socket report readiness;
 	// when nil a throwaway Bus is created for the run.
 	Bus *Bus
+
+	// Retries, when non-nil, counts the BestEffort retry loops still
+	// running after Run returns. A caller about to do something that
+	// destroys in-flight work — stopping k3s cancels every image pull
+	// under it — uses AwaitQuiescent to hold off while a component is
+	// still converging.
+	Retries *RetryTracker
 }
 
 // Run plans the graph, resolves edges, and executes components as
@@ -319,7 +326,7 @@ func (g Graph) runScheduler(
 			defer release()
 
 			runOne(runCtx, c, results, g.RetryCtx, g.RetryPolicy, g.RetryCallback,
-				bus, awaits[c.Name], release)
+				bus, g.Retries, awaits[c.Name], release)
 		}()
 	}
 
@@ -404,7 +411,7 @@ type result struct {
 func runOne(
 	ctx context.Context, c *Component, results chan<- result,
 	retryCtx context.Context, retryPolicy RetryPolicy, retryCallback RetryCallback,
-	bus *Bus, awaitSigs []Signal, releaseSlot func(),
+	bus *Bus, retries *RetryTracker, awaitSigs []Signal, releaseSlot func(),
 ) {
 	start := time.Now()
 
@@ -416,7 +423,7 @@ func runOne(
 			if c.BestEffort {
 				log.Printf("deploy: %s: BEST-EFFORT await FAILED (treated as success, downstream NOT blocked): %v",
 					c.Name, err)
-				spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, err, "await")
+				spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, retries, err, "await")
 				results <- result{name: c.Name}
 				return
 			}
@@ -441,7 +448,7 @@ func runOne(
 			if c.BestEffort {
 				log.Printf("deploy: %s: BEST-EFFORT apply FAILED after %s (treated as success, downstream NOT blocked): %v",
 					c.Name, time.Since(start).Round(time.Millisecond), err)
-				spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, err, "apply")
+				spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, retries, err, "apply")
 				results <- result{name: c.Name}
 				return
 			}
@@ -464,34 +471,28 @@ func runOne(
 		return
 	}
 
-	readyCtx := ctx
-	var readyCancel context.CancelFunc
-	var readyTimeout time.Duration
-	if c.BestEffort {
-		readyTimeout = c.ReadyTimeout
-		if readyTimeout <= 0 {
-			readyTimeout = defaultReadyTimeout
-		}
-		readyCtx, readyCancel = context.WithTimeout(ctx, readyTimeout)
-		defer readyCancel()
-	} else if c.ReadyTimeout > 0 {
-		readyCtx, readyCancel = context.WithTimeout(ctx, c.ReadyTimeout)
-		defer readyCancel()
+	readyTimeout := c.ReadyTimeout
+	if c.BestEffort && readyTimeout <= 0 {
+		readyTimeout = defaultReadyTimeout
 	}
 
 	readyStart := time.Now()
 	log.Printf("deploy: %s: ready starting", c.Name)
-	if err := c.Ready(readyCtx); err != nil {
+	if err := runReadyGuarded(ctx, c, readyTimeout); err != nil {
 		if c.BestEffort {
 			elapsed := time.Since(readyStart).Round(time.Millisecond)
-			if errors.Is(readyCtx.Err(), context.DeadlineExceeded) {
+			switch {
+			case errors.Is(err, ErrNoProgress):
+				log.Printf("deploy: %s: BEST-EFFORT ready STALLED after %s (no progress for %s, treated as success, downstream NOT blocked): %v",
+					c.Name, elapsed, readyTimeout, err)
+			case errors.Is(err, context.DeadlineExceeded):
 				log.Printf("deploy: %s: BEST-EFFORT ready TIMED OUT after %s (cap=%s, treated as success, downstream NOT blocked): %v",
 					c.Name, elapsed, readyTimeout, err)
-			} else {
+			default:
 				log.Printf("deploy: %s: BEST-EFFORT ready FAILED after %s (treated as success, downstream NOT blocked): %v",
 					c.Name, elapsed, err)
 			}
-			spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, err, "ready")
+			spawnBestEffortRetry(retryCtx, c, retryPolicy, retryCallback, bus, retries, err, "ready")
 			results <- result{name: c.Name}
 			return
 		}
