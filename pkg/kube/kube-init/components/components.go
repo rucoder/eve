@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -82,8 +83,12 @@ const (
 	// total for a component that reports progress but never
 	// converges. Longhorn is ~280 MB across three images, which on a
 	// slow link legitimately exceeds the window while advancing.
-	longhornWaitTimeout  = 10 * time.Minute
-	longhornReadyCeiling = 40 * time.Minute
+	longhornWaitTimeout = 10 * time.Minute
+	// Sized above a cold pull of the instance-manager image (442 MB) plus
+	// the resource reaching running, measured at ~42 min on the slowest
+	// topology under load. The previous 40 min expired three minutes short
+	// of convergence. Matches the e2e suite's own budget for this gate.
+	longhornReadyCeiling = 90 * time.Minute
 
 	nvidiaVendorDir = "/opt/vendor/nvidia"
 
@@ -315,7 +320,7 @@ func buildDeployGraph(deviceName string, addr NodeAddress, installKubevirt bool)
 				Emits:        []deploy.Signal{deploy.LonghornReady},
 				BestEffort:   true,
 				ReadyTimeout: longhornWaitTimeout,
-				Progress:     componentProgress(kubectlx.LonghornNamespace),
+				Progress:     longhornProgress,
 				ReadyCeiling: longhornReadyCeiling,
 			},
 			{
@@ -834,6 +839,7 @@ func WaitLonghornReady(ctx context.Context) error {
 
 	dsInformer := dsFactory.Apps().V1().DaemonSets().Informer()
 	longhornNodesInformer := dynFactory.ForResource(kubectlx.LonghornNodesGVR).Informer()
+	longhornIMInformer := dynFactory.ForResource(kubectlx.LonghornInstanceManagersGVR).Informer()
 
 	ready := make(chan struct{}, 1)
 	signalReady := func() {
@@ -843,7 +849,8 @@ func WaitLonghornReady(ctx context.Context) error {
 		}
 	}
 	check := func() {
-		if longhornDaemonSetsReady(waitCtx) && longhornNodeExists(waitCtx) {
+		if longhornDaemonSetsReady(waitCtx) && longhornNodeExists(waitCtx) &&
+			longhornInstanceManagerRunning(waitCtx) {
 			signalReady()
 		}
 	}
@@ -859,12 +866,22 @@ func WaitLonghornReady(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("add longhorn node event handler: %w", err)
 	}
+	// Without this the instance-manager could be the last condition to
+	// hold and nothing would notice until the informers' 10-minute
+	// resync, since the wait blocks on events rather than polling.
+	if _, err := longhornIMInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(any) { check() },
+		UpdateFunc: func(_, _ any) { check() },
+	}); err != nil {
+		return fmt.Errorf("add longhorn instancemanager event handler: %w", err)
+	}
 
 	dsFactory.Start(waitCtx.Done())
 	dynFactory.Start(waitCtx.Done())
 
 	if !cache.WaitForCacheSync(waitCtx.Done(),
-		dsInformer.HasSynced, longhornNodesInformer.HasSynced) {
+		dsInformer.HasSynced, longhornNodesInformer.HasSynced,
+		longhornIMInformer.HasSynced) {
 		return fmt.Errorf("longhorn informers failed to sync: %w", waitCtx.Err())
 	}
 
@@ -1197,6 +1214,44 @@ func longhornDaemonSetsReady(ctx context.Context) bool {
 // create it (the manager won't initialise without one); a create
 // failure is logged so a steady-state hot loop in WaitLonghornReady
 // is debuggable.
+// longhornInstanceManagerRunning reports whether this node has an
+// instance-manager in the running state.
+//
+// Longhorn runs a volume's engine and replica processes inside that pod, so
+// storage cannot serve a volume until one exists — yet it is owned by an
+// InstanceManager CR rather than a DaemonSet, so the daemonset sweep above
+// cannot observe it. Leaving it out let readiness be declared while the pod's
+// 442 MB image was still downloading, and the snapshot's k3s stop then
+// cancelled that pull.
+//
+// Longhorn creates the CR eagerly during node setup, not on first volume
+// request (verified on-device: the CR is running with no volumes present), so
+// waiting for it cannot deadlock against a volume that is itself gated on
+// storage readiness.
+func longhornInstanceManagerRunning(ctx context.Context) bool {
+	list, err := kubeclient.Default().Dynamic.
+		Resource(kubectlx.LonghornInstanceManagersGVR).
+		Namespace(kubectlx.LonghornNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("warning: list longhorn instancemanagers: %v", err)
+		}
+		return false
+	}
+	devName := readDeviceK8sName()
+	for i := range list.Items {
+		nodeID, _, _ := unstructured.NestedString(list.Items[i].Object, "spec", "nodeID")
+		if devName != "" && nodeID != devName {
+			continue
+		}
+		state, _, _ := unstructured.NestedString(list.Items[i].Object, "status", "currentState")
+		if state == "running" {
+			return true
+		}
+	}
+	return false
+}
+
 func longhornNodeExists(ctx context.Context) bool {
 	devName := readDeviceK8sName()
 	if devName == "" {

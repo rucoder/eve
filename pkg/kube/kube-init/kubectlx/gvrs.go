@@ -21,6 +21,14 @@ var (
 		Group: "longhorn.io", Version: "v1beta2", Resource: "nodes",
 	}
 
+	// LonghornInstanceManagersGVR is the CR that owns the per-node
+	// instance-manager pod, where Longhorn runs a volume's engine and
+	// replica processes. It is NOT a DaemonSet, so a readiness check
+	// that lists DaemonSets cannot see it.
+	LonghornInstanceManagersGVR = schema.GroupVersionResource{
+		Group: "longhorn.io", Version: "v1beta2", Resource: "instancemanagers",
+	}
+
 	AddonGVR = schema.GroupVersionResource{
 		Group: "k3s.cattle.io", Version: "v1", Resource: "addons",
 	}
