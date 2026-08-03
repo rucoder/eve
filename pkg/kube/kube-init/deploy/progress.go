@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -32,15 +33,17 @@ const defaultReadyCeilingFactor = 3
 // defaultRetryPolicy is a var. Production code must not mutate them.
 var (
 	// progressPollInterval is how often a guarded Ready samples its
-	// Progress token. Short enough to notice a stall promptly, long
-	// enough that the probe itself is not a load source — the probe
-	// hits containerd, which is already busy pulling.
+	// Progress token. The probe hits containerd, which is already busy
+	// pulling, so it must not be tight.
 	progressPollInterval = 15 * time.Second
 
-	// readyDrainGrace bounds how long we wait for a cancelled Ready to
-	// return before abandoning it. A Ready that ignores its ctx must
-	// not wedge the graph.
+	// readyDrainGrace bounds the wait for a cancelled Ready to return.
+	// One that ignores its ctx must not wedge the graph.
 	readyDrainGrace = 30 * time.Second
+
+	// progressLogInterval throttles the token log; during a download the
+	// token moves every poll.
+	progressLogInterval = 60 * time.Second
 )
 
 // runReadyGuarded runs c.Ready under the right deadline semantics.
@@ -91,6 +94,8 @@ func runReadyGuarded(ctx context.Context, c *Component, readyTimeout time.Durati
 	lastProgress := began
 	lastToken := ""
 	haveToken := false
+	lastLogged := time.Time{}
+	quietWarned := false
 
 	tick := time.NewTicker(progressPollInterval)
 	defer tick.Stop()
@@ -107,9 +112,24 @@ func runReadyGuarded(ctx context.Context, c *Component, readyTimeout time.Durati
 			// make the deadline unreachable.
 			if tok, err := c.Progress(runCtx); err == nil {
 				if !haveToken || tok != lastToken {
+					if quietWarned {
+						log.Printf("deploy: %s: progress resumed after %s: %s",
+							c.Name, time.Since(lastProgress).Round(time.Second), tok)
+					} else if time.Since(lastLogged) >= progressLogInterval {
+						log.Printf("deploy: %s: progress %s", c.Name, tok)
+						lastLogged = time.Now()
+					}
 					lastToken, haveToken = tok, true
 					lastProgress = time.Now()
+					quietWarned = false
 				}
+			}
+			// Once, halfway to the deadline: the frozen token names what
+			// the probe was watching when the component stopped moving.
+			if quiet := time.Since(lastProgress); !quietWarned && quiet >= readyTimeout/2 {
+				log.Printf("deploy: %s: no progress for %s, token held at: %s",
+					c.Name, quiet.Round(time.Second), lastToken)
+				quietWarned = true
 			}
 			if since := time.Since(lastProgress); since >= readyTimeout {
 				return giveUp(fmt.Errorf("%w for %s: %w",
