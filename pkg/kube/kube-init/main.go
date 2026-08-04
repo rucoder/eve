@@ -823,18 +823,29 @@ func (d *daemon) handleStartingK3s(ctx context.Context, ev Event) {
 	case EvK3sStarted:
 		d.k3sStartedAt = time.Now()
 		d.lastError = nil
-		// PhaseSteady routes through WaitK3sReady (not directly
-		// to RUNNING) because EvK3sStarted only proves the
+		// Every phase reaches RUNNING via WaitK3sReady (never
+		// directly) because EvK3sStarted only proves the
 		// kubeconfig file appeared — k3s writes it before the
 		// API listener is up. Going via WaitK3sReady forces a
 		// real round-trip before enterRunning spawns goroutines
 		// that will call kubectl. The wait against a healthy k3s
 		// returns nearly instantly, so the extra state is cheap.
+		//
+		// Every phase also goes via StateImporting, PhaseSteady
+		// included. ImportAll is per-EVE-release work: it re-tags the
+		// external-boot-image to the running release, which pillar
+		// references as :latest with imagePullPolicy Never. The
+		// initialization markers are restored from /persist and so
+		// survive an EVE upgrade, making PhaseSteady the phase on the
+		// first boot of a *new* release — a steady boot that skips the
+		// import leaves :latest on the prior release's image, and no
+		// container app can start. ImportAll pre-checks each image and
+		// is a few containerd lookups when they are already present.
 		switch d.phase {
 		case PhaseFirstBoot:
 			d.transition(ctx, StateImporting, "k3s-started/first-boot")
 		case PhaseSteady:
-			d.transition(ctx, StateWaitK3sReady, "k3s-started/restart")
+			d.transition(ctx, StateImporting, "k3s-started/restart")
 		case PhaseRecycle:
 			d.transition(ctx, StateImporting, "k3s-started/recycle")
 		default:

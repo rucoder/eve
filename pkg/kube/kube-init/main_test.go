@@ -120,15 +120,17 @@ func TestTransitionTable(t *testing.T) {
 			wantState: StateImporting,
 		},
 		{
-			// PhaseSteady routes through WaitK3sReady so the
-			// health-worker goroutines spawned in enterRunning
-			// do not race a not-yet-reachable API server. See
-			// the comment in handleStartingK3s.
-			name:      "StartingK3s/K3sStarted+Restart->WaitK3sReady",
+			// PhaseSteady is also the phase on the first boot of a
+			// new EVE release, so it must reach Importing for the
+			// external-boot-image re-tag; WaitK3sReady still follows
+			// via EvImagesDone, keeping the health-worker goroutines
+			// in enterRunning off a not-yet-reachable API server.
+			// See the comment in handleStartingK3s.
+			name:      "StartingK3s/K3sStarted+Restart->Importing",
 			initState: StateStartingK3s,
 			initPhase: PhaseSteady,
 			event:     Event{Type: EvK3sStarted},
-			wantState: StateWaitK3sReady,
+			wantState: StateImporting,
 		},
 		{
 			name:      "StartingK3s/K3sStarted+Recycle->Importing",
