@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for pkg/kube-images/oci-uncompress-layers.py.
+"""Unit tests for pkg/kube-images/oci-rewrite-layers.py.
 
 Builds a tiny OCI image layout fixture (a docker-schema2 manifest, an oci
 manifest wrapped in an image-index, and a docker-schema2 manifest wrapped
@@ -8,12 +8,16 @@ in a docker manifest-list, to exercise both recursion paths), runs the
 tool against it, and checks the post-run invariants: gzip layers become
 uncompressed tar, layer digests match their on-disk content AND equal the
 true uncompressed-content digest (diffID), ref-name annotations survive,
-and the config blob is never rewritten.
+and the config blob is never rewritten in uncompressed mode.
+
+The erofs-format tests cover the other path: layers become ready-made
+EROFS filesystems the device places instead of converting, which is only
+correct if the config's diff_ids follow them.
 """
 import gzip, hashlib, io, json, os, subprocess, tarfile, tempfile, unittest
 
 TOOL = os.path.join(os.path.dirname(__file__), "..", "..",
-                    "pkg", "kube-images", "oci-uncompress-layers.py")
+                    "pkg", "kube-images", "oci-rewrite-layers.py")
 
 
 def sha(b):
@@ -36,19 +40,23 @@ def write_blob(root, b):
     return d, len(b)
 
 
+FIXTURE_MTIME = 1234567890  # a real timestamp: the conversion must keep it
+
+
 def tar_bytes():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as t:
         data = b"hello"
         ti = tarfile.TarInfo("f")
         ti.size = len(data)
+        ti.mtime = FIXTURE_MTIME
         t.addfile(ti, io.BytesIO(data))
     return buf.getvalue()
 
 
 def make_image(root, manifest_mt, layer_mt):
     raw = tar_bytes()
-    gz = gzip.compress(raw)
+    gz = gzip.compress(raw, mtime=0)  # header mtime would make the digest vary per run
     ldig, lsz = write_blob(root, gz)
     diffid = sha(raw)  # config records the UNCOMPRESSED digest
     cfg = json.dumps({"rootfs": {"type": "layers", "diff_ids": [diffid]}}).encode()
@@ -127,12 +135,12 @@ def build_fixture(root):
     }
 
 
-class TestOCIUncompressLayers(unittest.TestCase):
+class TestUncompressedFormat(unittest.TestCase):
     def test_decompress_docker_and_oci_and_index(self):
         with tempfile.TemporaryDirectory() as root:
             pre_info = build_fixture(root)
 
-            subprocess.run(["python3", TOOL, root], check=True)
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)
 
             idx = json.loads(read_bytes(os.path.join(root, "index.json")))
             names = {m["annotations"]["org.opencontainers.image.ref.name"] for m in idx["manifests"]}
@@ -184,7 +192,7 @@ class TestOCIUncompressLayers(unittest.TestCase):
             with open(os.path.join(root, "index.json"), "w") as f:
                 json.dump(idx, f)
 
-            subprocess.run(["python3", TOOL, root], check=True)
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)
 
             out = json.loads(read_bytes(os.path.join(root, "index.json")))
             self.assertEqual(len(out["manifests"]), 3)
@@ -225,7 +233,7 @@ class TestOCIUncompressLayers(unittest.TestCase):
                 collect_gzip_layers(m)
             self.assertTrue(pre_gzip_blob_names, "fixture must contain gzip layers")
 
-            subprocess.run(["python3", TOOL, root], check=True)
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)
 
             # (a) the original gzip layer blobs no longer exist on disk
             remaining = set(os.listdir(blobs_dir))
@@ -267,7 +275,7 @@ class TestOCIUncompressLayers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             build_fixture(root)
 
-            subprocess.run(["python3", TOOL, root], check=True)
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)
             index_path = os.path.join(root, "index.json")
             blobs_dir = os.path.join(root, "blobs", "sha256")
 
@@ -277,7 +285,7 @@ class TestOCIUncompressLayers(unittest.TestCase):
                 for name in os.listdir(blobs_dir)
             }
 
-            subprocess.run(["python3", TOOL, root], check=True)
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)
 
             index_after_second = read_bytes(index_path)
             blobs_after_second = {
@@ -315,7 +323,7 @@ class TestOCIUncompressLayers(unittest.TestCase):
                     {"mediaType": d_mt, "digest": mdig, "size": msz,
                      "annotations": {"org.opencontainers.image.ref.name": "reg"}}]}, f)
 
-            subprocess.run(["python3", TOOL, root], check=True)  # must not crash
+            subprocess.run(["python3", TOOL, root, "--format", "uncompressed"], check=True)  # must not crash
 
             idx = json.load(open(os.path.join(root, "index.json")))
             man2 = read_blob_json(root, idx["manifests"][0]["digest"])
@@ -327,3 +335,96 @@ class TestOCIUncompressLayers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestErofsFormat(unittest.TestCase):
+    """The default format: layers arrive as ready-made EROFS filesystems."""
+
+    EROFS_MAGIC = b"\xe2\xe1\xf5\xe0"  # at offset 1024
+
+    def convert(self, root, *extra):
+        subprocess.run(["python3", TOOL, root, *extra],
+                       check=True, capture_output=True)
+
+    def leaf_manifests(self, root):
+        """Every leaf manifest in the layout, following both list types."""
+        out = []
+
+        def walk(desc):
+            doc = read_blob_json(root, desc["digest"])
+            if (desc["mediaType"].endswith("index.v1+json")
+                    or desc["mediaType"].endswith("manifest.list.v2+json")):
+                for sub in doc["manifests"]:
+                    walk(sub)
+            else:
+                out.append(doc)
+
+        for m in json.loads(read_bytes(os.path.join(root, "index.json")))["manifests"]:
+            walk(m)
+        return out
+
+    def test_layers_become_native_erofs_and_config_follows(self):
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            self.convert(root)
+
+            for man in self.leaf_manifests(root):
+                layer = man["layers"][0]
+                self.assertEqual(layer["mediaType"],
+                                 "application/vnd.oci.image.layer.v1.erofs")
+                blob = read_bytes(os.path.join(root, "blobs", "sha256",
+                                               layer["digest"].split(":")[1]))
+                # a real EROFS image whose digest/size describe it
+                self.assertEqual(blob[1024:1028], self.EROFS_MAGIC)
+                self.assertEqual(sha(blob), layer["digest"])
+                self.assertEqual(len(blob), layer["size"])
+                # containerd's unpacker compares the applied digest (for a
+                # native layer, the layer digest) to the config's diff_id
+                cfg = read_blob_json(root, man["config"]["digest"])
+                self.assertEqual(cfg["rootfs"]["diff_ids"], [layer["digest"]])
+
+    def test_shared_layers_convert_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            self.convert(root)
+            # the fixture's three images are built from identical content, so
+            # a per-unique-digest conversion must land them on one blob
+            digests = {m["layers"][0]["digest"] for m in self.leaf_manifests(root)}
+            self.assertEqual(len(digests), 1)
+
+    def test_file_mtimes_survive_conversion(self):
+        # The conversion must not change what the image contains. mkfs.erofs
+        # can pin its superblock time with -T, which would make the blob
+        # reproducible, but that clamps every file's mtime to the same value
+        # -- a content change to images we don't own. Parity with the
+        # device's own conversion wins; the blob is simply not reproducible.
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            self.convert(root)
+            man = self.leaf_manifests(root)[0]
+            img = os.path.join(root, "layer.erofs")
+            with open(img, "wb") as f:
+                f.write(read_bytes(os.path.join(root, "blobs", "sha256",
+                                                man["layers"][0]["digest"].split(":")[1])))
+            out = os.path.join(root, "extracted")
+            subprocess.run(["fsck.erofs", "--extract=" + out, "--preserve-perms", img],
+                           check=True, capture_output=True)
+            self.assertEqual(int(os.stat(os.path.join(out, "f")).st_mtime), FIXTURE_MTIME)
+
+    def test_existing_erofs_layers_are_left_alone(self):
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            self.convert(root)
+            before = self.leaf_manifests(root)[0]["layers"][0]["digest"]
+            self.convert(root)  # a second pass must be a no-op, not a re-wrap
+            after = self.leaf_manifests(root)[0]["layers"][0]["digest"]
+            self.assertEqual(before, after)
+
+    def test_source_blobs_are_pruned(self):
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            pre = {m["layers"][0]["digest"].split(":")[1]
+                   for m in self.leaf_manifests(root)}
+            self.convert(root)
+            remaining = set(os.listdir(os.path.join(root, "blobs", "sha256")))
+            self.assertFalse(pre & remaining, "source layer blobs were not pruned")
