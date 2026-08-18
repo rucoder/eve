@@ -86,10 +86,11 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 
 	cs := client.ContentStore()
 	is := client.ImageService()
+	sn := client.SnapshotService(erofsSnapshotter)
 
 	importStart := time.Now()
-	var registered, converted int
-	var convertTotal time.Duration
+	var registered, staged, unpacked int
+	var stageTotal time.Duration
 	for _, img := range imgs {
 		name := resolveName(img.RefName, refMap, externalBootRef)
 		if name == "" {
@@ -121,31 +122,36 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 				log.Printf("kube-images: aliased %s as %s", name, latestRef)
 			}
 		}
-		// Pre-convert into the erofs snapshotter now, sequentially, so the
-		// deploy waves find a ready snapshot at CreateContainer. Lazy per-pod
-		// conversion otherwise herds: a wave bringing up several images at once
-		// converts them concurrently and starves a CPU-constrained node past the
-		// CreateContainer deadline. Best-effort — kubelet converts on demand if
-		// this is skipped.
-		cimg, gerr := client.GetImage(ctx, name)
-		if gerr != nil {
-			log.Printf("WARNING: get image %s for pre-unpack: %v", name, gerr)
-			continue
-		}
+		// Make the layers available as erofs snapshots now, so the deploy
+		// waves find one ready at CreateContainer instead of unpacking
+		// under a CPU-constrained node past the CreateContainer deadline.
+		// The layers are already erofs images inside the payload, so this
+		// only writes snapshot metadata and a symlink per layer -- see
+		// placeLayers. Best-effort: on any failure fall back to
+		// containerd's own unpack, which copies the blobs but works.
 		t0 := time.Now()
-		if uerr := cimg.Unpack(ctx, erofsSnapshotter); uerr != nil {
-			log.Printf("WARNING: pre-unpack %s: %v", name, uerr)
-			continue
+		if perr := placeLayers(ctx, sn, cs, layoutDir, img); perr != nil {
+			log.Printf("WARNING: place snapshots for %s: %v; falling back to unpack", name, perr)
+			cimg, gerr := client.GetImage(ctx, name)
+			if gerr != nil {
+				log.Printf("WARNING: get image %s for unpack: %v", name, gerr)
+				continue
+			}
+			if uerr := cimg.Unpack(ctx, erofsSnapshotter); uerr != nil {
+				log.Printf("WARNING: unpack %s: %v", name, uerr)
+				continue
+			}
+			unpacked++
 		}
 		d := time.Since(t0)
-		convertTotal += d
-		converted++
-		log.Printf("kube-images: pre-converted %s -> %s in %s (%d/%d)",
-			name, erofsSnapshotter, d.Round(time.Millisecond), converted, len(imgs))
+		stageTotal += d
+		staged++
+		log.Printf("kube-images: staged %s for %s in %s (%d/%d)",
+			name, erofsSnapshotter, d.Round(time.Millisecond), staged, len(imgs))
 	}
-	log.Printf("kube-images: registerLayout done: %d registered, %d pre-converted, "+
-		"convert-time %s, wall %s",
-		registered, converted, convertTotal.Round(time.Second),
+	log.Printf("kube-images: registerLayout done: %d registered, %d staged "+
+		"(%d needed a copying unpack), stage-time %s, wall %s",
+		registered, staged, unpacked, stageTotal.Round(time.Second),
 		time.Since(importStart).Round(time.Second))
 	return nil
 }
