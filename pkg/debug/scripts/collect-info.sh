@@ -729,13 +729,23 @@ fi
 # Make a tarball
 # --exlude='root-run/run'              /run/run/run/.. exclude symbolic link loop
 # --exclude='root-run/containerd-user'  the k8s.io/*/rootfs paths go deep
+# --exclude='root-run/kube-images'     the read-only kube-images payload (~2.7GB
+#                                      of pre-packaged image layers). It is
+#                                      shipped with the EVE image, identical on
+#                                      every device and reproducible from the
+#                                      build, so it carries no diagnostic value
+#                                      -- but /run is collected via a symlink
+#                                      and tar --dereference would inline the
+#                                      whole mount, which takes minutes of gzip
+#                                      on a CPU-constrained node and produces an
+#                                      unusable tarball.
 # --ignore-failed-read --warning=none  ignore all errors, even if read fails
 # --dereference                        follow symlinks
 echo "- tar/gzip"
 if check_tar_flags; then
-  tar -C "$TMP_DIR" --exclude='root-run/run' --exclude='root-run/containerd-user' --ignore-failed-read --warning=none --dereference -czf "$TARBALL_FILE" "$INFO_DIR_SUFFIX"
+  tar -C "$TMP_DIR" --exclude='root-run/run' --exclude='root-run/containerd-user' --exclude='root-run/kube-images' --ignore-failed-read --warning=none --dereference -czf "$TARBALL_FILE" "$INFO_DIR_SUFFIX"
 else
-  tar -C "$TMP_DIR" --exclude='root-run/run' --exclude='root-run/containerd-user' --dereference -czf "$TARBALL_FILE" "$INFO_DIR_SUFFIX"
+  tar -C "$TMP_DIR" --exclude='root-run/run' --exclude='root-run/containerd-user' --exclude='root-run/kube-images' --dereference -czf "$TARBALL_FILE" "$INFO_DIR_SUFFIX"
 fi
 rm -rf "$TMP_DIR"
 sync
