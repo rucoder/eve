@@ -23,8 +23,6 @@ conf/device.cert.pem
 conf/device.key.pem
 conf/soft_serial
 pkg/eve/Dockerfile
-pkg/external-boot-image/Dockerfile
-pkg/external-boot-image/*.tar
 tools/compare-sbom-sources/vendor
 tools/get-deps/get-deps
 tools/get-deps/vendor
@@ -35,9 +33,8 @@ pkg/installer/vendor/windows-sys*/src/Windows/
 pkg/monitor/eve-monitor-rs
 pkg/pillar/lk-build-arg-COVER
 
-# kube-images build context: external-boot-image.tar, exported from the
-# linuxkit cache by the pkg/kube-images/external-boot-image.tar rule and
-# fed into pkg/kube-images's Dockerfile build stage via skopeo
-# docker-archive:, then discarded with the builder layer. Never committed.
-pkg/kube-images/*.tar
+# pkg/kube-images/Dockerfile is generated from Dockerfile.in by
+# parse-pkgs.sh (KERNEL_TAG / XENTOOLS_TAG substitution), like
+# pkg/eve/Dockerfile.
+pkg/kube-images/Dockerfile
 __pycache__/

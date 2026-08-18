@@ -3,8 +3,8 @@
 #
 # Read-only payload volume that ships the container images kube-init
 # needs at first boot: the upstream images (KubeVirt, CDI, Longhorn,
-# Multus, kube-vip) plus one EVE-authored image (external-boot-image,
-# folded in here from its docker-archive tar).
+# Multus, kube-vip) plus one EVE-authored image, external-boot-image,
+# assembled here from the kernel and runx-initrd rather than pulled.
 #
 # The payload is a single self-contained EROFS image
 # (kube-images.erofs) holding a standard OCI image layout. At boot
@@ -24,27 +24,52 @@
 # packed gzip streams for no size win. Both knobs are build-args, so
 # gzip+uncompressed-erofs remains selectable when that trade-off is
 # preferred (e.g. to avoid EROFS_FS_ZIP on the kernel side).
+#
+# external-boot-image supplies the kernel + initrd KubeVirt's
+# kernelBoot feature boots container-as-VM apps from; KubeVirt's API
+# only accepts a container image there, never host paths, so those two
+# files have to reach the node as an OCI image. They are taken
+# straight from the kernel and xen-tools packages below and packed as
+# a one-layer EROFS image (oci-add-erofs-image.py) — no separate
+# linuxkit package, no docker-archive tar, and nothing for the device
+# to convert. See .claude/design/kube-images-zero-import.md.
+#
+# Declare the two passthrough stages BEFORE `build` so the RUN/COPY
+# commands below execute inside `build` and not inside a passthrough
+# stage (the same trap documented in pkg/kube/Dockerfile).
+
+# hadolint ignore=DL3006
+FROM XENTOOLS_TAG AS xen-tools
+# hadolint ignore=DL3006
+FROM KERNEL_TAG AS kernel-src
 
 # hadolint ignore=DL3007
 FROM alpine:3.22 AS build
 
+ARG TARGETARCH
 ARG LAYER_FORMAT=uncompressed
 # Alpine's erofs-utils supports lz4/lz4hc only (no zstd); the kernel
 # decodes lz4 via CONFIG_EROFS_FS_ZIP. Value is passed straight to
 # mkfs.erofs -z<algo>; "none" builds an uncompressed filesystem.
 ARG EROFS_COMPRESSION=lz4hc
 
-# skopeo pulls the upstream images and reads external-boot-image from
-# its docker-archive tar; python3 runs oci-uncompress-layers.py when
-# LAYER_FORMAT=uncompressed; mkfs.erofs (erofs-utils) builds the
-# image. All discarded — only /out survives into the final stage.
+# skopeo pulls the upstream images; python3 runs oci-uncompress-layers.py
+# when LAYER_FORMAT=uncompressed and builds the external-boot-image layer;
+# mkfs.erofs (erofs-utils) builds both that layer and the payload itself.
+# All discarded — only /out survives into the final stage.
 # hadolint ignore=DL3018
 RUN apk add --no-cache skopeo erofs-utils python3
 
 WORKDIR /w
 COPY upstream-images.list /w/upstream-images.list
-COPY external-boot-image.tar /w/external-boot-image.tar
 COPY oci-uncompress-layers.py /w/oci-uncompress-layers.py
+COPY oci-add-erofs-image.py /w/oci-add-erofs-image.py
+
+# The two files external-boot-image consists of, at the paths pillar's
+# VMIRS references them by (kernelPath /kernel, initrdPath /runx-initrd).
+# Mode 0666: KubeVirt runs the container-disk container as non-root.
+COPY --from=xen-tools --chmod=666 /usr/lib/xen/boot/runx-initrd /w/ebi/runx-initrd
+COPY --from=kernel-src --chmod=666 /kernel /w/ebi/kernel
 
 # Assemble a shared OCI image layout, then pack it into one EROFS
 # image:
@@ -52,8 +77,8 @@ COPY oci-uncompress-layers.py /w/oci-uncompress-layers.py
 #      single OCI layout (skopeo dedups blobs by digest within it).
 #      skopeo sync can't target an OCI layout (docker/dir only), so
 #      this is a copy per ref.
-#   2) skopeo copy external-boot-image separately: it comes from a
-#      docker-archive: tar, not a registry.
+#   2) add external-boot-image as a one-layer native-EROFS image built
+#      from /w/ebi (no registry, no tar).
 #   3) optionally rewrite layers to uncompressed (LAYER_FORMAT).
 #   4) mkfs.erofs the layout dir into a self-contained image, with
 #      EROFS_COMPRESSION selecting the -z<algo> or none.
@@ -71,10 +96,8 @@ RUN --mount=type=cache,target=/oci-cache \
             "docker://$ref" \
             "oci:/oci-cache/oci-layout:$dest"; \
     done < /w/upstream-images.list; \
-    echo "[skopeo] external-boot-image (docker-archive)"; \
-    skopeo copy --preserve-digests \
-        docker-archive:/w/external-boot-image.tar \
-        oci:/oci-cache/oci-layout:eve-external-boot-image; \
+    python3 /w/oci-add-erofs-image.py /oci-cache/oci-layout \
+        eve-external-boot-image /w/ebi --arch "$TARGETARCH"; \
     # Ship the real-name ref list inside the image so kube-init can
     # map skopeo's sanitised OCI ref names back to the registry refs
     # kubelet expects (see images.retagUpstream).

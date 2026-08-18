@@ -425,14 +425,12 @@ FORCE_BUILD=
 # runtime content has changed.
 #
 # Current entries:
-#   external-boot-image — bakes runx-initrd (XENTOOLS_TAG) and the
-#                         kernel (KERNEL_TAG) via Dockerfile.in
-#                         placeholder substitution. Bumping either
-#                         doesn't invalidate the tag hash.
-#   kube-images         — folds in the gitignored external-boot-image.tar
-#                         AND skopeo-pulls upstream refs that aren't
-#                         digest-pinned into the erofs payload; neither
-#                         is covered by the tag hash.
+#   kube-images         — bakes runx-initrd (XENTOOLS_TAG) and the
+#                         kernel (KERNEL_TAG) into the payload via
+#                         Dockerfile.in placeholder substitution, AND
+#                         skopeo-pulls upstream refs that aren't
+#                         digest-pinned; neither is covered by the tag
+#                         hash, so bumping either serves a stale image.
 #
 # The list-driven mechanism below is used INSTEAD of the
 # target-specific `pkg/foo: FORCE_BUILD := --force` pattern —
@@ -440,7 +438,7 @@ FORCE_BUILD=
 # (alpine-base, alpine, uefi, xen-tools, ...) via GNU Make's
 # target-specific-variable inheritance, which was the source of
 # the "why is alpine-base rebuilding every time" symptom.
-LINUXKIT_FORCE_PKGS := external-boot-image kube-images
+LINUXKIT_FORCE_PKGS := kube-images
 
 # ROOTFS_DEPS enforces the scan of all rootfs image dependencies
 ifdef ROOTFS_DEPS
@@ -493,7 +491,7 @@ ifeq ($(HV),k)
         ROOTFS_MAXSIZE_MB=10240
 else
         #kube container will not be in non-k builds
-        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube|external-boot-image$$")
+        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube$$")
         # nvidia platform requires more space
         ifeq (, $(findstring nvidia,$(PLATFORM)))
             ROOTFS_MAXSIZE_MB=290
@@ -1006,37 +1004,15 @@ pkgs: RESCAN_DEPS=
 pkgs: $(LINUXKIT) $(PKGS) $(LK_POSSIBLE_BUILD_ARG_TARGETS)
 	@echo Done building packages
 
-# No-op target for get-deps which looks at
-# external-boot-image and sees a dep for eve-kernel
-# and attempts to build pkg/kernel, which is in
-# lf-edge/eve-kernel and not built here.
+# No-op target for get-deps which looks at kube-images, sees a dep
+# for eve-kernel (it COPYs the kernel into the external-boot-image
+# layer) and attempts to build pkg/kernel, which lives in
+# lf-edge/eve-kernel and is not built here.
 pkg/kernel:
 	$(QUIET): $@: No-op pkg/kernel
 
-# external-boot-image's --force is handled via LINUXKIT_FORCE_PKGS
-# at the top of this file. Rationale for --force is documented
-# there. See also .claude/design/kube-images-composefs.md for the
-# kube-images entry (same trap, one layer up).
-
-# external-boot-image is consumed by pkg/kube-images (folded into the
-# erofs payload) rather than baked into pkg/kube itself. The tar is
-# produced in pkg/kube-images/ and read from there by its Dockerfile
-# via skopeo's docker-archive: transport.
-# See .claude/design/kube-images-composefs.md.
-
-pkg/kube-images/external-boot-image.tar: pkg/external-boot-image
-	$(eval BOOT_IMAGE_TAG := $(shell $(LINUXKIT) pkg show-tag --canonical pkg/external-boot-image))
-	$(eval CACHE_CONTENT := $(shell $(LINUXKIT) cache ls 2>&1))
-	$(if $(filter $(BOOT_IMAGE_TAG),$(CACHE_CONTENT)),,$(LINUXKIT) cache pull $(BOOT_IMAGE_TAG))
-	$(MAKE) cache-export IMAGE=$(BOOT_IMAGE_TAG) OUTFILE=pkg/kube-images/external-boot-image.tar
-	rm -f pkg/external-boot-image/Dockerfile
-
-# pkg/kube-images's Dockerfile expects external-boot-image.tar in its
-# build context. Declaring the dep here means `make pkg/kube-images`
-# — and therefore `make pkgs` / `make live` — produces the tar before
-# linuxkit pkg build tries to COPY it. See
-# .claude/design/kube-images-composefs.md.
-pkg/kube-images: pkg/kube-images/external-boot-image.tar
+# kube-images' --force is handled via LINUXKIT_FORCE_PKGS at the top
+# of this file, where the rationale is documented.
 
 # TODO(kube-images matrix): pkg/kube-images's LAYER_FORMAT /
 # EROFS_COMPRESSION Dockerfile ARGs (default uncompressed+lz4hc) aren't
