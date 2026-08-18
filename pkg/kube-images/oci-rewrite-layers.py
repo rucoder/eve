@@ -49,9 +49,17 @@ def write_blob(root, data):
         with open(p, "wb") as f: f.write(data)
     return d, len(data)
 
-def is_gzip(path):
+GZIP_MAGIC = b"\x1f\x8b"
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def layer_magic(path):
     with open(path, "rb") as f:
-        return f.read(2) == b"\x1f\x8b"
+        return f.read(4)
+
+
+def is_gzip(path):
+    return layer_magic(path)[:2] == GZIP_MAGIC
 
 def uncompressed_mt(mt):
     if mt.endswith("+gzip"): return mt[: -len("+gzip")]
@@ -86,7 +94,16 @@ def convert_layer(root, digest, compression):
         args.append("-z" + compression)
     with tempfile.TemporaryDirectory(dir=os.path.join(root, "blobs")) as tmp:
         out = os.path.join(tmp, "layer.erofs")
-        opener = gzip.open if is_gzip(src) else open
+        magic = layer_magic(src)
+        if magic[:4] == ZSTD_MAGIC:
+            # mkfs.erofs --tar reads an uncompressed tar stream, and python's
+            # stdlib cannot decompress zstd before 3.14. Fail by name rather
+            # than handing zstd bytes to mkfs.erofs, which reports only a
+            # generic conversion error.
+            raise RuntimeError(
+                f"layer {digest} is zstd-compressed; only gzip and "
+                "uncompressed tar layers are supported")
+        opener = gzip.open if magic[:2] == GZIP_MAGIC else open
         with opener(src, "rb") as stream:
             proc = subprocess.Popen(args + [out], stdin=subprocess.PIPE)
             shutil.copyfileobj(stream, proc.stdin, length=1 << 20)

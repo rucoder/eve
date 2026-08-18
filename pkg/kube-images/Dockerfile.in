@@ -13,11 +13,10 @@
 # /images/kube-images.erofs read-only with `mount -t erofs` — no loop
 # device (CONFIG_EROFS_FS_BACKED_BY_FILE) — exposing the OCI layout so
 # it can register the images with the k3s user-containerd without a
-# network pull. See .claude/design/kube-images-composefs.md.
+# network pull.
 #
-# Self-contained (blobs inline), not composefs-with-digest-store: the
-# runtime needs only a plain `mount -t erofs`, no mount.composefs
-# helper on the device. LAYER_FORMAT=erofs (the default) converts every
+# Self-contained: the blobs live inside the image, so the runtime needs
+# only a plain `mount -t erofs` and no helper on the device. LAYER_FORMAT=erofs (the default) converts every
 # layer to a ready-made EROFS filesystem here, on the build host, so the
 # device places blobs instead of running mkfs.erofs per layer on its
 # single dom0 vCPU — see .claude/design/kube-images-zero-import.md.
@@ -119,7 +118,7 @@ RUN --mount=type=cache,target=/oci-cache \
         eve-external-boot-image /w/ebi --arch "$TARGETARCH"; \
     # Ship the real-name ref list inside the image so kube-init can
     # map skopeo's sanitised OCI ref names back to the registry refs
-    # kubelet expects (see images.retagUpstream).
+    # kubelet expects (see loadRefMap/resolveName in kube-init).
     cp /w/upstream-images.list /oci-cache/oci-layout/upstream-images.list; \
     echo "[rewrite] layers -> $LAYER_FORMAT"; \
     python3 /w/oci-rewrite-layers.py /oci-cache/oci-layout --format "$LAYER_FORMAT"; \

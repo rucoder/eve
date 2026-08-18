@@ -88,6 +88,16 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 	is := client.ImageService()
 	sn := client.SnapshotService(erofsSnapshotter)
 
+	// contentStoreBlobs duplicates `root` from pkg/kube/config-k3s.toml. If
+	// that root ever moves, staging would write symlinks into a directory
+	// nothing reads and every blob would be copied instead -- correct, but
+	// silently several GB slower. Say so rather than letting it pass.
+	if _, err := os.Stat(contentStoreBlobs); err != nil {
+		log.Printf("WARNING: content store %s not found (%v); images will be "+
+			"copied instead of staged -- has containerd's root moved in config-k3s.toml?",
+			contentStoreBlobs, err)
+	}
+
 	importStart := time.Now()
 	var registered, staged, unpacked int
 	var stageTotal time.Duration
@@ -195,18 +205,10 @@ func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
 		if err != nil {
 			return fmt.Errorf("open blob %s: %w", b.Digest, err)
 		}
-		// The manifest carries containerd.io/gc.ref.content.* labels naming
-		// its config + layers. Without them GC can't see the manifest's
-		// children and reaps every config/layer once our lease releases,
-		// leaving image records whose content is incomplete.
-		var opts []content.Opt
-		if b.Digest == img.Manifest.Digest {
-			opts = append(opts, content.WithLabels(gcRefLabels(img.Blobs[1:])))
-		}
 		// WriteBlob short-circuits to metadata-only when the staged symlink
 		// resolves in the backend store (shared policy); otherwise it copies
 		// from f. Either way correct.
-		writeErr := content.WriteBlob(ctx, cs, "kube-images-"+b.Digest.String(), f, b, opts...)
+		writeErr := content.WriteBlob(ctx, cs, "kube-images-"+b.Digest.String(), f, b)
 		_ = f.Close()
 		if writeErr != nil {
 			return fmt.Errorf("write blob %s: %w", b.Digest, writeErr)
@@ -218,6 +220,28 @@ func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
 			copied++
 		}
 	}
+	// The manifest carries containerd.io/gc.ref.content.* labels naming its
+	// config + layers. Without them GC can't see the manifest's children and
+	// reaps every config/layer once our lease releases, leaving image records
+	// whose content is incomplete.
+	//
+	// Set with an explicit Update rather than as WriteBlob options: WriteBlob
+	// only passes its options down to Commit, and returns early without
+	// calling it when the digest is already recorded in the metadata store --
+	// which is the case for any blob already registered by an earlier image.
+	// An Update applies either way and is idempotent.
+	labels := gcRefLabels(img.Blobs[1:])
+	fieldpaths := make([]string, 0, len(labels))
+	for k := range labels {
+		fieldpaths = append(fieldpaths, "labels."+k)
+	}
+	if _, err := cs.Update(ctx, content.Info{
+		Digest: img.Manifest.Digest,
+		Labels: labels,
+	}, fieldpaths...); err != nil {
+		return fmt.Errorf("label manifest with content refs: %w", err)
+	}
+
 	if err := putImage(ctx, is, name, img.Manifest); err != nil {
 		return err
 	}

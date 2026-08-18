@@ -14,8 +14,8 @@ fully-qualified image references, one per line:
     ...
 
 pkg/kube-images/Dockerfile loops over this file, `skopeo copy`-ing
-each ref into a shared OCI image layout that mkcomposefs then turns
-into the composefs payload.
+each ref into a shared OCI image layout that mkfs.erofs then turns
+into the kube-images payload.
 
 The file is committed for reviewability; the Makefile regenerates
 it whenever any of its inputs change and `make

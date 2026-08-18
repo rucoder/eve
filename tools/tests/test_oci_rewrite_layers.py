@@ -420,6 +420,21 @@ class TestErofsFormat(unittest.TestCase):
             after = self.leaf_manifests(root)[0]["layers"][0]["digest"]
             self.assertEqual(before, after)
 
+    def test_zstd_layer_fails_by_name(self):
+        # mkfs.erofs would report only a generic conversion error, so the
+        # unsupported compression must be named before it gets that far.
+        with tempfile.TemporaryDirectory() as root:
+            build_fixture(root)
+            man = self.leaf_manifests(root)[0]
+            blob = os.path.join(root, "blobs", "sha256",
+                                man["layers"][0]["digest"].split(":")[1])
+            with open(blob, "wb") as f:
+                f.write(b"\x28\xb5\x2f\xfd" + b"\x00" * 64)  # zstd magic
+            proc = subprocess.run(["python3", TOOL, root],
+                                  capture_output=True, text=True)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("zstd", proc.stderr)
+
     def test_source_blobs_are_pruned(self):
         with tempfile.TemporaryDirectory() as root:
             build_fixture(root)
