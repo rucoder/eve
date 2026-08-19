@@ -98,11 +98,18 @@ RUN --mount=type=cache,target=/oci-cache \
     set -eu; \
     mkdir -p /oci-cache/oci-layout /out; \
     while read -r ref; do \
-        [ -n "$ref" ] || continue; \
-        dest=$(printf '%s' "$ref" | tr '/:' '__'); \
-        echo "[skopeo] $ref"; \
+        case "$ref" in ''|'#'*) continue;; esac; \
+        # Pull strictly by the pinned digest (skopeo rejects tag@digest
+        # refs); name the layout image after the digest-less name:tag,
+        # which is what kube-init (refmap.go) and kubelet's pod specs
+        # resolve by.
+        name="${ref%%@*}"; \
+        pull="$ref"; \
+        case "$ref" in *@*) pull="${name%:*}@${ref#*@}";; esac; \
+        dest=$(printf '%s' "$name" | tr '/:' '__'); \
+        echo "[skopeo] $name ($pull)"; \
         skopeo copy --preserve-digests \
-            "docker://$ref" \
+            "docker://$pull" \
             "oci:/oci-cache/oci-layout:$dest"; \
     done < /w/upstream-images.list; \
     python3 /w/oci-add-erofs-image.py /oci-cache/oci-layout \

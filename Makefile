@@ -427,10 +427,12 @@ FORCE_BUILD=
 # Current entries:
 #   kube-images         — bakes runx-initrd (XENTOOLS_TAG) and the
 #                         kernel (KERNEL_TAG) into the payload via
-#                         Dockerfile.in placeholder substitution, AND
-#                         skopeo-pulls upstream refs that aren't
-#                         digest-pinned; neither is covered by the tag
-#                         hash, so bumping either serves a stale image.
+#                         Dockerfile.in placeholder substitution, which
+#                         the tag hash doesn't cover (the generated
+#                         Dockerfile is gitignored), so bumping either
+#                         serves a stale image. The upstream refs are
+#                         digest-pinned in the tracked list and no
+#                         longer force a rebuild.
 #
 # The list-driven mechanism below is used INSTEAD of the
 # target-specific `pkg/foo: FORCE_BUILD := --force` pattern —
@@ -1020,44 +1022,22 @@ pkg/kernel:
 # arbitrary values. Non-default combos need a direct --build-arg; left
 # at the intended default build.
 
-# Auto-derived catalog. Regenerated from the YAMLs / Go consts that
-# already pin the versions the running cluster consumes, so bumping
-# a KubeVirt / Longhorn / Multus / kube-vip / CDI version in the
-# manifest that actually deploys the pod is a one-file edit — the
-# JSON follows automatically. Committed for reviewability of the
-# resulting diff; kube-images-catalog-check re-derives and fails on
-# drift in CI.
-KUBE_IMAGES_CATALOG_INPUTS := \
-    pkg/kube/kubevirt-operator.yaml \
-    pkg/kube/multus-daemonset.yaml \
-    pkg/kube/kubevip-ds.yaml \
-    pkg/kube/kubevip-sa.yaml \
-    pkg/kube/kube-init/components/components.go \
-    pkg/kube/kube-init/versions/versions.go \
-    tools/kube-images-catalog-gen.py \
-    $(wildcard pkg/kube/lh-cfg-v*.yaml)
-
-pkg/kube-images/upstream-images.list: $(KUBE_IMAGES_CATALOG_INPUTS)
-	# Unique temp per shell: this Makefile sets -j unconditionally (see
-	# MAKEFLAGS above) and recursive sub-makes each resolve this target
-	# on their own, so two can run the rule at once. With a shared
-	# $@.tmp the first mv consumes it and the second fails with
-	# "cannot stat".
-	./tools/kube-images-catalog-gen.py > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
-
-pkg/kube-images: pkg/kube-images/upstream-images.list
-
-## Fail if pkg/kube-images/upstream-images.list drifts from what
-## tools/kube-images-catalog-gen.py would derive today. Intended for CI.
+## Fail if the name:tag part of pkg/kube-images/upstream-images.list
+## drifts from the versions the deploy YAMLs / Go consts pin (derived
+## by tools/kube-images-catalog-gen.py). The list itself is
+## hand-maintained — every ref carries a resolved @sha256 digest the
+## generator cannot derive offline — so this only verifies, never
+## regenerates. Intended for CI.
 .PHONY: kube-images-catalog-check
 kube-images-catalog-check:
 	@tmp=$$(mktemp) && trap "rm -f $$tmp" EXIT && \
 	./tools/kube-images-catalog-gen.py > $$tmp && \
-	if diff -u pkg/kube-images/upstream-images.list $$tmp; then \
+	if sed -e '/^#/d' -e '/^$$/d' -e 's/@sha256:[0-9a-f]*$$//' \
+	        pkg/kube-images/upstream-images.list | diff -u - $$tmp; then \
 	    echo "pkg/kube-images/upstream-images.list is in sync with sources"; \
 	else \
-	    echo "ERROR: catalog list is stale;" >&2; \
-	    echo "       regenerate with: rm -f pkg/kube-images/upstream-images.list && make pkg/kube-images/upstream-images.list" >&2; \
+	    echo "ERROR: upstream-images.list tags drifted from the deploy manifests;" >&2; \
+	    echo "       update the list (and re-resolve digests) per its header comment" >&2; \
 	    exit 1; \
 	fi
 pkg/%: eve-% FORCE

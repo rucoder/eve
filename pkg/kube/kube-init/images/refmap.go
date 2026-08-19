@@ -19,11 +19,15 @@ var refSanitizer = strings.NewReplacer("/", "_", ":", "_")
 // ref-name the build assigns in the layout.
 func sanitizeRef(realRef string) string { return refSanitizer.Replace(realRef) }
 
-// loadRefMap reads the shipped ref list (one real ref per line) and
-// returns sanitized -> real. A missing catalog is not an error: layouts
-// such as the external-boot-image erofs ship no catalog at all, and
-// their single image resolves via the eve-external-boot-image special
-// case instead.
+// loadRefMap reads the shipped ref list (one real ref per line,
+// optionally digest-pinned, '#' comments allowed) and returns
+// sanitized -> real. The @sha256 pin is stripped from both sides: the
+// build names layout images after the digest-less ref, and kubelet
+// resolves images by the name:tag the pod specs carry, never by the
+// pinned digest. A missing catalog is not an error: layouts such as
+// the external-boot-image erofs ship no catalog at all, and their
+// single image resolves via the eve-external-boot-image special case
+// instead.
 func loadRefMap(listPath string) (map[string]string, error) {
 	f, err := os.Open(listPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -37,9 +41,10 @@ func loadRefMap(listPath string) (map[string]string, error) {
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		ref := strings.TrimSpace(sc.Text())
-		if ref == "" {
+		if ref == "" || strings.HasPrefix(ref, "#") {
 			continue
 		}
+		ref, _, _ = strings.Cut(ref, "@")
 		m[sanitizeRef(ref)] = ref
 	}
 	return m, sc.Err()
