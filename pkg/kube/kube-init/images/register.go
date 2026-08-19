@@ -40,7 +40,7 @@ const externalBootLayoutRef = "eve-external-boot-image"
 // Must match snapshotter in pkg/kube/config-k3s.toml.
 const erofsSnapshotter = "erofs"
 
-// registerLayout registers every image in the mounted OCI layout into
+// registerLayout registers every image in the read-only OCI layout into
 // the k8s.io containerd namespace: content refs (metadata-only when the
 // blobs were staged into the store and the sharing policy is "shared";
 // a correct copy otherwise) plus image records named with the real

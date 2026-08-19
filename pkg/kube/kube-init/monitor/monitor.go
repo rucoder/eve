@@ -854,7 +854,7 @@ func (m *Monitor) reapplyNodeLabels(ctx context.Context) {
 // genuinely gone missing (e.g. after a containerd reset). Consulting
 // containerd directly makes this idempotent across restarts without a
 // persistent marker, and registration is metadata-only against the
-// mounted EROFS layout, so redoing the whole catalog copies no blobs.
+// read-only volume layout, so redoing the whole catalog copies no blobs.
 //
 // RT image re-imports are intentionally not handled in this
 // package; they belong with the RT-specific code path.

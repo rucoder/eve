@@ -1014,11 +1014,11 @@ pkg/kernel:
 # kube-images' --force is handled via LINUXKIT_FORCE_PKGS at the top
 # of this file, where the rationale is documented.
 
-# TODO(kube-images matrix): pkg/kube-images's LAYER_FORMAT /
-# EROFS_COMPRESSION Dockerfile ARGs (default uncompressed+lz4hc) aren't
-# selectable from make — the tree's build-arg mechanism (lk-extra-opt/%)
-# only passes boolean "VAR=y" flags, not arbitrary values. Non-default
-# combos need a direct --build-arg; left at the intended default build.
+# TODO(kube-images matrix): pkg/kube-images's LAYER_FORMAT Dockerfile
+# ARG (default erofs) isn't selectable from make — the tree's build-arg
+# mechanism (lk-extra-opt/%) only passes boolean "VAR=y" flags, not
+# arbitrary values. Non-default combos need a direct --build-arg; left
+# at the intended default build.
 
 # Auto-derived catalog. Regenerated from the YAMLs / Go consts that
 # already pin the versions the running cluster consumes, so bumping
