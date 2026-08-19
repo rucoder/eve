@@ -16,6 +16,7 @@ import (
 	ctrdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/lf-edge/eve/pkg/kube/kube-init/kubectlx"
@@ -32,15 +33,11 @@ func gcRefLabels(children []ocispec.Descriptor) map[string]string {
 	return labels
 }
 
-// externalBootLayoutRef is the ref-name the build assigns to the
-// EVE-authored external-boot-image inside the layout.
-const externalBootLayoutRef = "eve-external-boot-image"
-
 // erofsSnapshotter is the snapshotter kube-init pre-converts images into.
 // Must match snapshotter in pkg/kube/config-k3s.toml.
 const erofsSnapshotter = "erofs"
 
-// registerLayout registers every image in the mounted OCI layout into
+// registerLayout registers every image in the read-only OCI layout into
 // the k8s.io containerd namespace: content refs (metadata-only when the
 // blobs were staged into the store and the sharing policy is "shared";
 // a correct copy otherwise) plus image records named with the real
@@ -102,15 +99,9 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 	var registered, staged, unpacked int
 	var stageTotal time.Duration
 	for _, img := range imgs {
-		name := resolveName(img.RefName, refMap, externalBootRef)
+		name := refMap[img.RefName]
 		if name == "" {
-			if img.RefName == externalBootLayoutRef && externalBootRef == "" {
-				// Deliberate skip: external-boot-image is only registered
-				// when KubeVirt is enabled and a target ref is supplied.
-				log.Printf("kube-images: external-boot-image not requested (kubevirt disabled), skipping")
-			} else {
-				log.Printf("WARNING: no name mapping for %q, skipping", img.RefName)
-			}
+			log.Printf("WARNING: no name mapping for %q, skipping", img.RefName)
 			continue
 		}
 		if err := registerOne(ctx, cs, is, layoutDir, img, name); err != nil {
@@ -118,20 +109,6 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 			continue
 		}
 		registered++
-		// The external-boot-image must also be reachable as :latest.
-		// pillar's kubevirt hypervisor hardcodes that tag in every
-		// container-as-VM VMIRS (with imagePullPolicy: Never) precisely
-		// so the reference survives a baseOS upgrade, which prunes the
-		// versioned tag — see lf-edge/eve#6100. Registering only the
-		// versioned ref leaves virt-launcher wedged in ErrImageNeverPull.
-		if img.RefName == externalBootLayoutRef {
-			latestRef := ExternalBootImageName + ":latest"
-			if err := putImage(ctx, is, latestRef, img.Manifest); err != nil {
-				log.Printf("WARNING: alias %s -> %s: %v", name, latestRef, err)
-			} else {
-				log.Printf("kube-images: aliased %s as %s", name, latestRef)
-			}
-		}
 		// Make the layers available as erofs snapshots now, so the deploy
 		// waves find one ready at CreateContainer instead of unpacking
 		// under a CPU-constrained node past the CreateContainer deadline.
@@ -159,6 +136,17 @@ func registerLayout(ctx context.Context, socket, layoutDir, listPath, externalBo
 		log.Printf("kube-images: staged %s for %s in %s (%d/%d)",
 			name, erofsSnapshotter, d.Round(time.Millisecond), staged, len(imgs))
 	}
+	// The external-boot-image is not in the layout: it is EVE-authored
+	// and both its files already ship in the rootfs, so it is assembled
+	// and registered here on the device (see bootimage.go). Requested
+	// only when KubeVirt is enabled.
+	if externalBootRef != "" {
+		if err := registerExternalBoot(ctx, client, cs, is, externalBootRef); err != nil {
+			log.Printf("WARNING: external-boot-image: %v", err)
+		} else {
+			registered++
+		}
+	}
 	log.Printf("kube-images: registerLayout done: %d registered, %d staged "+
 		"(%d needed a copying unpack), stage-time %s, wall %s",
 		registered, staged, unpacked, stageTotal.Round(time.Second),
@@ -180,13 +168,31 @@ func blobKind(hex string) string {
 	return "regular"
 }
 
-// resolveName maps a layout ref-name to the real image ref. The
-// external-boot-image entry maps to externalBootRef (skipped if empty).
-func resolveName(refName string, refMap map[string]string, externalBootRef string) string {
-	if refName == externalBootLayoutRef {
-		return externalBootRef
+// setManifestRefs labels a manifest blob with
+// containerd.io/gc.ref.content.* entries naming its children (config +
+// layers). Without them GC can't see the manifest's children and reaps
+// every config/layer once our lease releases, leaving image records
+// whose content is incomplete.
+//
+// Set with an explicit Update rather than as WriteBlob options: WriteBlob
+// only passes its options down to Commit, and returns early without
+// calling it when the digest is already recorded in the metadata store --
+// which is the case for any blob already registered by an earlier image.
+// An Update applies either way and is idempotent.
+func setManifestRefs(ctx context.Context, cs content.Store,
+	manifest digest.Digest, children []ocispec.Descriptor) error {
+	labels := gcRefLabels(children)
+	fieldpaths := make([]string, 0, len(labels))
+	for k := range labels {
+		fieldpaths = append(fieldpaths, "labels."+k)
 	}
-	return refMap[refName]
+	if _, err := cs.Update(ctx, content.Info{
+		Digest: manifest,
+		Labels: labels,
+	}, fieldpaths...); err != nil {
+		return fmt.Errorf("label manifest with content refs: %w", err)
+	}
+	return nil
 }
 
 func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
@@ -220,26 +226,8 @@ func registerOne(ctx context.Context, cs content.Store, is ctrdimages.Store,
 			copied++
 		}
 	}
-	// The manifest carries containerd.io/gc.ref.content.* labels naming its
-	// config + layers. Without them GC can't see the manifest's children and
-	// reaps every config/layer once our lease releases, leaving image records
-	// whose content is incomplete.
-	//
-	// Set with an explicit Update rather than as WriteBlob options: WriteBlob
-	// only passes its options down to Commit, and returns early without
-	// calling it when the digest is already recorded in the metadata store --
-	// which is the case for any blob already registered by an earlier image.
-	// An Update applies either way and is idempotent.
-	labels := gcRefLabels(img.Blobs[1:])
-	fieldpaths := make([]string, 0, len(labels))
-	for k := range labels {
-		fieldpaths = append(fieldpaths, "labels."+k)
-	}
-	if _, err := cs.Update(ctx, content.Info{
-		Digest: img.Manifest.Digest,
-		Labels: labels,
-	}, fieldpaths...); err != nil {
-		return fmt.Errorf("label manifest with content refs: %w", err)
+	if err := setManifestRefs(ctx, cs, img.Manifest.Digest, img.Blobs[1:]); err != nil {
+		return err
 	}
 
 	if err := putImage(ctx, is, name, img.Manifest); err != nil {

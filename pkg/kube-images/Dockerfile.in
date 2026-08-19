@@ -1,40 +1,28 @@
 # Copyright (c) 2026 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Read-only payload volume that ships the container images kube-init
-# needs at first boot: the upstream images (KubeVirt, CDI, Longhorn,
-# Multus, kube-vip) plus one EVE-authored image, external-boot-image,
-# assembled here from the kernel and runx-initrd rather than pulled.
+# Read-only payload volume that ships the upstream container images
+# kube-init needs at first boot: KubeVirt, CDI, Longhorn, Multus and
+# kube-vip. (The EVE-authored external-boot-image is not in here — it
+# is assembled on the device by kube-init from the kernel and
+# runx-initrd already present in the rootfs, see
+# pkg/kube/kube-init/images/bootimage.go — which keeps this package
+# independent of the kernel and xen-tools tags.)
 #
-# The payload is a single self-contained EROFS image
-# (kube-images.erofs) holding a standard OCI image layout. At boot
-# the linuxkit rootfs binds this container's / at /images inside the
-# kube container (see images/modifiers/hv/k.yq), and kube-init mounts
-# /images/kube-images.erofs read-only with `mount -t erofs` — no loop
-# device (CONFIG_EROFS_FS_BACKED_BY_FILE) — exposing the OCI layout so
-# it can register the images with the k3s user-containerd without a
-# network pull.
+# The payload is a standard OCI image layout (index.json, oci-layout,
+# blobs/sha256/*) shipped as plain files: linuxkit unpacks volume
+# images into the rootfs, and the rootfs binds this container's / at
+# /images inside the kube container (see images/modifiers/hv/k.yq), so
+# kube-init reads the layout there directly and registers the images
+# with the k3s user-containerd without a network pull. No wrapper
+# filesystem and no mount step on the device — the rootfs (squashfs-xz)
+# compresses the payload as-is.
 #
-# Self-contained: the blobs live inside the image, so the runtime needs
-# only a plain `mount -t erofs` and no helper on the device. LAYER_FORMAT=erofs (the default) converts every
-# layer to a ready-made EROFS filesystem here, on the build host, so the
-# device places blobs instead of running mkfs.erofs per layer on its
-# single dom0 vCPU — see .claude/design/kube-images-zero-import.md.
+# LAYER_FORMAT=erofs (the default) converts every layer to a ready-made
+# EROFS filesystem here, on the build host, so the device places blobs
+# instead of running mkfs.erofs per layer on its single dom0 vCPU.
 # LAYER_FORMAT=uncompressed keeps the previous behaviour (plain tar
 # layers, converted on the device) as the fallback.
-#
-# external-boot-image supplies the kernel + initrd KubeVirt's
-# kernelBoot feature boots container-as-VM apps from; KubeVirt's API
-# only accepts a container image there, never host paths, so those two
-# files have to reach the node as an OCI image. They are taken
-# straight from the kernel and xen-tools packages below and packed as
-# a one-layer EROFS image (oci-add-erofs-image.py) — no separate
-# linuxkit package, no docker-archive tar, and nothing for the device
-# to convert. See .claude/design/kube-images-zero-import.md.
-#
-# Declare the two passthrough stages BEFORE `build` so the RUN/COPY
-# commands below execute inside `build` and not inside a passthrough
-# stage (the same trap documented in pkg/kube/Dockerfile).
 
 # The kube container is the source of the PATCHED mkfs.erofs (erofs-utils
 # 1.9.2 + the usr-merge symlink fix). It cannot move here and out of
@@ -42,31 +30,21 @@
 # plugin init and skips itself without it, and the device still converts
 # every image that is NOT pre-packaged (user app images). Copying the
 # binary means the build host converts with exactly the device's converter.
+# Declare this passthrough stage BEFORE `build` so the RUN/COPY commands
+# below execute inside `build` (the trap documented in pkg/kube/Dockerfile).
 # hadolint ignore=DL3006
 FROM KUBE_TAG AS kube
-
-# hadolint ignore=DL3006
-FROM XENTOOLS_TAG AS xen-tools
-# hadolint ignore=DL3006
-FROM KERNEL_TAG AS kernel-src
 
 # hadolint ignore=DL3007
 FROM alpine:3.22 AS build
 
 ARG TARGETARCH
 ARG LAYER_FORMAT=erofs
-# Compression of the payload itself. Alpine's erofs-utils supports
-# lz4/lz4hc only (no zstd); the kernel decodes lz4 via
-# CONFIG_EROFS_FS_ZIP. Value is passed straight to mkfs.erofs -z<algo>;
-# "none" builds an uncompressed filesystem. Empty (the default) picks
-# per LAYER_FORMAT below.
-ARG EROFS_COMPRESSION=
 
-# skopeo pulls the upstream images; python3 runs the layer rewrite and
-# builds the external-boot-image layer; erofs-utils brings the runtime
-# libs mkfs.erofs needs (lz4, xz, zlib, uuid) — the binary itself is
-# replaced by the patched one below. All discarded — only /out survives
-# into the final stage.
+# skopeo pulls the upstream images; python3 runs the layer rewrite;
+# erofs-utils brings the runtime libs mkfs.erofs needs (lz4, xz, zlib,
+# uuid) — the binary itself is replaced by the patched one below. All
+# discarded — only /out survives into the final stage.
 # hadolint ignore=DL3018
 RUN apk add --no-cache skopeo erofs-utils python3
 
@@ -80,26 +58,16 @@ RUN mkfs.erofs --version
 WORKDIR /w
 COPY upstream-images.list /w/upstream-images.list
 COPY oci-rewrite-layers.py /w/oci-rewrite-layers.py
-COPY oci-add-erofs-image.py /w/oci-add-erofs-image.py
 
-# The two files external-boot-image consists of, at the paths pillar's
-# VMIRS references them by (kernelPath /kernel, initrdPath /runx-initrd).
-# Mode 0666: KubeVirt runs the container-disk container as non-root.
-COPY --from=xen-tools --chmod=666 /usr/lib/xen/boot/runx-initrd /w/ebi/runx-initrd
-COPY --from=kernel-src --chmod=666 /kernel /w/ebi/kernel
-
-# Assemble a shared OCI image layout, then pack it into one EROFS
-# image:
-#   1) skopeo copy every upstream ref from the generated list into a
+# Assemble a shared OCI image layout:
+#   1) skopeo copy every upstream ref from the pinned list into a
 #      single OCI layout (skopeo dedups blobs by digest within it).
 #      skopeo sync can't target an OCI layout (docker/dir only), so
 #      this is a copy per ref.
-#   2) add external-boot-image as a one-layer native-EROFS image built
-#      from /w/ebi (no registry, no tar).
-#   3) rewrite every layer per LAYER_FORMAT: to EROFS (default, so the
+#   2) rewrite every layer per LAYER_FORMAT: to EROFS (default, so the
 #      device places them) or to plain tar.
-#   4) mkfs.erofs the layout dir into a self-contained image, with
-#      EROFS_COMPRESSION selecting the -z<algo> or none.
+#   3) copy the layout out of the cache mount — /out is what survives
+#      into the final stage, as plain files.
 #
 # BuildKit's --mount=type=cache persists /oci-cache across rebuilds,
 # so bumping one image only re-pulls that image.
@@ -107,31 +75,27 @@ RUN --mount=type=cache,target=/oci-cache \
     set -eu; \
     mkdir -p /oci-cache/oci-layout /out; \
     while read -r ref; do \
-        [ -n "$ref" ] || continue; \
-        dest=$(printf '%s' "$ref" | tr '/:' '__'); \
-        echo "[skopeo] $ref"; \
+        case "$ref" in ''|'#'*) continue;; esac; \
+        # Pull strictly by the pinned digest (skopeo rejects tag@digest
+        # refs); name the layout image after the digest-less name:tag,
+        # which is what kube-init (refmap.go) and kubelet's pod specs
+        # resolve by.
+        name="${ref%%@*}"; \
+        pull="$ref"; \
+        case "$ref" in *@*) pull="${name%:*}@${ref#*@}";; esac; \
+        dest=$(printf '%s' "$name" | tr '/:' '__'); \
+        echo "[skopeo] $name ($pull)"; \
         skopeo copy --preserve-digests \
-            "docker://$ref" \
+            "docker://$pull" \
             "oci:/oci-cache/oci-layout:$dest"; \
     done < /w/upstream-images.list; \
-    python3 /w/oci-add-erofs-image.py /oci-cache/oci-layout \
-        eve-external-boot-image /w/ebi --arch "$TARGETARCH"; \
     # Ship the real-name ref list inside the image so kube-init can
     # map skopeo's sanitised OCI ref names back to the registry refs
-    # kubelet expects (see loadRefMap/resolveName in kube-init).
+    # kubelet expects (see loadRefMap in kube-init).
     cp /w/upstream-images.list /oci-cache/oci-layout/upstream-images.list; \
     echo "[rewrite] layers -> $LAYER_FORMAT"; \
     python3 /w/oci-rewrite-layers.py /oci-cache/oci-layout --format "$LAYER_FORMAT"; \
-    if [ -z "$EROFS_COMPRESSION" ]; then \
-        # erofs-format layers are lz4hc already: compressing the payload
-        # over them wins no space and costs a second decompression on
-        # every read. Tar layers do benefit, so keep lz4hc for those.
-        if [ "$LAYER_FORMAT" = erofs ]; then EROFS_COMPRESSION=none; \
-        else EROFS_COMPRESSION=lz4hc; fi; \
-    fi; \
-    z=""; [ "$EROFS_COMPRESSION" = none ] || z="-z$EROFS_COMPRESSION"; \
-    echo "[mkfs.erofs] kube-images.erofs ($LAYER_FORMAT, ${EROFS_COMPRESSION})"; \
-    mkfs.erofs $z /out/kube-images.erofs /oci-cache/oci-layout
+    cp -a /oci-cache/oci-layout/. /out/
 
 FROM scratch
-COPY --from=build /out/kube-images.erofs /
+COPY --from=build /out/ /

@@ -13,13 +13,15 @@ fully-qualified image references, one per line:
     quay.io/kubevirt/virt-operator:v1.7.3
     ...
 
-pkg/kube-images/Dockerfile loops over this file, `skopeo copy`-ing
-each ref into a shared OCI image layout that mkfs.erofs then turns
-into the kube-images payload.
+pkg/kube-images/Dockerfile loops over that file, `skopeo copy`-ing
+each ref into the shared OCI image layout that becomes the
+kube-images payload.
 
-The file is committed for reviewability; the Makefile regenerates
-it whenever any of its inputs change and `make
-kube-images-catalog-check` re-derives + diffs so CI catches drift.
+The committed list is hand-maintained: every ref additionally carries
+a resolved @sha256 index digest, which this generator cannot derive
+offline. `make kube-images-catalog-check` therefore only verifies the
+name:tag part of each line against this derivation, so CI catches a
+version bump in the deploy manifests that the list missed.
 
 Sources of truth per family:
 
@@ -48,10 +50,10 @@ Sources of truth per family:
 
 Deliberately NOT in the list:
 
-  * external-boot-image (EVE-authored) — pulled from the local
-    linuxkit cache, not a registry. Its docker-archive tar is folded
-    into pkg/kube-images's erofs at build time, and kube-init names it
-    via a special case, so it needs no entry in this catalog.
+  * external-boot-image (EVE-authored) — not pulled at all: kube-init
+    assembles and registers it on the device from the kernel and
+    runx-initrd already in the rootfs (see
+    pkg/kube/kube-init/images/bootimage.go).
 
   * descheduler, system-upgrade-controller, alpine — no local
     source of truth on this branch. They land upstream when

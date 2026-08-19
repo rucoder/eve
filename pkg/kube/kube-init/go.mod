@@ -5,6 +5,7 @@ go 1.25.12
 require (
 	github.com/containerd/containerd/v2 v2.2.5
 	github.com/containerd/errdefs v1.0.0
+	github.com/google/uuid v1.6.0
 	github.com/lf-edge/eve/pkg/pillar v0.0.0-20260723060853-d8f4dcef88b3
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
@@ -78,7 +79,6 @@ require (
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-containerregistry v0.20.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
