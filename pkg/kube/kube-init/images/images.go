@@ -6,10 +6,11 @@
 // network pull and without copying gigabytes of layer blobs onto
 // /persist.
 //
-// The images ship as a standard OCI image layout (index.json,
-// oci-layout, blobs/sha256/*) of every pre-packaged image (the upstream
-// images plus the EVE-authored external-boot-image folded in at build
-// time). The linuxkit rootfs binds the eve-kube-images volume at
+// The upstream images (KubeVirt, CDI, Longhorn, Multus, kube-vip) ship
+// as a standard OCI image layout (index.json, oci-layout,
+// blobs/sha256/*); the EVE-authored external-boot-image is instead
+// assembled on the device from rootfs content (bootimage.go) and
+// registered alongside them. The linuxkit rootfs binds the eve-kube-images volume at
 // /images inside the kube container (images/modifiers/hv/k.yq), so the
 // layout is directly readable there for the life of every boot — no
 // mount step. At the IMPORTING phase kube-init:

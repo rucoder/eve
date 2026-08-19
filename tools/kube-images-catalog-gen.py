@@ -50,10 +50,10 @@ Sources of truth per family:
 
 Deliberately NOT in the list:
 
-  * external-boot-image (EVE-authored) — pulled from the local
-    linuxkit cache, not a registry. Its docker-archive tar is folded
-    into pkg/kube-images's erofs at build time, and kube-init names it
-    via a special case, so it needs no entry in this catalog.
+  * external-boot-image (EVE-authored) — not pulled at all: kube-init
+    assembles and registers it on the device from the kernel and
+    runx-initrd already in the rootfs (see
+    pkg/kube/kube-init/images/bootimage.go).
 
   * descheduler, system-upgrade-controller, alpine — no local
     source of truth on this branch. They land upstream when

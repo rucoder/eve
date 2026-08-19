@@ -425,14 +425,13 @@ FORCE_BUILD=
 # runtime content has changed.
 #
 # Current entries:
-#   kube-images         — bakes runx-initrd (XENTOOLS_TAG) and the
-#                         kernel (KERNEL_TAG) into the payload via
-#                         Dockerfile.in placeholder substitution, which
-#                         the tag hash doesn't cover (the generated
-#                         Dockerfile is gitignored), so bumping either
-#                         serves a stale image. The upstream refs are
-#                         digest-pinned in the tracked list and no
-#                         longer force a rebuild.
+#   kube-images         — copies the patched mkfs.erofs out of the kube
+#                         container (KUBE_TAG substitution in the
+#                         gitignored generated Dockerfile), so an
+#                         erofs-utils change in pkg/kube would serve a
+#                         stale payload without --force. The upstream
+#                         refs are digest-pinned in the tracked list
+#                         and don't force a rebuild.
 #
 # The list-driven mechanism below is used INSTEAD of the
 # target-specific `pkg/foo: FORCE_BUILD := --force` pattern —
@@ -1005,13 +1004,6 @@ $(LIVE).parallels: $(LIVE).raw
 pkgs: RESCAN_DEPS=
 pkgs: $(LINUXKIT) $(PKGS) $(LK_POSSIBLE_BUILD_ARG_TARGETS)
 	@echo Done building packages
-
-# No-op target for get-deps which looks at kube-images, sees a dep
-# for eve-kernel (it COPYs the kernel into the external-boot-image
-# layer) and attempts to build pkg/kernel, which lives in
-# lf-edge/eve-kernel and is not built here.
-pkg/kernel:
-	$(QUIET): $@: No-op pkg/kernel
 
 # kube-images' --force is handled via LINUXKIT_FORCE_PKGS at the top
 # of this file, where the rationale is documented.

@@ -123,10 +123,9 @@ COPY multus-daemonset.yaml /etc
 COPY kubevirt-operator.yaml /etc
 COPY kubevirt-features.yaml /etc
 
-# external-boot-image no longer lives in the kube container; it is
-# now part of the pkg/kube-images composefs payload (see
-# .claude/design/kube-images-composefs.md). kube-init reads it via
-# the same catalog that carries the upstream images.
+# external-boot-image no longer lives in the kube container: kube-init
+# assembles and registers it on the device from the kernel and
+# runx-initrd already in the rootfs (images/bootimage.go).
 
 # Longhorn config
 COPY lh-cfg-v1.9.1.yaml /etc/
