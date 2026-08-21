@@ -1,0 +1,11 @@
+# linuxkit build template
+#
+# Copyright (c) 2026 Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+org: lfedge
+image: eve-nvidia-dgpu
+# apt-get and the deb downloads run inside RUN, which has no network in a
+# linuxkit build unless declared here (pkg/alpine, pkg/kube-images and others do
+# the same). pkg/nvidia avoids this by using ADD for its tarball instead.
+network: true

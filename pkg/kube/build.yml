@@ -15,6 +15,18 @@ config:
     - /persist:/persist:rshared,rbind
     - /sys/fs/cgroup:/sys/fs/cgroup
     - /opt/vendor:/opt/vendor:ro
+    # The k3s containerd runs in this container and launches
+    # /opt/vendor/nvidia/bin/nvidia-container-runtime, a glibc binary.
+    # Without the host glibc runtime here it never execs, and containerd
+    # can only report "unable to retrieve OCI runtime error" because the
+    # runtime produced no log at all. Alpine has neither of these paths.
+    - /usr/lib64:/lib64:ro
+    - /usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro
+    # The generated CDI spec lists the GSP firmware as a mount, and runc
+    # performs that mount from inside this container, so the blobs must be
+    # visible here or every GPU container fails to start with
+    # "failed to fulfil mount request". pkg/pillar binds this already.
+    - /lib/firmware:/lib/firmware
   capabilities:
     - all
   pid: host

@@ -17,6 +17,13 @@ config:
     - /persist:/persist:rshared,rbind
     - /usr/bin/containerd:/usr/bin/containerd
     - /opt/vendor:/opt/vendor:ro
+    # NVIDIA's userland under /opt/vendor is glibc, but pillar's container is
+    # musl and ships no glibc loader, so device-steps.sh could not exec those
+    # binaries at all. Alpine has neither of these paths, so binding the
+    # host's glibc runtime in is collision-free. /lib64 is the ELF interpreter
+    # path baked into those binaries; it is a symlink to usr/lib64 on the host.
+    - /usr/lib64:/lib64:ro
+    - /usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro
     # Expose host firmware for Wi-Fi drivers that defer firmware loading
     # until first interface use, from within the container context.
     - /lib/firmware:/lib/firmware
