@@ -1645,6 +1645,13 @@ func (d *daemon) workConfigure(workCtx context.Context) error {
 	if err := prereqs.CopyCNIPlugins(); err != nil {
 		log.Printf("WARNING: CNI plugin copy: %v", err)
 	}
+	// Staged here, not only in StateDeploying: that state is reached on
+	// first boot alone ("k3s-ready/skip-deploy" otherwise), so a base OS
+	// upgrade that adds a manifest would never apply it. CopyManifests is
+	// idempotent, so running it on both paths is safe.
+	if err := components.CopyManifests(); err != nil {
+		log.Printf("WARNING: stage manifests: %v", err)
+	}
 	return nil
 }
 

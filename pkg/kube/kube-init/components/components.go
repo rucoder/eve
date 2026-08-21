@@ -93,6 +93,7 @@ const (
 	longhornReadyCeiling = 90 * time.Minute
 
 	nvidiaVendorDir = "/opt/vendor/nvidia"
+	sysfsPciDevices = "/sys/bus/pci/devices"
 
 	// Multus readiness identity. The DaemonSet's pods write
 	// 00-multus.conf into k3s's CNI dir; because 00- sorts first that
@@ -752,19 +753,58 @@ func EnsureStorageClasses() error {
 	return nil
 }
 
-// copyOptionalNvidiaManifest stages the NVIDIA device-plugin
-// manifest into the auto-deploy dir on hardware that exposes
-// /opt/vendor/nvidia. ENOENT on either the vendor dir or the
-// manifest is a no-op (no NVIDIA hardware / minimal build). A
-// copy failure on hardware that does have the vendor dir IS
-// surfaced — silent failure means GPUs are invisible to k8s
-// and the misconfiguration is undiagnosable from the daemon log.
+// hasNvidiaGPU reports whether any PCI device has NVIDIA's vendor ID.
+// The device plugin cannot start without a GPU: its discovery strategy
+// finds neither NVML nor Tegra and it exits with "invalid device
+// discovery strategy", crash-looping forever. Its own log says as much
+// ("If this is not a GPU node, you should set up a toleration or
+// nodeSelector to only deploy this plugin on GPU nodes").
+//
+// A missing or unreadable sysfs is treated as "no GPU": staging a
+// manifest that is guaranteed to crash-loop is worse than skipping it.
+func hasNvidiaGPU() bool {
+	const nvidiaPCIVendor = "0x10de"
+	entries, err := os.ReadDir(sysfsPciDevices)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		v, err := os.ReadFile(filepath.Join(sysfsPciDevices, e.Name(), "vendor"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(v)) == nvidiaPCIVendor {
+			return true
+		}
+	}
+	return false
+}
+
+// copyOptionalNvidiaManifest stages the NVIDIA device-plugin manifest
+// into the auto-deploy dir, but only on a node that actually has an
+// NVIDIA GPU.
+//
+// Both conditions matter. /opt/vendor/nvidia carries the userland the
+// plugin needs, but it ships on every ai-generic image regardless of
+// hardware, so it alone is not evidence of a GPU — that was safe when
+// the vendor dir only existed on nvidia-jp* (Jetson) images, which are
+// always GPU hardware, and stopped being safe once ai-generic made it a
+// platform package.
+//
+// ENOENT on the vendor dir or the manifest is a no-op (minimal build).
+// A copy failure on a node that has both a GPU and the vendor dir IS
+// surfaced — silent failure means GPUs are invisible to k8s and the
+// misconfiguration is undiagnosable from the daemon log.
 func copyOptionalNvidiaManifest() error {
 	if _, err := os.Stat(nvidiaVendorDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("stat %s: %w", nvidiaVendorDir, err)
+	}
+	if !hasNvidiaGPU() {
+		log.Printf("no NVIDIA GPU present, skipping device plugin manifest")
+		return nil
 	}
 	nvSrc := filepath.Join(manifestsSrc, "nvidia-device-plugin-18.0.yml")
 	nvDst := filepath.Join(manifestsDst, "nvidia-device-plugin-18.0.yml")
