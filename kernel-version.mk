@@ -19,7 +19,7 @@ KERNEL_COMPILER=gcc
 # by default the flavor is empty to keep compatibility with the old EVE version
 KERNEL_CONFIG_FLAVOR ?=
 
-PLATFORMS_amd64=generic rt
+PLATFORMS_amd64=generic rt ai-generic
 PLATFORMS_arm64=generic nvidia-jp5 nvidia-jp6 nvidia-jp7 imx8mp_pollux imx8mp_epc_r3720 imx8mq_evk
 PLATFORMS_riscv64=generic
 ARCHS=amd64 arm64 riscv64
@@ -35,12 +35,18 @@ ifeq (, $(filter $(PLATFORM), $(PLATFORMS_$(ZARCH))))
 endif
 
 ifeq ($(ZARCH), amd64)
-    KERNEL_VERSION=v6.12.96
-    KERNEL_FLAVOR=generic
-    ifeq ($(PLATFORM), rt)
-        KERNEL_CONFIG_FLAVOR=rt
+    ifeq ($(PLATFORM), ai-generic)
+        KERNEL_VERSION=v6.18.35
+        KERNEL_FLAVOR=generic
+        KERNEL_CONFIG_FLAVOR=hwe
     else
-        KERNEL_CONFIG_FLAVOR=core
+        KERNEL_VERSION=v6.12.96
+        KERNEL_FLAVOR=generic
+        ifeq ($(PLATFORM), rt)
+            KERNEL_CONFIG_FLAVOR=rt
+        else
+            KERNEL_CONFIG_FLAVOR=core
+        endif
     endif
 else ifeq ($(ZARCH), arm64)
     ifeq (, $(findstring nvidia,$(PLATFORM)))

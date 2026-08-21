@@ -480,12 +480,23 @@ endif
 # and NVIDIA based platforms, and 290MB for x86_64 and other arm64 platforms. That helps in catching image size
 # increases earlier than at later stage.
 # We are currently filtering out a few packages from bulk builds since they are not getting published in Docker HUB
+# HV=k bulk-builds every directory under pkg/, so packages that only apply to one
+# platform get built for all of them. Exclude the ones that cannot apply: pkg/nvidia
+# is Jetson/L4T (arm64 Tegra) and is meaningless on ai-generic, while pkg/nvidia-dgpu
+# and pkg/glibc exist only for ai-generic. Anchored with $$ so pkg/nvidia-dgpu is not
+# caught by the pkg/nvidia pattern.
+ifeq ($(PLATFORM),ai-generic)
+        PKG_EXCLUDE=eve|alpine|sources$$|nvidia$$
+else
+        PKG_EXCLUDE=eve|alpine|sources$$|nvidia-dgpu$$|glibc$$
+endif
+
 ifeq ($(HV),k)
-        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources$$")
+        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "$(PKG_EXCLUDE)")
         ROOTFS_MAXSIZE_MB=10240
 else
         #kube container will not be in non-k builds
-        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube(-images)?$$")
+        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "$(PKG_EXCLUDE)|kube(-images)?$$")
         # nvidia platform requires more space
         ifeq (, $(findstring nvidia,$(PLATFORM)))
             ROOTFS_MAXSIZE_MB=290
