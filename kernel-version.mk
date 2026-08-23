@@ -38,7 +38,7 @@ ifeq ($(ZARCH), amd64)
     ifeq ($(PLATFORM), ai-generic)
         KERNEL_VERSION=v6.18.35
         KERNEL_FLAVOR=generic
-        KERNEL_CONFIG_FLAVOR=hwe
+        KERNEL_CONFIG_FLAVOR=ai
     else
         KERNEL_VERSION=v6.12.96
         KERNEL_FLAVOR=generic
