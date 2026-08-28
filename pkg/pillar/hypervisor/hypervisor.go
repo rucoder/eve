@@ -190,6 +190,13 @@ func PCIReserveGeneric(long string) error {
 		}
 	}
 
+	// Stop an Intel iGPU scanning out of stolen memory before vfio-pci takes
+	// it, while the device still has no driver and its BARs are reachable.
+	// Best-effort: a device we cannot quiesce is still one we pass through.
+	if err := igpuDisableDisplayPlanes(long); err != nil {
+		logrus.Warnf("could not quiesce display engine of %s: %v", long, err)
+	}
+
 	if err := os.WriteFile(sysfsPciDriversProbe, []byte(long), 0644); err != nil {
 		return logError("drivers_probe failure for PCI device %s: %v",
 			long, err)
