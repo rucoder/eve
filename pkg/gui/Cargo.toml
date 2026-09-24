@@ -34,6 +34,20 @@ anyhow = "1"
 log = "0.4"
 libc = "0.2"
 
+# Pillar's monitor contract: the generated types and the framed client copied
+# from pkg/monitor.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = { version = "3", features = ["base64"] }
+serde_repr = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+ipnet = { version = "2", features = ["serde", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+macaddr = { version = "1", features = ["serde"] }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+
 # QEMU's D-Bus display is a peer-to-peer connection over a socket QEMU itself
 # authenticates, so no bus daemon and no session bus are involved.
 zbus = { version = "5", default-features = false, features = [

@@ -13,6 +13,7 @@
 mod drm;
 mod guest;
 mod input;
+mod ipc;
 mod logger;
 mod qmp;
 mod scanout;
