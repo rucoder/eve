@@ -15,6 +15,7 @@ package monitor
 import (
 	"net"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,15 +49,27 @@ func deviceStatusToContract(server string, ob types.OnboardingStatus, enInfo typ
 	}
 }
 
+// kvmQmpSocket mirrors hypervisor.GetQmpExecutorSocket, which is not used
+// directly because importing hypervisor here would pull kvm, xen and
+// containerd into an agent that is deliberately dependency-lean. Keep in step
+// with kvmStateDir in hypervisor/kvm.go.
+func kvmQmpSocket(domainName string) string {
+	if domainName == "" {
+		return ""
+	}
+	return filepath.Join("/run/hypervisor/kvm", domainName, "qmp")
+}
+
 func appsListToContract(apps []types.AppInstanceStatus) monitorapi.AppsList {
 	out := monitorapi.AppsList{Instances: make([]monitorapi.AppInstance, 0, len(apps))}
 	for _, a := range apps {
 		out.Instances = append(out.Instances, monitorapi.AppInstance{
-			UUID:    a.UUIDandVersion.UUID,
-			Name:    a.DisplayName,
-			Version: a.UUIDandVersion.Version,
-			State:   swStateToContract(a.State),
-			Error:   a.ErrorAndTimeWithSource.Error,
+			UUID:      a.UUIDandVersion.UUID,
+			Name:      a.DisplayName,
+			Version:   a.UUIDandVersion.Version,
+			State:     swStateToContract(a.State),
+			Error:     a.ErrorAndTimeWithSource.Error,
+			QMPSocket: kvmQmpSocket(a.DomainName),
 		})
 	}
 	return out
