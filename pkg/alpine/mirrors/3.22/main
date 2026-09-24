@@ -345,6 +345,8 @@ libeconf
 libedit
 libedit-dev
 libelf
+libepoxy
+libepoxy-dev
 libestr
 libestr-dev
 libev
@@ -469,10 +471,13 @@ libxrandr-dev
 libxrender
 libxrender-dev
 libxshmfence
+libxshmfence-dev
 libxslt
 libxtables
 libxtst
 libxtst-dev
+libxxf86vm
+libxxf86vm-dev
 libxxhash
 linux-headers
 linux-pam
@@ -505,10 +510,13 @@ m4
 make
 mdev-conf
 mesa
+mesa-dev
 mesa-dri-gallium
 mesa-egl
 mesa-gbm
+mesa-gl
 mesa-gles
+mesa-xatracker
 meson
 mkinitfs
 mpc1

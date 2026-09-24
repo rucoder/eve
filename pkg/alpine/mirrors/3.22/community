@@ -71,4 +71,6 @@ tpm2-tss-tcti-spi-helper
 tpm2-tss-tcti-swtpm
 tpm2-tss-tctildr
 vde2-libs
+virglrenderer
+virglrenderer-dev
 yq-go

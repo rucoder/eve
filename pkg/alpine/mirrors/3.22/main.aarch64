@@ -1,7 +1,12 @@
 binutils-gold
+clang20-headers
+clang20-libs
 gcc-gdc
 gcc-gnat
+libclc
 libgnat
 libgnat-static
+mesa-rusticl
+spirv-llvm-translator-libs
 spirv-tools
 xen-libs
