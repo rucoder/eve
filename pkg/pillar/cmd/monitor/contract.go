@@ -15,6 +15,7 @@ package monitor
 import (
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -53,11 +54,21 @@ func deviceStatusToContract(server string, ob types.OnboardingStatus, enInfo typ
 // directly because importing hypervisor here would pull kvm, xen and
 // containerd into an agent that is deliberately dependency-lean. Keep in step
 // with kvmStateDir in hypervisor/kvm.go.
+//
+// The path is reported only if it exists. A name alone says nothing about
+// whether the instance has a monitor to reach: under Xen there is none, and a
+// container's shim VM has no display behind it. Reporting one regardless would
+// have the console dial a socket that can never answer, for every app, for the
+// life of the device.
 func kvmQmpSocket(domainName string) string {
 	if domainName == "" {
 		return ""
 	}
-	return filepath.Join("/run/hypervisor/kvm", domainName, "qmp")
+	sock := filepath.Join("/run/hypervisor/kvm", domainName, "qmp")
+	if _, err := os.Stat(sock); err != nil {
+		return ""
+	}
+	return sock
 }
 
 func appsListToContract(apps []types.AppInstanceStatus) monitorapi.AppsList {

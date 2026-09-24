@@ -746,6 +746,13 @@ type KvmContext struct {
 	dmCPUArgs    []string
 	dmFmlCPUArgs []string
 	capabilities *types.Capabilities
+	// virtualGPU records, once at startup, whether this device can back a
+	// guest GPU with host GL. The display flags and the video device must
+	// agree: a GL video device with -display none fails to realize, and a
+	// D-Bus display with gl=on fails to start where the render node has
+	// gone. Deciding it twice - once here, once per domain - let the two
+	// disagree whenever the render node appeared or vanished in between.
+	virtualGPU bool
 }
 
 func newKvm() Hypervisor {
@@ -764,18 +771,25 @@ func newKvm() Hypervisor {
 			ctrdContext:  *ctrdCtx,
 			devicemodel:  "virt",
 			dmExec:       "/usr/lib/xen/bin/qemu-system-aarch64",
-			dmArgs:       []string{"-display", "none", "-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0"},
+			dmArgs:       []string{"-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0"},
 			dmCPUArgs:    []string{"-cpu", "host"},
 			dmFmlCPUArgs: []string{"-cpu", "host"},
+			// The graphical console is amd64-only for now, so arm64 keeps
+			// -display none. virtualGPU must stay false to match it: a
+			// virtio-gpu-gl-pci against -display none stops every VM on the
+			// device from starting.
+			virtualGPU: false,
 		}
 	case "amd64":
+		gpu := hostHasRenderNode()
 		return KvmContext{
 			ctrdContext:  *ctrdCtx,
 			devicemodel:  "pc-q35-3.1",
 			dmExec:       "/usr/lib/xen/bin/qemu-system-x86_64",
-			dmArgs:       append(displayArgs(), "-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0", "-machine", "hpet=off"),
+			dmArgs:       []string{"-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0", "-machine", "hpet=off"},
 			dmCPUArgs:    []string{"-cpu", "host"},
 			dmFmlCPUArgs: []string{"-cpu", "host,hv_time,hv_relaxed,hv_vendor_id=eveitis,hypervisor=off,kvm=off,vmx=off"},
+			virtualGPU:   gpu,
 		}
 	}
 	return nil
@@ -934,7 +948,12 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 		return logError("failed to build domain config: %v", err)
 	}
 
-	dmArgs := ctx.dmArgs
+	// Copy: appending to ctx.dmArgs in place would let one domain's flags
+	// leak into the next.
+	dmArgs := append([]string{}, ctx.dmArgs...)
+	// The display must match the video device the domain config just asked
+	// for, so both come from the same call.
+	dmArgs = append(dmArgs, displayArgs(ctx.virtualGPUFor(config, status))...)
 	if config.VirtualizationMode == types.FML {
 		dmArgs = append(dmArgs, ctx.dmFmlCPUArgs...)
 	} else {
@@ -1800,7 +1819,7 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		EFIDebug:               efiDebug,
 		DumpGuestCore:          dumpGuestCore,
 		HasIntelIGPU:           hasIntelIGPU,
-		VirtualGPU:             hostHasRenderNode(),
+		VirtualGPU:             ctx.virtualGPUFor(config, status),
 		IgpuLpcDeviceID:        igpuLpcID,
 		DomainConfig:           config,
 		DomainStatus:           status,
@@ -2279,6 +2298,19 @@ func usbBusPort(USBAddr string) (string, string) {
 	return "", ""
 }
 
+// virtualGPUFor reports whether this domain gets a GL-backed virtual GPU.
+//
+// A shim VM running an OCI container has no framebuffer anyone wants to look
+// at, and giving each one a virgl context would have a device with twenty
+// container apps holding twenty EGL contexts against one iGPU. It still gets a
+// video device when VNC is explicitly enabled for it.
+func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, status types.DomainStatus) bool {
+	if !ctx.virtualGPU {
+		return false
+	}
+	return status.OCIConfigDir == "" || config.EnableVnc
+}
+
 // renderNode is the DRM render node QEMU uses to back a guest's virtual GPU
 // with host GL. Only present on a device with a usable GPU.
 const renderNode = "/dev/dri/renderD128"
@@ -2290,12 +2322,17 @@ func hostHasRenderNode() bool {
 	return err == nil
 }
 
-// displayArgs selects QEMU's display backend. The graphical console reads guest
-// framebuffers over the D-Bus display in peer-to-peer mode, which needs no bus
-// daemon. Where there is no render node, gl=on would stop QEMU from starting at
-// all, so such devices keep the previous behaviour and simply have no console.
-func displayArgs() []string {
-	if !hostHasRenderNode() {
+// displayArgs selects QEMU's display backend for a device that can (or cannot)
+// back a guest GPU with host GL. The graphical console reads guest framebuffers
+// over the D-Bus display in peer-to-peer mode, which needs no bus daemon. Where
+// there is no render node, gl=on would stop QEMU from starting at all, so such
+// devices keep the previous behaviour and simply have no console.
+//
+// Takes the decision rather than making it, so that the display flags and the
+// video device in the domain config cannot be derived from two different
+// readings of a mutable fact.
+func displayArgs(virtualGPU bool) []string {
+	if !virtualGPU {
 		return []string{"-display", "none"}
 	}
 	return []string{"-display", "dbus,p2p=on,gl=on,rendernode=" + renderNode}

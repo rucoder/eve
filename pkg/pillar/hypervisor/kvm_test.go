@@ -6,7 +6,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -3504,5 +3506,67 @@ func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
 	none := render(false, "q35")
 	if strings.Contains(none, `[device "video0"]`) {
 		t.Errorf("no render node and no VNC should emit no video device, got:\n%s", none)
+	}
+}
+
+// The video device and the display flags are two halves of one decision. A
+// GL video device with "-display none" fails to realize ("opengl is not
+// available") and takes down every VM on the device; a dbus display with
+// gl=on where the render node has gone does the same. They must agree, and
+// they must agree per domain rather than being derived twice from a fact
+// that changes - the render node appears when i915 probes late and vanishes
+// when the iGPU is bound to vfio for a passthrough app.
+func TestVirtualGPUAgreesWithTheDisplay(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		ctxGPU      bool
+		ociDir      string
+		enableVnc   bool
+		wantGPU     bool
+		wantDisplay string
+	}{
+		{"vm on a device with a render node", true, "", false, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+		{"vm on a device without one", false, "", false, false, "none"},
+		// A container's shim VM has no framebuffer worth showing, and giving
+		// every one of them a virgl context would have a device with twenty
+		// container apps holding twenty EGL contexts against one iGPU.
+		{"container shim vm", true, "/persist/oci/app", false, false, "none"},
+		{"container shim vm with vnc asked for", true, "/persist/oci/app", true, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := KvmContext{virtualGPU: c.ctxGPU}
+			config := types.DomainConfig{VmConfig: types.VmConfig{EnableVnc: c.enableVnc}}
+			status := types.DomainStatus{OCIConfigDir: c.ociDir}
+
+			gotGPU := ctx.virtualGPUFor(config, status)
+			if gotGPU != c.wantGPU {
+				t.Errorf("virtualGPUFor = %v, want %v", gotGPU, c.wantGPU)
+			}
+
+			args := displayArgs(gotGPU)
+			want := []string{"-display", c.wantDisplay}
+			if !reflect.DeepEqual(args, want) {
+				t.Errorf("displayArgs = %v, want %v", args, want)
+			}
+		})
+	}
+}
+
+// arm64 has no graphical console yet and keeps "-display none". A context that
+// claimed a virtual GPU there would emit virtio-gpu-gl-pci against that
+// display, and no app instance on the device would start.
+func TestArm64ContextClaimsNoVirtualGPU(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOARCH != "arm64" {
+		t.Skip("newKvm's arm64 arm is only reachable on arm64")
+	}
+	ctx := KvmContext{} // the arm64 arm sets virtualGPU: false
+	if ctx.virtualGPUFor(types.DomainConfig{}, types.DomainStatus{}) {
+		t.Error("arm64 must not claim a virtual GPU while its display is none")
 	}
 }

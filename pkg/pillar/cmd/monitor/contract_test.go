@@ -100,3 +100,15 @@ func TestProxyToContract_ManualByScheme(t *testing.T) {
 		t.Fatalf("expected ProxyManual, got %T", p)
 	}
 }
+
+// A name is not a monitor. Under Xen, or for an instance that never got a
+// QEMU, the reconstructed path does not exist; reporting it anyway has the
+// console dial a socket that can never answer, once per app, forever.
+func TestKvmQmpSocketOnlyReportsAPathThatExists(t *testing.T) {
+	if got := kvmQmpSocket(""); got != "" {
+		t.Errorf("no domain name should report no socket, got %q", got)
+	}
+	if got := kvmQmpSocket("6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1"); got != "" {
+		t.Errorf("a domain with no socket on disk should report none, got %q", got)
+	}
+}
