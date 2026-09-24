@@ -27,6 +27,7 @@ import (
 	"go/printer"
 	"go/token"
 	"io/fs"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -203,6 +204,21 @@ func main() {
 
 // ---------------- Rust emission ----------------
 
+// nullAsDefaultHelper is emitted into every generated Rust file. Go marshals a
+// nil slice as `null`, not as `[]`, and #[serde(default)] does not accept an
+// explicit null - serde reports "invalid type: null, expected a sequence" and
+// the WHOLE message fails to decode, not just that field. Every Vec field goes
+// through this.
+const nullAsDefaultHelper = `fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+`
+
 func emitRust(enums []enumDef, structs []structDef, unions []*unionDef, out string) {
 	var b strings.Builder
 	b.WriteString("// Copyright (c) 2026 Zededa, Inc.\n")
@@ -217,6 +233,7 @@ func emitRust(enums []enumDef, structs []structDef, unions []*unionDef, out stri
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
+	b.WriteString(nullAsDefaultHelper)
 
 	for _, e := range enums {
 		b.WriteString("#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n")
@@ -304,7 +321,7 @@ func rustImports(structs []structDef, unions []*unionDef) []string {
 	}
 	imports := []string{"use serde::{Deserialize, Serialize};"}
 	if base64 {
-		imports = append(imports, "use serde_with::{base64::Base64, serde_as};")
+		imports = append(imports, "use serde_with::{base64::Base64, serde_as, DefaultOnNull};")
 	}
 	for _, line := range byToken {
 		if needed[line] {
@@ -338,6 +355,27 @@ func emitDerives(b *strings.Builder, fields []field) {
 	}
 }
 
+// nullGuard returns the serde attribute that turns an explicit null into the
+// default, or nothing when serde_with is already doing it for this field.
+func nullGuard(f field) string {
+	if f.base64 {
+		return "" // DefaultOnNull<Base64> already covers it
+	}
+	return ", deserialize_with = \"null_as_default\""
+}
+
+// rustTypeHasDefault reports whether #[serde(default)] can be written on a
+// field of this type. Anything generated (an enum, a nested struct) and the
+// foreign scalars chrono and macaddr give us do not implement Default.
+func rustTypeHasDefault(ty string) bool {
+	switch ty {
+	case "String", "bool", "u8", "u16", "u32", "u64",
+		"i8", "i16", "i32", "i64", "f32", "f64", "Uuid":
+		return true
+	}
+	return false
+}
+
 func emitRustField(b *strings.Builder, f field, indent string, withPub bool) {
 	ty := normType(f.rustType)
 	if f.slice {
@@ -346,10 +384,16 @@ func emitRustField(b *strings.Builder, f field, indent string, withPub bool) {
 	if f.optional {
 		ty = "Option<" + ty + ">"
 	}
+	// A base64 field's codec comes from serde_with, which refuses to be
+	// combined with serde's deserialize_with. DefaultOnNull is serde_with's
+	// own way of saying the same thing null_as_default says below.
 	if f.base64 {
 		adaptor := "Base64"
-		if f.optional {
+		switch {
+		case f.optional:
 			adaptor = "Option<Base64>"
+		case f.slice:
+			adaptor = "DefaultOnNull<Base64>"
 		}
 		fmt.Fprintf(b, "%s#[serde_as(as = %q)]\n", indent, adaptor)
 	}
@@ -358,14 +402,27 @@ func emitRustField(b *strings.Builder, f field, indent string, withPub bool) {
 	case f.optional && f.omitempty:
 		b.WriteString(", default, skip_serializing_if = \"Option::is_none\"")
 	case f.slice && f.omitempty:
-		b.WriteString(", default, skip_serializing_if = \"Vec::is_empty\"")
-	case f.optional || f.slice:
-		// present-but-possibly-null/empty on the wire: tolerate on read, don't skip on write
+		// Absent OR explicitly null: Go writes null for a nil slice, and
+		// #[serde(default)] alone does not accept an explicit null.
+		b.WriteString(", default" + nullGuard(f) + ", skip_serializing_if = \"Vec::is_empty\"")
+	case f.slice:
+		b.WriteString(", default" + nullGuard(f))
+	case f.optional:
+		// present-but-possibly-null on the wire: Option takes null as None.
 		b.WriteString(", default")
 	case f.omitempty:
 		// A scalar with omitempty is absent from the wire at its zero value, so
 		// the Rust side must tolerate it missing or the whole message fails to
 		// decode. Serialising it unconditionally is harmless.
+		//
+		// Only for a type that has a Default: #[serde(default)] on one that
+		// does not is a compile error in a crate the Go author is not looking
+		// at, so say so here instead.
+		if !rustTypeHasDefault(ty) {
+			log.Fatalf("field %q: Go type has `omitempty` but its Rust type %s has no Default. "+
+				"Make the Go field a pointer so it becomes Option<%s>, or drop omitempty.",
+				f.jsonTag, ty, ty)
+		}
 		b.WriteString(", default")
 	}
 	b.WriteString(")]\n")

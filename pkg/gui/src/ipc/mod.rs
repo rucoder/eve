@@ -148,6 +148,31 @@ mod tests {
         }
     }
 
+    /// Go marshals a nil slice as `null`, not as `[]`. #[serde(default)] alone
+    /// does not accept an explicit null - serde reports "invalid type: null,
+    /// expected a sequence" and the WHOLE message is dropped, not just the
+    /// field. Every Vec in the contract can arrive this way.
+    #[test]
+    fn decodes_a_null_slice_as_empty() {
+        let wire = r#"{"type":"NetworkStatus","message":{"dpcKey":"manual","interfaces":[
+            {"name":"eth0","label":"uplink","mac":"00:11:22:33:44:55","up":true,
+             "isMgmt":true,"cost":0,"media":{"kind":"ethernet"},
+             "network":{"isDhcp":true,"ipv4":null,"ipv6":null,"subnet":null,
+                        "routes":null,"dnsServers":null,"ntpServers":null,
+                        "domain":"","proxy":{"mode":"none"},"errors":null},
+             "vlans":null}]}}"#;
+        match serde_json::from_str::<IpcMessage>(wire).expect("a null slice must decode") {
+            IpcMessage::NetworkStatus(n) => {
+                assert_eq!(n.interfaces.len(), 1);
+                assert!(n.interfaces[0].network.dns_servers.is_empty());
+                assert!(n.interfaces[0].network.routes.is_empty());
+                assert!(n.interfaces[0].network.errors.is_empty());
+                assert!(n.interfaces[0].vlans.is_empty());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     /// An app with no virtual GPU omits the field entirely; it must still decode.
     #[test]
     fn decodes_an_app_without_a_qmp_socket() {

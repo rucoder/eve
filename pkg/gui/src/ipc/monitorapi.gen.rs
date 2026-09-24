@@ -7,9 +7,17 @@
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use serde_with::{base64::Base64, serde_as};
+use serde_with::{base64::Base64, serde_as, DefaultOnNull};
 use std::net::IpAddr;
 use uuid::Uuid;
+
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttestState {
@@ -187,7 +195,7 @@ pub struct AppInstance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppsList {
-    #[serde(rename = "instances", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "instances", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub instances: Vec<AppInstance>,
 }
 
@@ -256,7 +264,7 @@ pub struct DownloaderStatus {
 pub struct EfiVariable {
     #[serde(rename = "name", default)]
     pub name: String,
-    #[serde_as(as = "Base64")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
     #[serde(rename = "value", default, skip_serializing_if = "Vec::is_empty")]
     pub value: Vec<u8>,
 }
@@ -279,7 +287,7 @@ pub struct NetworkInterface {
     pub media: NetworkMedia,
     #[serde(rename = "network")]
     pub network: PortNetwork,
-    #[serde(rename = "vlans", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "vlans", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub vlans: Vec<Vlan>,
 }
 
@@ -295,7 +303,7 @@ pub struct NetworkProxy {
 pub struct NetworkStatus {
     #[serde(rename = "dpcKey")]
     pub dpc_key: String,
-    #[serde(rename = "interfaces", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "interfaces", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<NetworkInterface>,
 }
 
@@ -303,23 +311,23 @@ pub struct NetworkStatus {
 pub struct PortNetwork {
     #[serde(rename = "isDhcp")]
     pub is_dhcp: bool,
-    #[serde(rename = "ipv4", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "ipv4", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub ipv4: Vec<IpAddr>,
-    #[serde(rename = "ipv6", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "ipv6", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub ipv6: Vec<IpAddr>,
     #[serde(rename = "subnet", default, skip_serializing_if = "Option::is_none")]
     pub subnet: Option<IpNet>,
-    #[serde(rename = "routes", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "routes", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<IpAddr>,
-    #[serde(rename = "dnsServers", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "dnsServers", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub dns_servers: Vec<IpAddr>,
-    #[serde(rename = "ntpServers", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "ntpServers", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub ntp_servers: Vec<String>,
     #[serde(rename = "domain")]
     pub domain: String,
     #[serde(rename = "proxy")]
     pub proxy: ProxySettings,
-    #[serde(rename = "errors", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "errors", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }
 
@@ -361,7 +369,7 @@ pub struct SetInterfaceConfig {
     pub ip: IpMode,
     #[serde(rename = "proxy")]
     pub proxy: ProxySettings,
-    #[serde(rename = "ntp", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "ntp", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub ntp: Vec<String>,
     #[serde(rename = "domain", default)]
     pub domain: String,
@@ -375,7 +383,7 @@ pub struct StaticIpConfig {
     pub subnet: IpNet,
     #[serde(rename = "gateway", default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<IpAddr>,
-    #[serde(rename = "dnsServers", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "dnsServers", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub dns_servers: Vec<IpAddr>,
 }
 
@@ -388,21 +396,21 @@ pub struct TuiConfig {
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TpmLogs {
-    #[serde_as(as = "Base64")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
     #[serde(rename = "last_failed_log", default, skip_serializing_if = "Vec::is_empty")]
     pub last_failed_log: Vec<u8>,
-    #[serde_as(as = "Base64")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
     #[serde(rename = "last_good_log", default, skip_serializing_if = "Vec::is_empty")]
     pub last_good_log: Vec<u8>,
-    #[serde_as(as = "Base64")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
     #[serde(rename = "backup_failed_log", default, skip_serializing_if = "Vec::is_empty")]
     pub backup_failed_log: Vec<u8>,
-    #[serde_as(as = "Base64")]
+    #[serde_as(as = "DefaultOnNull<Base64>")]
     #[serde(rename = "backup_good_log", default, skip_serializing_if = "Vec::is_empty")]
     pub backup_good_log: Vec<u8>,
-    #[serde(rename = "efi_vars_success", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "efi_vars_success", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub efi_vars_success: Vec<EfiVariable>,
-    #[serde(rename = "efi_vars_failed", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "efi_vars_failed", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
     pub efi_vars_failed: Vec<EfiVariable>,
 }
 
@@ -444,11 +452,11 @@ pub enum NetworkMedia {
         operator: String,
         #[serde(rename = "roaming")]
         roaming: bool,
-        #[serde(rename = "rats", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "rats", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         rats: Vec<String>,
-        #[serde(rename = "sims", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "sims", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         sims: Vec<Sim>,
-        #[serde(rename = "visibleProviders", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "visibleProviders", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         visible_providers: Vec<CellProvider>,
     },
     Ethernet,
@@ -462,11 +470,11 @@ pub enum NetworkMedia {
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub enum ProxySettings {
     Manual {
-        #[serde(rename = "servers", default)]
+        #[serde(rename = "servers", default, deserialize_with = "null_as_default")]
         servers: Vec<ProxyServer>,
-        #[serde(rename = "exceptions", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "exceptions", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         exceptions: Vec<String>,
-        #[serde(rename = "certPem", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "certPem", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         cert_pem: Vec<String>,
     },
     None,
@@ -492,7 +500,7 @@ pub enum VaultStatus {
     Locked {
         #[serde(rename = "error")]
         error: String,
-        #[serde(rename = "mismatchingPcrs", default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(rename = "mismatchingPcrs", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
         mismatching_pcrs: Vec<u32>,
     },
     Unknown,
