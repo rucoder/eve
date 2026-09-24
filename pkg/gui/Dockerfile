@@ -52,7 +52,7 @@ FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS runtime
 # mesa-dri-gallium carries the iris driver used by Gen12+ Intel graphics, which
 # is what the EGL/GBM path needs at runtime; without it EGL falls back to
 # software or fails outright.
-ENV PKGS="kbd mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput eudev-libs"
+ENV PKGS="kbd mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs"
 RUN eve-alpine-deploy.sh
 
 COPY --from=builder /app/gui-version.txt /tmp/gui-version
