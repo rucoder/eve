@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 FROM lfedge/eve-uefi:7e975cf524ce81922f283bf434563a08ac400a17 AS uefi-build
-FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS runx-build
+FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runx-build
 ENV BUILD_PKGS="mkinitfs gcc musl-dev e2fsprogs chrony agetty"
 RUN eve-alpine-deploy.sh
 
@@ -20,18 +20,19 @@ RUN gcc -s -o /chroot2 /tmp/chroot2.c -Wall -Werror
 RUN gcc -s -o /hacf /tmp/hacf.c -Wall -Werror
 RUN mkinitfs -n -F base -i /init-initrd -o /runx-initrd
 
-FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS build
+FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS build
 ENV BUILD_PKGS="\
     gcc make libc-dev dev86 xz-dev perl bash python3-dev \
     gettext iasl util-linux-dev ncurses-dev glib-dev \
     pixman-dev libaio-dev yajl-dev argp-standalone \
     linux-headers git patch texinfo tar libcap-ng-dev \
     attr-dev flex bison cmake libusb-dev zstd-dev \
-    python3 build-base ninja gnutls-dev agetty py3-setuptools"
+    python3 build-base ninja gnutls-dev agetty py3-setuptools \
+    libepoxy-dev virglrenderer-dev mesa-dev"
 
 ENV BUILD_PKGS_arm64=dtc-dev
 
-ENV PKGS="alpine-baselayout libgcc bash musl-utils libaio libbz2 glib pixman yajl keyutils libusb xz-libs libuuid zstd-libs util-linux-misc gnutls"
+ENV PKGS="alpine-baselayout libgcc bash musl-utils libaio libbz2 glib pixman yajl keyutils libusb xz-libs libuuid zstd-libs util-linux-misc gnutls libepoxy virglrenderer mesa-gbm mesa-egl mesa-gl"
 ENV PKGS_arm64=libfdt
 
 RUN eve-alpine-deploy.sh
@@ -64,9 +65,14 @@ RUN register-sbom-pkg.sh -n liburing -v "${LIBURING_VERSION}" -l LGPL-2.1-only -
 # When changing this version, also update SEABIOS_UPSTREAM_REVISION to whatever is in `Config.mk` in the xen source
 ENV XEN_VERSION=4.21.1
 ENV XEN_SOURCE=https://downloads.xenproject.org/release/xen/${XEN_VERSION}/xen-${XEN_VERSION}.tar.gz
+# dbus-display is how the graphical console receives guest framebuffers.
+# opengl and virglrenderer are what build the virtio-gpu-gl device variants;
+# without them QEMU has no device that can hand over a dmabuf, and the console
+# falls back to copying whole framebuffers over the bus.
 ENV EXTRA_QEMUU_CONFIGURE_ARGS="--enable-libusb --enable-linux-aio \
     --enable-vhost-net --enable-vhost-kernel \
-    --enable-vhost-user --enable-linux-io-uring --enable-zstd"
+    --enable-vhost-user --enable-linux-io-uring --enable-zstd \
+    --enable-dbus-display --enable-opengl --enable-virglrenderer"
 
 WORKDIR /
 
