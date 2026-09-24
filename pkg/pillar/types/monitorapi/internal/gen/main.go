@@ -362,6 +362,11 @@ func emitRustField(b *strings.Builder, f field, indent string, withPub bool) {
 	case f.optional || f.slice:
 		// present-but-possibly-null/empty on the wire: tolerate on read, don't skip on write
 		b.WriteString(", default")
+	case f.omitempty:
+		// A scalar with omitempty is absent from the wire at its zero value, so
+		// the Rust side must tolerate it missing or the whole message fails to
+		// decode. Serialising it unconditionally is harmless.
+		b.WriteString(", default")
 	}
 	b.WriteString(")]\n")
 	vis := "pub "

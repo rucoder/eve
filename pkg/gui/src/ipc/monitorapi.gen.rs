@@ -181,7 +181,7 @@ pub struct AppInstance {
     pub state: SwState,
     #[serde(rename = "error")]
     pub error: String,
-    #[serde(rename = "qmpSocket")]
+    #[serde(rename = "qmpSocket", default)]
     pub qmp_socket: String,
 }
 
@@ -254,7 +254,7 @@ pub struct DownloaderStatus {
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EfiVariable {
-    #[serde(rename = "name")]
+    #[serde(rename = "name", default)]
     pub name: String,
     #[serde_as(as = "Base64")]
     #[serde(rename = "value", default, skip_serializing_if = "Vec::is_empty")]
@@ -363,7 +363,7 @@ pub struct SetInterfaceConfig {
     pub proxy: ProxySettings,
     #[serde(rename = "ntp", default, skip_serializing_if = "Vec::is_empty")]
     pub ntp: Vec<String>,
-    #[serde(rename = "domain")]
+    #[serde(rename = "domain", default)]
     pub domain: String,
 }
 
