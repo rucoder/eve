@@ -94,6 +94,10 @@ impl Vm {
         probe: bool,
         frame: u32,
     ) {
+        if std::mem::take(&mut self.shared.lock().unwrap().copy_takeover) && self.dma_id.is_some() {
+            log::info!("{}: guest switched back to the copy path", self.name);
+            self.release_gl();
+        }
         self.take_scanout(renderer);
         self.upload_copy(egui_ctx);
         self.blit_external(renderer, painter, probe, frame);

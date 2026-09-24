@@ -135,8 +135,15 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             // BLOCK until the kernel has something. No timeout, no polling:
             // the thread sleeps and wakes on the event itself.
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 { continue; }
-            inp.pump(2.0);
+            if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+                // Anything else is permanent (a bad fd after device teardown);
+                // retrying would spin a core for the life of the process.
+                log::error!("input: poll failed: {e}; input thread stopping");
+                return;
+            }
+            inp.pump(crate::POINTS_PER_PIXEL);
             // forward to the guest IMMEDIATELY, at device rate
             if !inp.guest.is_empty() {
                 if let Some(t) = tx.lock().unwrap().as_ref() {
@@ -166,6 +173,8 @@ pub struct Input {
     ctrl: bool,
     alt: bool,
     last_toggle: Option<std::time::Instant>,
+    /// Set when a grabbing click was consumed, so its release is too.
+    swallow_release: Option<u32>,
     /// Sub-detent scroll remainder, v120 units (120 = one wheel click).
     scroll_acc: (f64, f64),
     /// Devices that have sent absolute motion. Only THOSE devices get their
@@ -201,7 +210,7 @@ impl Input {
                  std::env::var("GUI_PTR_SCALE").unwrap_or_else(|_| "1.0".into()));
         Ok(Self {
             li, focus: Focus::Gui, x: w as f64 / 2.0, y: h as f64 / 2.0,
-            w: w as f64, h: h as f64, ctrl: false, alt: false, last_toggle: None, scroll_acc: (0.0, 0.0), abs_devices: Default::default(),
+            w: w as f64, h: h as f64, ctrl: false, alt: false, last_toggle: None, swallow_release: None, scroll_acc: (0.0, 0.0), abs_devices: Default::default(),
             scale: std::env::var("GUI_PTR_SCALE").ok()
                      .and_then(|v| v.parse().ok()).unwrap_or(1.0),
             stats: Default::default(),
@@ -306,7 +315,15 @@ impl Input {
                             self.focus = Focus::Guest;
                             self.held.clear();
                             log::debug!("focus -> Guest (clicked in guest view)");
+                            self.swallow_release = q;
                             continue;   // consume the grabbing click
+                        }
+                        // The press that grabbed was consumed, so its release
+                        // must be too - otherwise the guest sees an unpaired
+                        // button-up and drag tracking gets confused.
+                        if !down && self.swallow_release == q && q.is_some() {
+                            self.swallow_release = None;
+                            continue;
                         }
                         match self.focus {
                             Focus::Guest if q.is_some() => self.guest.push(GuestAct::Btn(q.unwrap(), down)),

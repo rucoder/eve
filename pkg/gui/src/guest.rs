@@ -32,6 +32,11 @@ pub struct GuestFrame {
     /// The screen then stays black forever while the update counter looks
     /// healthy. Surfaced in the UI so it is diagnosable instead of mystifying.
     pub orphan_updates: u64,
+    /// Set when a plain Scanout arrives, meaning the guest has gone back to
+    /// sending pixels. Without it the consumer keeps re-blitting the last
+    /// imported dmabuf and the tab freezes - which is what a guest reboot into
+    /// a dumb framebuffer looks like.
+    pub copy_takeover: bool,
 }
 
 /// A scanout buffer QEMU rendered on the host GPU. Importing this avoids the
@@ -98,11 +103,11 @@ impl Listener {
         }
         // union with any damage the consumer has not picked up yet
         g.dirty = Some(match g.dirty {
-            None => (rx, ry, (x1 - x0) as u32, (y1 - y0) as u32),
+            None => (rx, ry, x1.saturating_sub(x0) as u32, y1.saturating_sub(y0) as u32),
             Some((ox, oy, ow, oh)) => {
                 let nx = ox.min(rx); let ny = oy.min(ry);
                 let ex = (ox + ow).max(x1 as u32); let ey = (oy + oh).max(y1 as u32);
-                (nx, ny, ex - nx, ey - ny)
+                (nx, ny, ex.saturating_sub(nx), ey.saturating_sub(ny))
             }
         });
         g.seq += 1;
@@ -112,7 +117,12 @@ impl Listener {
 #[interface(name = "org.qemu.Display1.Listener")]
 impl Listener {
     async fn scanout(&mut self, width: u32, height: u32, stride: u32, _fmt: u32, data: Vec<u8>) {
-        { let mut g = self.f.lock().unwrap(); g.w = width; g.h = height; g.dirty = None; g.orphan_updates = 0; }
+        {
+            let mut g = self.f.lock().unwrap();
+            g.w = width; g.h = height; g.dirty = None; g.orphan_updates = 0;
+            g.dmabuf = None;
+            g.copy_takeover = true;
+        }
         self.have_scanout = true;
         self.stride = stride;
         self.raw = data;
@@ -173,7 +183,14 @@ impl Listener {
                            data: Vec<u8>) {
         if width <= 0 || height <= 0 { return; }
         let (w, h) = (width as u32, height as u32);
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        let want = (w as usize) * (h as usize) * 4;
+        // Guest-controlled: a length that disagrees with the declared size
+        // would trip an assert in egui and take the whole console down.
+        if data.len() != want {
+            log::warn!("CursorDefine {w}x{h}: {} bytes, expected {want}; ignored", data.len());
+            return;
+        }
+        let mut rgba = Vec::with_capacity(want);
         // QEMU sends ARGB32 little-endian => B,G,R,A in memory
         for px in data.chunks_exact(4) {
             rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
