@@ -32,7 +32,7 @@ use scanout::Vm;
 pub const POINTS_PER_PIXEL: f32 = 2.0;
 
 struct Config {
-    card: String,
+    card: Option<String>,
     /// 0 means run until signalled.
     frames: u32,
     orient: u8,
@@ -46,10 +46,8 @@ impl Config {
         let env = |k: &str| std::env::var(k).ok();
         Self {
             // A positional argument still wins, which keeps ad-hoc runs easy.
-            card: std::env::args()
-                .nth(1)
-                .or_else(|| env("GUI_CARD"))
-                .unwrap_or_else(|| "/dev/dri/card0".into()),
+            // None means "probe"; see drm::pick_card.
+            card: std::env::args().nth(1).or_else(|| env("GUI_CARD")),
             frames: env("GUI_FRAMES").and_then(|v| v.parse().ok()).unwrap_or(0),
             orient: env("GUI_ORIENT").and_then(|v| v.parse().ok()).unwrap_or(1),
             ptr_scale: env("GUI_PTR_SCALE").and_then(|v| v.parse().ok()).unwrap_or(1.0),
@@ -83,7 +81,8 @@ fn main() -> anyhow::Result<()> {
     vt::install_signal_handlers();
     log::info!("orientation mode = {} (0=none 1=flipY 2=flipX 3=rot180)", cfg.orient);
 
-    let mut gpu = drm::open(&cfg.card)?;
+    let card = drm::pick_card(cfg.card.as_deref())?;
+    let mut gpu = drm::open(&card)?;
     let mut heads = drm::discover_heads(&mut gpu)?;
 
     // egui_glow painter sharing smithay's GL context.
@@ -94,11 +93,16 @@ fn main() -> anyhow::Result<()> {
     log::info!("egui_glow painter created on smithay's GL context");
 
     let mut vms = spawn_vms(&cfg.vms);
-    anyhow::ensure!(!vms.is_empty(), "no VMs: set GUI_VMS=\"linux=<bus>;windows=<bus>\"");
     let mut active = 0usize;
+    // Tab 0 is the node page; guests are tabs 1..n.
+    let mut show_node = true;
+
+    let pillar = ipc::spawn(ipc::MONITOR_SOCKET);
 
     let inp = input::spawn(heads[0].w, heads[0].h, cfg.ptr_scale)?;
-    inp.set_active(vms[active].tx.clone());
+    if let Some(vm) = vms.get(active) {
+        inp.set_active(vm.tx.clone());
+    }
     log::info!("input: click in the guest view to grab, ctrl+alt+g to release, ctrl+alt+N for tab N");
 
     // Guest hardware cursor, reloaded whenever the active guest republishes it.
@@ -186,28 +190,63 @@ fn main() -> anyhow::Result<()> {
                     ..Default::default()
                 };
 
-                let tabs: Vec<String> = vms.iter().map(|v| v.name.clone()).collect();
-                let (orphans, cursor_visible, has_cursor) = {
-                    let g = vms[active].shared.lock().unwrap();
-                    (g.orphan_updates, g.cursor_visible, g.cursor.is_some())
+                let mut tabs: Vec<String> = vec!["Node".into()];
+                tabs.extend(vms.iter().map(|v| v.name.clone()));
+                let (orphans, cursor_visible, has_cursor) = match vms.get(active) {
+                    Some(vm) => {
+                        let g = vm.shared.lock().unwrap();
+                        (g.orphan_updates, g.cursor_visible, g.cursor.is_some())
+                    }
+                    None => (0, false, false),
+                };
+                let node = {
+                    let p = pillar.lock().unwrap();
+                    let d = p.device.clone();
+                    (
+                        d.as_ref().map_or(String::new(), |d| d.node_name.clone()),
+                        d.as_ref().map_or(String::new(), |d| d.serial.clone()),
+                        d.as_ref().map_or(String::new(), |d| d.server.clone()),
+                        d.as_ref().map_or(String::new(), |d| d.hardware_model.clone()),
+                        interfaces_of(&p),
+                        p.connected,
+                    )
                 };
                 let view = ui::Frame {
+                    node_tab: show_node,
+                    node: ui::NodeView {
+                        name: &node.0,
+                        serial: &node.1,
+                        server: &node.2,
+                        model: &node.3,
+                        interfaces: &node.4,
+                        connected: node.5,
+                    },
                     head: &head_name,
                     fps: fps_now,
                     guest_fps: gfps_now,
                     frame: n,
                     elapsed: start.elapsed().as_secs_f32(),
                     tabs: &tabs,
-                    active,
+                    active: if show_node { 0 } else { active + 1 },
                     focus,
                     pointer: egui::pos2(cx / POINTS_PER_PIXEL, cy / POINTS_PER_PIXEL),
-                    guest: ui::GuestView {
-                        dma_id: vms[active].dma_id,
-                        dma_size: vms[active].dma_size,
-                        dma_flip: vms[active].dma_flip,
-                        tex: vms[active].tex.as_ref(),
-                        seq: vms[active].seq,
-                        orphan_updates: orphans,
+                    guest: match vms.get(active) {
+                        Some(vm) => ui::GuestView {
+                            dma_id: vm.dma_id,
+                            dma_size: vm.dma_size,
+                            dma_flip: vm.dma_flip,
+                            tex: vm.tex.as_ref(),
+                            seq: vm.seq,
+                            orphan_updates: orphans,
+                        },
+                        None => ui::GuestView {
+                            dma_id: None,
+                            dma_size: egui::vec2(1.0, 1.0),
+                            dma_flip: false,
+                            tex: None,
+                            seq: 0,
+                            orphan_updates: 0,
+                        },
                     },
                     // Only when the ACTIVE guest published one: a guest that
                     // composites its own would end up with two pointers.
@@ -252,23 +291,38 @@ fn main() -> anyhow::Result<()> {
             }
 
             // The hotkey wins over a tab-bar click.
-            let want = hot_tab.filter(|t| *t < vms.len()).or(act.tab);
+            // Tab 0 is the node page, so Ctrl+Alt+1 and a click on the first
+            // tab mean the same thing.
+            let want = hot_tab.filter(|t| *t <= vms.len()).or(act.tab);
             if let Some(t) = want {
-                if t != active {
-                    active = t;
-                    inp.set_active(vms[active].tx.clone());
-                    win_gseq = vms[active].seq; // not a real rate jump
-                    cur_seq = u64::MAX; // reload this guest's cursor
-                    log::info!("tab -> {}", vms[active].name);
+                let (node, idx) = if t == 0 { (true, active) } else { (false, t - 1) };
+                if node != show_node || idx != active {
+                    show_node = node;
+                    if !node {
+                        active = idx;
+                        if let Some(vm) = vms.get(active) {
+                            inp.set_active(vm.tx.clone());
+                            win_gseq = vm.seq; // not a real rate jump
+                        }
+                        cur_seq = u64::MAX; // reload this guest's cursor
+                    }
+                    log::info!(
+                        "tab -> {}",
+                        if node { "Node" } else { vms.get(active).map_or("?", |v| v.name.as_str()) }
+                    );
                 }
             }
             if act.send_wake {
-                send_keys(&vms[active], &[(input::KEY_LEFTSHIFT, true), (input::KEY_LEFTSHIFT, false)]);
-                log::info!("sent wake keystroke to {}", vms[active].name);
+                if let Some(vm) = vms.get(active) {
+                    send_keys(vm, &[(input::KEY_LEFTSHIFT, true), (input::KEY_LEFTSHIFT, false)]);
+                    log::info!("sent wake keystroke to {}", vm.name);
+                }
             }
             if act.send_cad {
-                send_keys(&vms[active], input::CTRL_ALT_DEL);
-                log::info!("sent Ctrl+Alt+Del to {}", vms[active].name);
+                if let Some(vm) = vms.get(active) {
+                    send_keys(vm, input::CTRL_ALT_DEL);
+                    log::info!("sent Ctrl+Alt+Del to {}", vm.name);
+                }
             }
             if let Some(r) = act.viewport {
                 let mut st = inp.state.lock().unwrap();
@@ -280,7 +334,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 // Every frame, from the VM that owns it - never inferred from
                 // whether a scanout message happened to arrive.
-                st.guest_size = vms[active].size;
+                st.guest_size = vms.get(active).map_or((0, 0), |v| v.size);
             }
 
             drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &heads, n)?;
@@ -322,6 +376,30 @@ fn main() -> anyhow::Result<()> {
     );
     shutdown(gpu, heads, vms, painter);
     loop_result
+}
+
+/// Flatten pillar's network status into (interface, address) rows.
+fn interfaces_of(p: &ipc::PillarState) -> Vec<(String, String)> {
+    let Some(n) = p.network.as_ref() else {
+        return Vec::new();
+    };
+    n.interfaces
+        .iter()
+        .map(|i| {
+            // v4 first, then v6; a port with neither is still worth showing,
+            // because "up with no address" is exactly what you want to see.
+            let addr = i
+                .network
+                .ipv4
+                .iter()
+                .chain(i.network.ipv6.iter())
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let name = if i.label.is_empty() { i.name.clone() } else { i.label.clone() };
+            (name, addr)
+        })
+        .collect()
 }
 
 fn send_keys(vm: &Vm, keys: &[(u32, bool)]) {

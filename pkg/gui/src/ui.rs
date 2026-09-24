@@ -26,6 +26,17 @@ pub struct CursorView<'a> {
     pub hotspot: (f32, f32),
 }
 
+/// What the Node tab shows, from pillar's DeviceStatus and NetworkStatus.
+pub struct NodeView<'a> {
+    pub name: &'a str,
+    pub serial: &'a str,
+    pub server: &'a str,
+    pub model: &'a str,
+    /// (interface, address). Empty until pillar reports any.
+    pub interfaces: &'a [(String, String)],
+    pub connected: bool,
+}
+
 pub struct Frame<'a> {
     pub head: &'a str,
     pub fps: f32,
@@ -39,6 +50,9 @@ pub struct Frame<'a> {
     pub pointer: egui::Pos2,
     pub guest: GuestView<'a>,
     pub cursor: Option<CursorView<'a>>,
+    pub node: NodeView<'a>,
+    /// Tab 0 is the node page; guests follow.
+    pub node_tab: bool,
 }
 
 #[derive(Default)]
@@ -124,6 +138,10 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
 }
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
+    if f.node_tab {
+        node_page(ui, &f.node);
+        return;
+    }
     let avail = ui.available_rect_before_wrap();
     let src = if f.guest.dma_id.is_some() {
         Some(f.guest.dma_size)
@@ -185,6 +203,51 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
         }
     }
     act.viewport = Some(rect);
+}
+
+fn node_page(ui: &mut egui::Ui, n: &NodeView) {
+    if !n.connected {
+        ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
+        return;
+    }
+    // A 1080p panel, not an 80x25 terminal: two columns, generous spacing.
+    ui.add_space(12.0);
+    ui.columns(2, |col| {
+        col[0].heading("Node");
+        col[0].add_space(8.0);
+        egui::Grid::new("node")
+            .num_columns(2)
+            .spacing([28.0, 10.0])
+            .show(&mut col[0], |ui| {
+                for (k, v) in [
+                    ("Name", n.name),
+                    ("Serial", n.serial),
+                    ("Model", n.model),
+                    ("Controller", n.server),
+                ] {
+                    ui.label(egui::RichText::new(k).strong());
+                    ui.label(if v.is_empty() { "—" } else { v });
+                    ui.end_row();
+                }
+            });
+
+        col[1].heading("Network");
+        col[1].add_space(8.0);
+        egui::Grid::new("net")
+            .num_columns(2)
+            .spacing([28.0, 10.0])
+            .show(&mut col[1], |ui| {
+                if n.interfaces.is_empty() {
+                    ui.label("no interfaces reported");
+                    ui.end_row();
+                }
+                for (name, addr) in n.interfaces {
+                    ui.label(egui::RichText::new(name).strong());
+                    ui.label(if addr.is_empty() { "—" } else { addr.as_str() });
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 /// A standard arrow, as an explicit triangle mesh: the shape is concave, so

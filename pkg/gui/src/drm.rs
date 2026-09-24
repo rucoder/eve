@@ -42,6 +42,49 @@ pub struct Gpu {
     _notifier: DrmDeviceNotifier,
 }
 
+/// Does this card have anything plugged into it?
+///
+/// Worth checking before committing to a card: the node number is not stable
+/// across machines - the same GUI needs card1 on one box and card0 on another -
+/// and picking a card with no output looks identical to a broken renderer.
+fn has_connected_output(path: &str) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+    let Ok((drm, _n)) = DrmDevice::new(fd, false) else {
+        return false;
+    };
+    let Ok(res) = drm.resource_handles() else {
+        return false;
+    };
+    res.connectors().iter().any(|h| {
+        drm.get_connector(*h, false)
+            .is_ok_and(|c| c.state() == connector::State::Connected)
+    })
+}
+
+/// The card to use: the caller's choice if given, otherwise the first one with
+/// something plugged in.
+pub fn pick_card(configured: Option<&str>) -> anyhow::Result<String> {
+    if let Some(p) = configured {
+        return Ok(p.to_string());
+    }
+    for n in 0..4 {
+        let path = format!("/dev/dri/card{n}");
+        if has_connected_output(&path) {
+            log::info!("picked {path}: has a connected output");
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("no /dev/dri/card* with a connected output")
+}
+
 /// Open the card and bring up GBM, EGL and a glow renderer on it.
 pub fn open(path: &str) -> anyhow::Result<Gpu> {
     let file = OpenOptions::new()
