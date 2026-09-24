@@ -27,11 +27,15 @@ use crate::input::GuestAct;
 /// One tab: a guest, its input channel, and its framebuffer state.
 pub struct Vm {
     pub name: String,
+    /// Distinguishes one attach from the next on the same QMP socket. A guest
+    /// that reboots keeps its socket path, so the path alone cannot tell the
+    /// render loop that the tab it is pointing at is a different guest now.
+    pub id: u64,
     /// The QMP socket this tab was created from; the identity we reconcile on.
     /// Empty for a tab configured by hand through GUI_VMS.
     pub source: String,
     pub shared: guest::Shared,
-    pub tx: std::sync::mpsc::Sender<GuestAct>,
+    pub tx: std::sync::mpsc::SyncSender<GuestAct>,
 
     /// Framebuffer size in guest pixels, from whichever path delivered it.
     ///
@@ -70,10 +74,12 @@ impl Vm {
     pub fn new(
         name: String,
         shared: guest::Shared,
-        tx: std::sync::mpsc::Sender<GuestAct>,
+        tx: std::sync::mpsc::SyncSender<GuestAct>,
     ) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             name,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source: String::new(),
             shared,
             tx,

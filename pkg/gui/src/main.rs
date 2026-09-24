@@ -94,6 +94,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut vms = spawn_vms(&cfg.vms);
     let mut active = 0usize;
+    let mut backoff = Backoff::default();
     // Tab 0 is the node page; guests are tabs 1..n.
     let mut show_node = true;
 
@@ -130,7 +131,24 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            reconcile_tabs(&mut vms, &pillar, &mut active);
+            // Input routing names a specific VM. When reconcile changes who
+            // holds the active slot - an app removed, a guest that died and
+            // came back - it has to be re-pointed in the same breath, or
+            // every keystroke goes to a channel nobody is reading.
+            if reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff) {
+                match vms.get(active) {
+                    Some(vm) => {
+                        inp.set_active(vm.tx.clone());
+                        win_gseq = vm.seq;
+                        log::info!("active tab is now {}", vm.name);
+                    }
+                    None => {
+                        inp.clear_active();
+                        show_node = true;
+                    }
+                }
+                cur_seq = u64::MAX; // reload this guest's cursor
+            }
 
             // Guest framebuffer: once per frame, not once per head.
             if let Some(vm) = vms.get_mut(active) {
@@ -383,10 +401,54 @@ fn main() -> anyhow::Result<()> {
     loop_result
 }
 
+/// Per-socket attach back-off. Reconcile runs once per frame, so an app that
+/// is listed but whose QEMU is not answering would otherwise be dialled at the
+/// frame rate forever - 60 blocking handshakes a second against a guest that
+/// is merely still booting.
+#[derive(Default)]
+pub struct Backoff(std::collections::HashMap<String, (u32, std::time::Instant)>);
+
+impl Backoff {
+    const FIRST: std::time::Duration = std::time::Duration::from_millis(250);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(8);
+
+    fn ready(&self, sock: &str) -> bool {
+        self.0.get(sock).is_none_or(|(_, next)| std::time::Instant::now() >= *next)
+    }
+
+    fn failed(&mut self, sock: &str) {
+        let e = self.0.entry(sock.to_string()).or_insert((0, std::time::Instant::now()));
+        e.0 = e.0.saturating_add(1);
+        let wait = Self::FIRST.saturating_mul(1u32 << e.0.min(5)).min(Self::MAX);
+        e.1 = std::time::Instant::now() + wait;
+    }
+
+    fn succeeded(&mut self, sock: &str) {
+        self.0.remove(sock);
+    }
+
+    /// Forget sockets pillar no longer lists, so the map cannot grow for the
+    /// life of the process on a device that cycles through many apps.
+    fn retain_listed(&mut self, wanted: &[(String, String)]) {
+        self.0.retain(|sock, _| wanted.iter().any(|(_, s)| s == sock));
+    }
+}
+
 /// Add a tab for each app pillar reports with a display, and drop tabs whose
-/// app has gone. An app without a QMP socket has no virtual GPU and simply
-/// gets no tab.
-fn reconcile_tabs(vms: &mut Vec<Vm>, pillar: &ipc::Shared, active: &mut usize) {
+/// app has gone or whose guest has died. An app without a QMP socket has no
+/// virtual GPU and simply gets no tab.
+///
+/// Returns true if the VM sitting at `active` changed identity, which the
+/// caller must act on: the input routing and the published guest size both
+/// name a specific VM, and leaving them pointing at the previous occupant of
+/// an index sends every keystroke into a dropped channel.
+#[must_use]
+fn reconcile_tabs(
+    vms: &mut Vec<Vm>,
+    pillar: &ipc::Shared,
+    active: &mut usize,
+    backoff: &mut Backoff,
+) -> bool {
     let wanted: Vec<(String, String)> = {
         let p = pillar.lock().unwrap();
         p.apps
@@ -396,39 +458,57 @@ fn reconcile_tabs(vms: &mut Vec<Vm>, pillar: &ipc::Shared, active: &mut usize) {
             .collect()
     };
     if wanted.is_empty() && vms.is_empty() {
-        return;
+        return false;
     }
+    backoff.retain_listed(&wanted);
+
+    // Identity of whoever holds the active slot right now, so we can tell
+    // afterwards whether that slot changed hands.
+    let was: Option<(String, u64)> = vms.get(*active).map(|v| (v.source.clone(), v.id));
 
     vms.retain_mut(|vm| {
         // Tabs from GUI_VMS have no source: they are the developer's, not
         // pillar's, and removing them because pillar has not heard of them
         // would delete the only tab on a rig with no pillar at all.
-        let keep = vm.source.is_empty()
+        let listed = vm.source.is_empty()
             || wanted.iter().any(|(_, sock)| *sock == vm.source);
+        // A guest whose QEMU has gone keeps its last frame on screen and its
+        // counters ticking, so it looks alive. Drop it; the loop below
+        // re-attaches when the guest comes back. A hand-configured tab is
+        // exempt: nothing would ever re-create it, so dropping it would strip
+        // the rig of its only tab permanently rather than for one reconnect.
+        let alive = vm.source.is_empty() || !vm.shared.lock().map(|f| f.gone).unwrap_or(true);
+        let keep = listed && alive;
         if !keep {
-            log::info!("tab gone: {}", vm.name);
+            log::info!("tab gone: {} ({})", vm.name, if listed { "guest died" } else { "app removed" });
             vm.release_gl();
         }
         keep
     });
 
-    for (name, sock) in wanted {
-        if vms.iter().any(|v| v.source == sock) {
+    for (name, sock) in &wanted {
+        if vms.iter().any(|v| v.source == *sock) || !backoff.ready(sock) {
             continue;
         }
-        match qmp::connect_display(std::path::Path::new(&sock)) {
+        match qmp::connect_display(std::path::Path::new(sock)) {
             Ok(fd) => {
-                let (shared, tx) = guest::spawn(&name, guest::Transport::Fd(fd), 0);
+                let (shared, tx) = guest::spawn(name, guest::Transport::Fd(fd), 0);
                 log::info!("tab added: {name} via {sock}");
-                vms.push(Vm::new(name, shared, tx).with_source(sock));
+                backoff.succeeded(sock);
+                vms.push(Vm::new(name.clone(), shared, tx).with_source(sock.clone()));
             }
             // Routine while a guest is starting: QEMU may not be listening yet.
-            Err(e) => log::debug!("{name}: display not ready ({e})"),
+            Err(e) => {
+                log::debug!("{name}: display not ready ({e})");
+                backoff.failed(sock);
+            }
         }
     }
     if *active >= vms.len() {
         *active = vms.len().saturating_sub(1);
     }
+    let now: Option<(String, u64)> = vms.get(*active).map(|v| (v.source.clone(), v.id));
+    was != now
 }
 
 /// Flatten pillar's network status into (interface, address) rows.
@@ -496,4 +576,114 @@ fn shutdown(
     drop(gpu.drm);
     log::info!("cleanup: done");
     logger::drain(); // do not lose the tail on exit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_vm(name: &str, source: &str) -> Vm {
+        let (shared, tx) = (
+            std::sync::Arc::new(std::sync::Mutex::new(guest::GuestFrame::default())),
+            std::sync::mpsc::sync_channel(1).0,
+        );
+        let vm = Vm::new(name.into(), shared, tx);
+        if source.is_empty() { vm } else { vm.with_source(source.into()) }
+    }
+
+    fn pillar_listing(socks: &[(&str, &str)]) -> ipc::Shared {
+        let st = ipc::PillarState {
+            // Built through the wire format rather than field by field: the
+            // contract type is generated, so this also keeps the fixture
+            // honest if a field is added.
+            apps: socks
+                .iter()
+                .map(|(name, sock)| {
+                    serde_json::from_value(serde_json::json!({
+                        "uuid": "9c1f2e3a-4b5c-6d7e-8f90-a1b2c3d4e5f6",
+                        "name": name,
+                        "version": "1",
+                        "state": "running",
+                        "error": "",
+                        "qmpSocket": sock,
+                    }))
+                    .expect("fixture decodes")
+                })
+                .collect(),
+            connected: true,
+            ..Default::default()
+        };
+        std::sync::Arc::new(std::sync::Mutex::new(st))
+    }
+
+    /// A guest that reboots keeps its QMP socket path, so pillar keeps listing
+    /// it and the tab was never rebuilt: the screen froze on the last frame
+    /// while the frame counter kept looking healthy.
+    #[test]
+    fn drops_a_tab_whose_guest_died() {
+        let pillar = pillar_listing(&[("vm1", "/nonexistent/eve-gui-test/qmp")]);
+        let mut vms = vec![a_vm("vm1", "/nonexistent/eve-gui-test/qmp")];
+        let mut active = 0usize;
+        let mut backoff = Backoff::default();
+
+        // Still alive: kept.
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert_eq!(vms.len(), 1);
+
+        vms[0].shared.lock().unwrap().gone = true;
+        let changed = reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff);
+        assert!(vms.is_empty(), "a dead guest must not keep its tab");
+        assert!(changed, "the active slot changed hands and input must be re-pointed");
+    }
+
+    /// The hand-configured tab from GUI_VMS has no socket to re-attach to, so
+    /// dropping it on death would remove it for good. See the Task 8 ruling.
+    #[test]
+    fn keeps_a_hand_configured_tab_whose_guest_died() {
+        let pillar = pillar_listing(&[]);
+        let mut vms = vec![a_vm("manual", "")];
+        vms[0].shared.lock().unwrap().gone = true;
+        let mut active = 0usize;
+        let mut backoff = Backoff::default();
+
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert_eq!(vms.len(), 1);
+    }
+
+    /// Reconcile runs once per frame. Without a back-off, an app whose QEMU is
+    /// not answering yet is dialled 60 times a second, each one a blocking
+    /// handshake on the render thread.
+    #[test]
+    fn backs_off_after_a_failed_attach() {
+        let sock = "/nonexistent/eve-gui-test/qmp";
+        let mut b = Backoff::default();
+        assert!(b.ready(sock), "first attempt must go straight through");
+        b.failed(sock);
+        assert!(!b.ready(sock), "a failed attach must not be retried on the next frame");
+        b.succeeded(sock);
+        assert!(b.ready(sock), "success clears the back-off");
+    }
+
+    /// The map is keyed by socket path; a device that cycles through apps
+    /// would otherwise grow it for the life of the process.
+    #[test]
+    fn forgets_backoff_for_apps_pillar_no_longer_lists() {
+        let mut b = Backoff::default();
+        b.failed("/run/a/qmp");
+        b.failed("/run/b/qmp");
+        b.retain_listed(&[("b".into(), "/run/b/qmp".into())]);
+        assert!(b.ready("/run/a/qmp"), "the delisted app's entry should be gone");
+        assert!(!b.ready("/run/b/qmp"));
+    }
+
+    /// An app with no virtual GPU reports no socket and must not get a tab.
+    #[test]
+    fn ignores_apps_without_a_qmp_socket() {
+        let pillar = pillar_listing(&[("container-app", "")]);
+        let mut vms: Vec<Vm> = Vec::new();
+        let mut active = 0usize;
+        let mut backoff = Backoff::default();
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert!(vms.is_empty());
+    }
 }

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! THROWAWAY SPIKE — QEMU D-Bus display listener feeding a shared RGBA frame.
+//! QEMU D-Bus display listener feeding a shared RGBA frame.
 
 use std::os::fd::{AsFd, OwnedFd};
 #[allow(unused_imports)]
@@ -32,6 +32,11 @@ pub struct GuestFrame {
     /// The screen then stays black forever while the update counter looks
     /// healthy. Surfaced in the UI so it is diagnosable instead of mystifying.
     pub orphan_updates: u64,
+    /// Set when the listener thread has exited: the D-Bus connection to QEMU
+    /// closed, or our input channel was dropped. The tab is dead from here on
+    /// and must be torn down - without this the last frame stays on screen
+    /// looking healthy, which is what a guest reboot used to look like.
+    pub gone: bool,
     /// Set when a plain Scanout arrives, meaning the guest has gone back to
     /// sending pixels. Without it the consumer keeps re-blitting the last
     /// imported dmabuf and the tab freezes - which is what a guest reboot into
@@ -280,10 +285,24 @@ pub enum Transport {
     Fd(std::os::fd::OwnedFd),
 }
 
-pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync::mpsc::Sender<crate::input::GuestAct>) {
+/// Mark the tab dead so the render loop tears it down and retries.
+fn mark_gone(shared: &Shared) {
+    if let Ok(mut f) = shared.lock() {
+        f.gone = true;
+    }
+}
+
+/// How many input events may queue for one guest. The pump normally drains
+/// this every iteration; it only fills when QEMU has stopped reading, and an
+/// unbounded queue there grows at device rate (1 kHz mice exist) with nothing
+/// to stop it - the same shape as the scanout OOM.
+const INPUT_QUEUE: usize = 1024;
+
+pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync::mpsc::SyncSender<crate::input::GuestAct>) {
     let shared: Shared = Arc::new(Mutex::new(GuestFrame::default()));
     let out = shared.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<crate::input::GuestAct>();
+    let shared_out = shared.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<crate::input::GuestAct>(INPUT_QUEUE);
     let vm = vm.to_string();
     let tname = format!("guest:{vm}");
     let _ = std::thread::Builder::new().name(tname).spawn(move || {
@@ -306,20 +325,20 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
                         Ok(sock) => Ok(zbus::connection::Builder::unix_stream(sock)
                             .p2p()
                             .max_queued(4)),
-                        Err(e) => { log::error!("display socket: {e}"); return; }
+                        Err(e) => { log::error!("display socket: {e}"); mark_gone(&shared_out); return; }
                     }
                 }
             };
             let conn = match built {
                 Ok(b) => match b.build().await {
                     Ok(c) => c,
-                    Err(e) => { log::error!("connect display: {e}"); return; }
+                    Err(e) => { log::error!("connect display: {e}"); mark_gone(&shared_out); return; }
                 },
-                Err(e) => { log::error!("bad display transport: {e}"); return; }
+                Err(e) => { log::error!("bad display transport: {e}"); mark_gone(&shared_out); return; }
             };
             let path = format!("/org/qemu/Display1/Console_{console}");
             let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
-                Ok(p) => p, Err(e) => { log::error!("no console: {e}"); return; }
+                Ok(p) => p, Err(e) => { log::error!("no console: {e}"); mark_gone(&shared_out); return; }
             };
             let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
             ours.set_nonblocking(true).unwrap();
@@ -331,12 +350,15 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
             let task = tokio::spawn(async move { builder.build().await });
             let ofd: OwnedFd = theirs.into();
             if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {
-                log::error!("RegisterListener failed: {e}"); return;
+                log::error!("RegisterListener failed: {e}"); mark_gone(&shared_out); return;
             }
-            match task.await {
-                Ok(Ok(c)) => { log::info!("listener up"); std::mem::forget(c); }
-                other => { log::error!("listener build failed: {other:?}"); return; }
-            }
+            // Bind rather than forget: the connection must outlive the pump
+            // loop, but it must also be dropped when the loop ends, or the
+            // thread's whole runtime leaks with it on every tab removal.
+            let _listener = match task.await {
+                Ok(Ok(c)) => { log::info!("listener up"); c }
+                other => { log::error!("listener build failed: {other:?}"); mark_gone(&shared_out); return; }
+            };
             // input pump: drain the channel and drive QEMU's Keyboard/Mouse
             let mut pending: Vec<crate::input::GuestAct> = Vec::new();
             let path = format!("/org/qemu/Display1/Console_{console}");
@@ -377,14 +399,31 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
                 // Block rather than poll: D-Bus costs 24us/event, so a
                 // poll+sleep here dominated the transport by >100x.
                 if !got {
+                    use std::sync::mpsc::RecvTimeoutError::*;
                     match tokio::task::block_in_place(|| {
                         rx.recv_timeout(std::time::Duration::from_millis(100))
                     }) {
                         Ok(a) => pending.push(a),
-                        Err(_) => {}
+                        Err(Timeout) => {}
+                        // The Vm was dropped, so the only Sender is gone.
+                        // recv_timeout returns Disconnected *immediately*, so
+                        // treating it as a timeout spins this thread on a core
+                        // for the life of the process.
+                        Err(Disconnected) => {
+                            log::info!("guest pump: input channel closed, stopping");
+                            break;
+                        }
                     }
                 }
+                // QEMU went away: the socket closed or errored. Nothing will
+                // ever arrive again, so end the thread and let reconcile_tabs
+                // rebuild the tab when the guest comes back.
+                if conn.is_closed() {
+                    log::info!("guest pump: display connection closed, stopping");
+                    break;
+                }
             }
+            mark_gone(&shared_out);
         });
     });
     (shared, tx)

@@ -20,6 +20,20 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+/// How long to wait for any one QMP reply. QEMU answers in microseconds when
+/// its main loop is running; when the BQL is held by a stuck device model or a
+/// long savevm it answers never. Without this the read blocks forever on the
+/// render thread, and the console freezes with DRM master held and a stale
+/// frame on screen - no keyboard, no tab switch, nothing short of a reboot.
+const QMP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Apply `QMP_TIMEOUT` to both directions of the socket.
+fn set_timeouts(sock: &UnixStream) -> anyhow::Result<()> {
+    sock.set_read_timeout(Some(QMP_TIMEOUT))?;
+    sock.set_write_timeout(Some(QMP_TIMEOUT))?;
+    Ok(())
+}
+
 /// Read one QMP reply, failing on an error object.
 fn qmp_line(r: &mut BufReader<UnixStream>) -> anyhow::Result<String> {
     let mut s = String::new();
@@ -32,6 +46,7 @@ fn qmp_line(r: &mut BufReader<UnixStream>) -> anyhow::Result<String> {
 /// as a D-Bus peer connection.
 pub fn connect_display(qmp: &Path) -> anyhow::Result<OwnedFd> {
     let stream = UnixStream::connect(qmp)?;
+    set_timeouts(&stream)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut w = stream.try_clone()?;
 
@@ -87,6 +102,33 @@ fn send_fd(sock: &UnixStream, fd: i32, payload: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QEMU whose main loop is wedged accepts the connection and then says
+    /// nothing. The handshake must give up, not hang: it runs on the render
+    /// thread, and a hang there freezes the whole console.
+    #[test]
+    fn gives_up_on_a_silent_peer() {
+        let dir = std::env::temp_dir().join(format!("eve-gui-qmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("qmp.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Accept and hold the connection open without ever writing a greeting.
+        let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+
+        let t0 = std::time::Instant::now();
+        let err = connect_display(&path).expect_err("should not hang");
+        let waited = t0.elapsed();
+
+        assert!(
+            waited < QMP_TIMEOUT * 4,
+            "took {waited:?}, which means it was not bounded by QMP_TIMEOUT"
+        );
+        let _ = held.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Any error will do; what matters is that one arrived promptly.
+        let _ = err;
+    }
 
     /// Requires a QEMU started with:
     ///   -display dbus,p2p=on -qmp unix:/tmp/qmp-test.sock,server=on,wait=off

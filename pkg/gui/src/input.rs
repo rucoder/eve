@@ -71,6 +71,9 @@ pub struct Stats {
     pub age_sum_us: std::sync::atomic::AtomicU64,
     pub age_n: std::sync::atomic::AtomicU64,
     pub age_max_us: std::sync::atomic::AtomicU64,
+    /// Events dropped because a guest's input queue was full, i.e. its pump
+    /// stopped draining. Counted rather than logged: this is the hot path.
+    pub guest_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl Stats {
@@ -99,12 +102,18 @@ pub struct State {
 pub struct Handle {
     pub stats: std::sync::Arc<Stats>,
     pub state: std::sync::Arc<std::sync::Mutex<State>>,
-    pub active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<GuestAct>>>>,
+    pub active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>>,
 }
 
 impl Handle {
-    pub fn set_active(&self, tx: std::sync::mpsc::Sender<GuestAct>) {
+    pub fn set_active(&self, tx: std::sync::mpsc::SyncSender<GuestAct>) {
         *self.active_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// No guest owns the keyboard and pointer: events go nowhere rather than
+    /// to whichever VM happens to sit at the old index.
+    pub fn clear_active(&self) {
+        *self.active_tx.lock().unwrap() = None;
     }
 }
 
@@ -115,7 +124,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
         view: (0.0, 0.0, w as f32, h as f32),
         ..Default::default()
     }));
-    let active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<GuestAct>>>> =
+    let active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>> =
         Default::default();
     let stats: std::sync::Arc<Stats> = Default::default();
     let st = state.clone();
@@ -147,7 +156,13 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             // forward to the guest IMMEDIATELY, at device rate
             if !inp.guest.is_empty() {
                 if let Some(t) = tx.lock().unwrap().as_ref() {
-                    for a in inp.guest.drain(..) { let _ = t.send(a); }
+                    // try_send, never send: the queue is bounded, and blocking
+                    // here on a guest whose pump has wedged would stall input
+                    // for the host UI and every other tab too.
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for a in inp.guest.drain(..) {
+                        if t.try_send(a).is_err() { inp.stats.guest_dropped.fetch_add(1, Relaxed); }
+                    }
                 } else { inp.guest.clear(); }
             }
             // publish what the render loop needs
