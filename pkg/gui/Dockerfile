@@ -22,7 +22,12 @@ FROM target-$TARGETARCH AS toolchain
 # Unlike the TUI monitor, this package links against the graphics and input
 # stack: libgbm and libEGL for the scanout, libdrm for KMS, libinput for evdev.
 # hadolint ignore=DL3018
-RUN apk add --no-cache mesa-dev libdrm-dev libinput-dev eudev-dev pkgconf
+RUN apk add --no-cache mesa-dev libdrm-dev libinput-dev libxkbcommon-dev eudev-dev pkgconf
+# Link dynamically against musl. The Rust musl target defaults to a static
+# binary, and there is no static libgbm or libinput to link against - mesa does
+# not ship one - so a static build fails with "library not found: gbm". The
+# shared libraries are installed into the runtime image below.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN echo "Cargo target: $CARGO_BUILD_TARGET"
 
 FROM toolchain AS planer
@@ -48,11 +53,11 @@ RUN cp "/app/target/$CARGO_BUILD_TARGET/release/eve-gui" /app/target/
 # Single source of truth for the version: the crate manifest.
 RUN awk -F'"' '/^version = / {print $2; exit}' Cargo.toml > /app/gui-version.txt
 
-FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS runtime
+FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runtime
 # mesa-dri-gallium carries the iris driver used by Gen12+ Intel graphics, which
 # is what the EGL/GBM path needs at runtime; without it EGL falls back to
 # software or fails outright.
-ENV PKGS="kbd mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs"
+ENV PKGS="kbd mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs libxkbcommon musl"
 RUN eve-alpine-deploy.sh
 
 COPY --from=builder /app/gui-version.txt /tmp/gui-version
