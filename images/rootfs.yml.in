@@ -42,9 +42,9 @@ onboot:
   - name: measure-config
     image: MEASURE_CONFIG_TAG
 services:
-  - name: monitor
-    image: MONITOR_TAG
-    cgroupsPath: /eve/services/monitor
+  - name: gui
+    image: GUI_TAG
+    cgroupsPath: /eve/services/gui
     oomScoreAdj: -999
   - name: vector
     image: VECTOR_TAG

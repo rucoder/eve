@@ -35,7 +35,7 @@ log = "0.4"
 libc = "0.2"
 
 # Pillar's monitor contract: the generated types and the framed client copied
-# from pkg/monitor.
+# from the TUI console this package replaced.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = { version = "3", features = ["base64"] }

@@ -33,4 +33,3 @@ pkg/installer/target
 pkg/installer/vendor/windows*/lib
 pkg/installer/vendor/winapi-*/lib
 pkg/installer/vendor/windows-sys*/src/Windows/
-pkg/monitor/eve-monitor-rs

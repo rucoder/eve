@@ -3,7 +3,7 @@
 EVE has a user-friendly TUI (Text User Interface) that can be used to interact with the system.
 The implementation is consists of two parts
 
-1. Client application responsible for rendering the TUI, sending user input to the server, and handling asynchronous server notification. The client is written in Rust and its source, Dockerfile, and LinuxKit build files are located at `pkg/monitor` (the crate source is under `pkg/monitor/src`). It was previously developed in the standalone repo [https://github.com/lf-edge/eve-monitor-rs](https://github.com/lf-edge/eve-monitor-rs).
+1. Client application responsible for rendering the console, sending user input to the server, and handling asynchronous server notification. The client is written in Rust and its source, Dockerfile, and LinuxKit build files are located at `pkg/gui` (the crate source is under `pkg/gui/src`). It replaced the TUI client `pkg/monitor`, which was previously developed in the standalone repo [https://github.com/lf-edge/eve-monitor-rs](https://github.com/lf-edge/eve-monitor-rs).
 2. Server part is implemented inside [pkg/pillar/cmd/monitor](../pkg/pillar/cmd/monitor/)
 
 The client communicates with the server over UNIX socket
@@ -40,6 +40,4 @@ Rust application can be built and run on Linux host for testing and development 
 
 * Key handling.
 
-  By default `linux` terminal cannot properly handle many key combinations e.g. `PgDwn`, `Ctrl+left, Ctrl + right`, etc. A custom key map must be set to properly handle required combinations. It is done in [pkg/monitor/run-monitor.sh](../pkg/monitor/run-monitor.sh) by calling `loadkeys` utility
-
-  As of now only `Ctrl + [left|right|up|down]` are properly handled.
+  This applied to the TUI client, which read keys through the terminal: the `linux` terminal cannot properly handle many key combinations e.g. `PgDwn`, `Ctrl+left, Ctrl + right`, and a custom key map had to be loaded with `loadkeys`. The graphical console reads evdev directly through libinput and puts the VT keyboard in `K_OFF`, so no key map is involved.

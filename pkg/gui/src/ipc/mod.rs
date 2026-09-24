@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Device state from pillar, over the same socket and message types the TUI
-//! monitor uses. The client is copied from `pkg/monitor`: each linuxkit package
-//! builds in its own Docker context, so a path dependency is impossible, and
-//! this code becomes ours outright once the TUI is removed.
+//! monitor uses. The client was copied from the TUI console it replaced,
+//! `pkg/monitor`: each linuxkit package builds in its own Docker context, so a
+//! path dependency on pillar is impossible.
 
 pub mod ipc_client;
 pub mod message;

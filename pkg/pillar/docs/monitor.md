@@ -1,7 +1,7 @@
 # Monitor service implementation
 
-The monitor service is a simple IPC server which uses a unix socket to communicate with external [rust client](../../monitor/Dockerfile) located at `pkg/monitor`. The server can send asynchronous updates about EVE status to the
-connected client. The information is then used by rust client to display a TUI for the user.
+The monitor service is a simple IPC server which uses a unix socket to communicate with external [rust client](../../gui/Dockerfile) located at `pkg/gui`. The server can send asynchronous updates about EVE status to the
+connected client. The information is then used by rust client to display a graphical console for the user.
 
 ## Client requests
 
