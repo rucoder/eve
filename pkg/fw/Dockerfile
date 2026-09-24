@@ -57,7 +57,7 @@ RUN mkdir -p /nvidia-firmware && \
 ENV RTL8822_FW_VERSION=ca9f4e199efbf8c377e8a1769ba5b05b23f92c82
 ADD https://github.com/lwfinger/rtw88.git#${RTL8822_FW_VERSION} /rtw88
 
-ENV LINUX_FIRMWARE_VERSION=20240811
+ENV LINUX_FIRMWARE_VERSION=20260916
 ENV LINUX_FIRMWARE_URL=https://cdn.kernel.org/pub/linux/kernel/firmware/linux-firmware
 ADD ${LINUX_FIRMWARE_URL}-${LINUX_FIRMWARE_VERSION}.tar.gz /linux-firmware.tar.gz
 RUN mkdir /linux-firmware &&\
@@ -73,17 +73,17 @@ RUN ln -s ../cypress/cyfmac43430-sdio.bin /lib/firmware/brcm/brcmfmac43430-sdio.
 RUN ln -s brcmfmac4356-pcie.gpd-win-pocket.txt '/lib/firmware/brcm/brcmfmac4356-pcie.Kontron America-Agora Gateway 403.txt'
 RUN ln -s brcmfmac4356-pcie.bin '/lib/firmware/brcm/brcmfmac4356-pcie.Kontron America-.bin'
 RUN ln -s brcmfmac4356-pcie.gpd-win-pocket.txt /lib/firmware/brcm/brcmfmac4356-pcie.txt
-# symlinks for Raspberry Pi
+# symlinks for Raspberry Pi. The .txt variants for the 500 and the CM5 are not
+# here: linux-firmware declares those links itself in WHENCE, with the same
+# targets, and creating them again fails the build with "File exists".
 RUN ln -s ../cypress/cyfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,4-model-b.bin
 RUN ln -s ../cypress/cyfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,4-compute-module.bin
 RUN ln -s ../cypress/cyfmac43455-sdio.clm_blob /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,4-compute-module.clm_blob
 RUN ln -s ../cypress/cyfmac43455-sdio.clm_blob /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,4-model-b.clm_blob
 RUN ln -s ../cypress/cyfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,500.bin
 RUN ln -s ../cypress/cyfmac43455-sdio.clm_blob /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,500.clm_blob
-RUN ln -s brcmfmac43455-sdio.raspberrypi,4-model-b.txt /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,500.txt
 RUN ln -s ../cypress/cyfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-compute-module.bin
 RUN ln -s ../cypress/cyfmac43455-sdio.clm_blob /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-compute-module.clm_blob
-RUN ln -s brcmfmac43455-sdio.raspberrypi,4-model-b.txt /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-compute-module.txt
 RUN ln -s ../cypress/cyfmac43455-sdio.bin /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.bin
 RUN ln -s ../cypress/cyfmac43455-sdio.clm_blob /lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.clm_blob
 
@@ -198,6 +198,22 @@ COPY --from=build /lib/firmware/intel/ibt-0040-0041* /lib/firmware/intel/
 # Intel Wi-Fi 6E AX1690i/AX211 (gf4 variant) on Intel-NUC12SNKi7
 COPY --from=build /lib/firmware/iwlwifi-so-a0-gf4-a0-89.ucode /lib/firmware/
 COPY --from=build /lib/firmware/iwlwifi-so-a0-gf4-a0.pnvm /lib/firmware/
+
+# Intel graphics (i915/xe) firmware, needed by the DRM console in pkg/gui.
+# DMC is what the display engine needs for power management; GuC/HuC come with
+# the same families. Gen12 onward only - tgl/rkl (Gen12), adl, mtl, and the
+# xe2/xe3 display blobs. Pre-Gen12 parts still bring up a display without their
+# DMC, they just lose display power management, so they are omitted for size;
+# add their prefixes here if that turns out to matter. Note a COPY glob that
+# matches nothing fails the build, so every prefix here must exist in the
+# pinned linux-firmware release.
+COPY --from=build /lib/firmware/i915/tgl_* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/rkl_* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/adlp_* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/adls_* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/mtl_* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/xe2lpd* /lib/firmware/i915/
+COPY --from=build /lib/firmware/i915/xe3lpd* /lib/firmware/i915/
 # Intel AX201NGW
 COPY --from=build /lib/firmware/iwlwifi-so-a0-hr-b0* /lib/firmware/
 # Intel Wi-Fi 6E AX211 160MHz on ASUS-NUC14SRK (Meteor Lake PCH CNVi)
