@@ -14,6 +14,7 @@ mod drm;
 mod guest;
 mod input;
 mod logger;
+mod qmp;
 mod scanout;
 mod ui;
 mod vt;
@@ -66,7 +67,7 @@ fn spawn_vms(spec: &str) -> Vec<Vm> {
     for entry in spec.split(';').filter(|e| !e.trim().is_empty()) {
         let Some((name, bus)) = entry.split_once('=') else { continue };
         let (name, bus) = (name.trim().to_string(), bus.trim().to_string());
-        let (shared, tx) = guest::spawn(&name, bus, 0);
+        let (shared, tx) = guest::spawn(&name, guest::Transport::Address(bus), 0);
         log::info!("tab {}: {}", vms.len(), name);
         vms.push(Vm::new(name, shared, tx));
     }

@@ -441,6 +441,8 @@ libusb
 libusb-dev
 libuuid
 libuv
+libva
+libva-dev
 libverto
 libverto-dev
 libverto-glib
@@ -464,6 +466,7 @@ libxi
 libxi-dev
 libxinerama
 libxinerama-dev
+libxkbcommon
 libxml2
 libxml2-utils
 libxrandr
@@ -665,7 +668,10 @@ util-macros
 utmps-libs
 vim
 vim-common
+wayland-dev
 wayland-libs-client
+wayland-libs-cursor
+wayland-libs-egl
 wayland-libs-server
 wget
 wireless-tools
@@ -675,6 +681,7 @@ xcb-proto
 xcb-util
 xcb-util-dev
 xfsprogs
+xkeyboard-config
 xorgproto
 xorriso
 xtrans

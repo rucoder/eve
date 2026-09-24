@@ -271,7 +271,16 @@ trait Mouse {
 }
 
 /// Spawn a background thread running the D-Bus listener for `console`.
-pub fn spawn(vm: &str, bus: String, console: u32) -> (Shared, std::sync::mpsc::Sender<crate::input::GuestAct>) {
+/// How to reach a guest's D-Bus display.
+pub enum Transport {
+    /// A bus address. Needs a dbus-daemon, which only the development rig has.
+    Address(String),
+    /// A socket QEMU already accepted through QMP `add_client`. This is the
+    /// EVE path: no bus daemon exists or is needed.
+    Fd(std::os::fd::OwnedFd),
+}
+
+pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync::mpsc::Sender<crate::input::GuestAct>) {
     let shared: Shared = Arc::new(Mutex::new(GuestFrame::default()));
     let out = shared.clone();
     let (tx, rx) = std::sync::mpsc::channel::<crate::input::GuestAct>();
@@ -282,18 +291,31 @@ pub fn spawn(vm: &str, bus: String, console: u32) -> (Shared, std::sync::mpsc::S
             .thread_name(format!("guest:{vm}"))
             .enable_all().build().unwrap();
         rt.block_on(async move {
-            let conn = match zbus::connection::Builder::address(bus.as_str())
-                // The copy path carries whole framebuffers (8 MB at 1920x1080)
-                // per guest frame; unbounded queueing of those is an OOM. We
-                // only ever draw the newest frame, so dropping stale ones is
-                // correct. The dmabuf path sends an fd, not pixels.
-                .map(|b| b.max_queued(4))
-            {
+            // The copy path carries whole framebuffers (8 MB at 1920x1080) per
+            // guest frame; unbounded queueing of those is an OOM. We only ever
+            // draw the newest frame, so dropping stale ones is correct. The
+            // dmabuf path sends an fd, not pixels.
+            let built = match transport {
+                Transport::Address(ref bus) => zbus::connection::Builder::address(bus.as_str())
+                    .map(|b| b.max_queued(4)),
+                Transport::Fd(fd) => {
+                    let std_sock = std::os::unix::net::UnixStream::from(fd);
+                    match std_sock.set_nonblocking(true)
+                        .and_then(|_| tokio::net::UnixStream::from_std(std_sock))
+                    {
+                        Ok(sock) => Ok(zbus::connection::Builder::unix_stream(sock)
+                            .p2p()
+                            .max_queued(4)),
+                        Err(e) => { log::error!("display socket: {e}"); return; }
+                    }
+                }
+            };
+            let conn = match built {
                 Ok(b) => match b.build().await {
                     Ok(c) => c,
-                    Err(e) => { log::error!("connect {bus}: {e}"); return; }
+                    Err(e) => { log::error!("connect display: {e}"); return; }
                 },
-                Err(e) => { log::error!("bad bus address {bus}: {e}"); return; }
+                Err(e) => { log::error!("bad display transport: {e}"); return; }
             };
             let path = format!("/org/qemu/Display1/Console_{console}");
             let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
