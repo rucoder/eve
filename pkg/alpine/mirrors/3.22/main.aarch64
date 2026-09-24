@@ -3,4 +3,5 @@ gcc-gdc
 gcc-gnat
 libgnat
 libgnat-static
+spirv-tools
 xen-libs

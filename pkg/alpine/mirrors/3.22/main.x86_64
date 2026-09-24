@@ -4,4 +4,5 @@ gcc-gnat
 iucode-tool
 libgnat
 libgnat-static
+spirv-tools
 xen-libs
