@@ -3468,3 +3468,41 @@ func TestQemuGlobalConfIntelIGPUSuppressesVirtualIOMMU(t *testing.T) {
 		}
 	}
 }
+
+// A device with a render node gets the GL device variants, which are what
+// export the scanout as a dmabuf for the graphical console; one without keeps
+// the plain devices, because QEMU refuses to start a -gl device with no
+// rendernode. The build host usually has no render node, so the GL branch is
+// only ever exercised here.
+func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
+	t.Parallel()
+
+	render := func(virtualGPU bool, machine string) string {
+		var buf bytes.Buffer
+		ctx := tQemuGlobalConfContext{
+			Machine:            machine,
+			VirtualizationMode: "HVM",
+			VirtualGPU:         virtualGPU,
+		}
+		if err := tQemuGlobalConf.Execute(&buf, ctx); err != nil {
+			t.Fatalf("rendering the global config failed: %v", err)
+		}
+		return buf.String()
+	}
+
+	q35GL := render(true, "q35")
+	if !strings.Contains(q35GL, `driver = "virtio-vga-gl"`) {
+		t.Errorf("q35 with a render node should use virtio-vga-gl, got:\n%s", q35GL)
+	}
+
+	virtGL := render(true, "virt")
+	if !strings.Contains(virtGL, `driver = "virtio-gpu-gl-pci"`) {
+		t.Errorf("virt with a render node should use virtio-gpu-gl-pci, got:\n%s", virtGL)
+	}
+
+	// Without one, and with VNC off, no video device is emitted at all.
+	none := render(false, "q35")
+	if strings.Contains(none, `[device "video0"]`) {
+		t.Errorf("no render node and no VNC should emit no video device, got:\n%s", none)
+	}
+}
