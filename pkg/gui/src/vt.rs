@@ -35,8 +35,9 @@ pub fn install_signal_handlers() {
     }
 }
 
-const KDGKBMODE: libc::c_ulong = 0x4B44;
-const KDSKBMODE: libc::c_ulong = 0x4B45;
+// libc::Ioctl is c_int on musl and c_ulong on glibc; the Dockerfile builds musl.
+const KDGKBMODE: libc::Ioctl = 0x4B44;
+const KDSKBMODE: libc::Ioctl = 0x4B45;
 const K_OFF: i32 = 0x04;
 const K_UNICODE: i32 = 0x03;
 

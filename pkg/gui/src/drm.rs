@@ -172,6 +172,7 @@ pub fn wait_for_flips(
 /// Release DRM master. Without this, stale state is left behind and the next
 /// run renders black until the host is rebooted.
 pub fn drop_master(raw_fd: RawFd) {
-    const DRM_IOCTL_DROP_MASTER: libc::c_ulong = 0x6425;
+    // DRM_IO(0x1f); libc::Ioctl is c_int on musl and c_ulong on glibc.
+    const DRM_IOCTL_DROP_MASTER: libc::Ioctl = 0x641f;
     unsafe { libc::ioctl(raw_fd, DRM_IOCTL_DROP_MASTER) };
 }
