@@ -130,7 +130,9 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            // Guest framebuffer: once per frame, not once per head.
+            reconcile_tabs(&mut vms, &pillar, &mut active);
+
+        // Guest framebuffer: once per frame, not once per head.
             vms[active].update(&mut gpu.renderer, &mut painter, &egui_ctx, cfg.probe, n);
 
             // Guest hardware cursor.
@@ -376,6 +378,50 @@ fn main() -> anyhow::Result<()> {
     );
     shutdown(gpu, heads, vms, painter);
     loop_result
+}
+
+/// Add a tab for each app pillar reports with a display, and drop tabs whose
+/// app has gone. An app without a QMP socket has no virtual GPU and simply
+/// gets no tab.
+fn reconcile_tabs(vms: &mut Vec<Vm>, pillar: &ipc::Shared, active: &mut usize) {
+    let wanted: Vec<(String, String)> = {
+        let p = pillar.lock().unwrap();
+        p.apps
+            .iter()
+            .filter(|a| !a.qmp_socket.is_empty())
+            .map(|a| (a.name.clone(), a.qmp_socket.clone()))
+            .collect()
+    };
+    if wanted.is_empty() && vms.is_empty() {
+        return;
+    }
+
+    vms.retain_mut(|vm| {
+        let keep = wanted.iter().any(|(_, sock)| *sock == vm.source);
+        if !keep {
+            log::info!("tab gone: {}", vm.name);
+            vm.release_gl();
+        }
+        keep
+    });
+
+    for (name, sock) in wanted {
+        if vms.iter().any(|v| v.source == sock) {
+            continue;
+        }
+        match qmp::connect_display(std::path::Path::new(&sock)) {
+            Ok(fd) => {
+                let (shared, tx) = guest::spawn(&name, guest::Transport::Fd(fd), 0);
+                log::info!("tab added: {name} via {sock}");
+                vms.push(Vm::new(name, shared, tx).with_source(sock));
+            }
+            // Routine while a guest is starting: QEMU may not be listening yet.
+            Err(e) => log::debug!("{name}: display not ready ({e})"),
+        }
+    }
+    if *active >= vms.len() {
+        *active = vms.len().saturating_sub(1);
+    }
 }
 
 /// Flatten pillar's network status into (interface, address) rows.

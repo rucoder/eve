@@ -27,6 +27,9 @@ use crate::input::GuestAct;
 /// One tab: a guest, its input channel, and its framebuffer state.
 pub struct Vm {
     pub name: String,
+    /// The QMP socket this tab was created from; the identity we reconcile on.
+    /// Empty for a tab configured by hand through GUI_VMS.
+    pub source: String,
     pub shared: guest::Shared,
     pub tx: std::sync::mpsc::Sender<GuestAct>,
 
@@ -71,6 +74,7 @@ impl Vm {
     ) -> Self {
         Self {
             name,
+            source: String::new(),
             shared,
             tx,
             size: (0, 0),
@@ -83,6 +87,12 @@ impl Vm {
             dma_2d: None,
             dma_cache: HashMap::new(),
         }
+    }
+
+    /// Record which QMP socket this tab came from.
+    pub fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
     }
 
     /// Pick up whatever the guest has produced since the last frame.
