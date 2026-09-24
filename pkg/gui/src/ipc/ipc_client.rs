@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{anyhow, Result};
-use log::warn;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -19,7 +18,7 @@ impl IpcClient {
                     return Ok(unix_stream);
                 }
                 Err(e) => {
-                    warn!(
+                    log::debug!(
                         "Failed to connect to socket: {}. Retrying {}/{}",
                         e,
                         i + 1,

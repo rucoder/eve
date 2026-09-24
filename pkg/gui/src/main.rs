@@ -132,12 +132,14 @@ fn main() -> anyhow::Result<()> {
 
             reconcile_tabs(&mut vms, &pillar, &mut active);
 
-        // Guest framebuffer: once per frame, not once per head.
-            vms[active].update(&mut gpu.renderer, &mut painter, &egui_ctx, cfg.probe, n);
+            // Guest framebuffer: once per frame, not once per head.
+            if let Some(vm) = vms.get_mut(active) {
+                vm.update(&mut gpu.renderer, &mut painter, &egui_ctx, cfg.probe, n);
+            }
 
             // Guest hardware cursor.
-            {
-                let g = vms[active].shared.lock().unwrap();
+            if let Some(vm) = vms.get(active) {
+                let g = vm.shared.lock().unwrap();
                 if g.cursor_seq != cur_seq {
                     if let Some(c) = &g.cursor {
                         cur_seq = g.cursor_seq;
@@ -172,10 +174,11 @@ fn main() -> anyhow::Result<()> {
             let wdt = win_t.elapsed().as_secs_f32();
             if wdt >= 0.5 {
                 fps_now = win_frames as f32 / wdt;
-                gfps_now = vms[active].seq.saturating_sub(win_gseq) as f32 / wdt;
+                let seq = vms.get(active).map_or(0, |v| v.seq);
+                gfps_now = seq.saturating_sub(win_gseq) as f32 / wdt;
                 win_t = std::time::Instant::now();
                 win_frames = 0;
-                win_gseq = vms[active].seq;
+                win_gseq = seq;
             }
 
             let mut act = ui::Actions::default();
@@ -397,7 +400,11 @@ fn reconcile_tabs(vms: &mut Vec<Vm>, pillar: &ipc::Shared, active: &mut usize) {
     }
 
     vms.retain_mut(|vm| {
-        let keep = wanted.iter().any(|(_, sock)| *sock == vm.source);
+        // Tabs from GUI_VMS have no source: they are the developer's, not
+        // pillar's, and removing them because pillar has not heard of them
+        // would delete the only tab on a rig with no pillar at all.
+        let keep = vm.source.is_empty()
+            || wanted.iter().any(|(_, sock)| *sock == vm.source);
         if !keep {
             log::info!("tab gone: {}", vm.name);
             vm.release_gl();
