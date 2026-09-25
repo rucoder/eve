@@ -231,6 +231,7 @@ fn update_state(out: &Shared, msg: &IpcMessage) {
 #[cfg(test)]
 mod gui_client_tests {
     use super::*;
+    use message::Request;
 
     // IpcMessage is adjacently tagged: {"type": ..., "message": ...}. The
     // payloads below are the real ones from
@@ -342,6 +343,26 @@ mod gui_client_tests {
         let wire = r#"{"type":"GPURequest","message":{"domain":"","release":false}}"#;
         match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
             IpcMessage::GPURequest(r) => assert!(!r.release),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// GPUAck travels console -> pillar, so unlike GPURequest it goes through
+    /// the Request envelope (RequestType/RequestData/id) that ipc_server.go's
+    /// `request` struct decodes, not IpcMessage's adjacently-tagged
+    /// type/message envelope. A GPUAck wrongly encoded as
+    /// {"type":"GPUAck","message":{...}} would arrive at pillar as an empty
+    /// RequestType and be rejected by request.validate(), hanging the
+    /// handshake until domainmgr's timeout.
+    #[test]
+    fn decodes_a_gpu_ack_as_a_request() {
+        let wire = r#"{"RequestType":"GPUAck","RequestData":{"domain":"vm1","released":true},"id":7}"#;
+        match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
+            IpcMessage::Request { request: Request::GPUAck(ack), id } => {
+                assert_eq!(ack.domain, "vm1");
+                assert!(ack.released);
+                assert_eq!(id, 7);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }

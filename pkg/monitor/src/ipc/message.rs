@@ -41,6 +41,12 @@ pub enum Request {
     SetInterfaceConfig(SetInterfaceConfig),
     SetServer(String),
     RevertManualConfig(RevertManualConfig),
+    /// The console's answer to a GPURequest, sent once it has actually let go
+    /// of (or reclaimed) DRM master. Travels console -> pillar, so - unlike
+    /// GPURequest - it goes through this Request envelope (RequestType /
+    /// RequestData / id), the same one the TUI's existing requests use, not
+    /// through IpcMessage's adjacently-tagged type/message envelope.
+    GPUAck(GpuAck),
 }
 
 // This is the IPC wire type; variant shapes mirror EVE messages and must not
@@ -63,11 +69,10 @@ pub enum IpcMessage {
     TUIConfig(TuiConfig),
     TpmLogs(TpmLogs),
     /// The release request pillar sends before it binds the GPU to vfio, and
-    /// the restore request once the app releases it. See GPUAck below.
+    /// the restore request once the app releases it. Pillar -> console only;
+    /// the console's answer (GPUAck) travels the other way, through the
+    /// Request envelope below, not this one.
     GPURequest(GpuRequest),
-    /// The console's answer to a GPURequest, sent once it has actually let
-    /// go of (or reclaimed) DRM master.
-    GPUAck(GpuAck),
     Response {
         #[serde(flatten)]
         result: core::result::Result<String, String>,

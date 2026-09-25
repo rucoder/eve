@@ -3,9 +3,18 @@
 
 package monitorapi
 
-// The wire tag must match the IpcMessage variant name in
-// pkg/monitor/src/ipc/message.rs. It is the contract between the two sides and
-// nothing checks it at build time, so it lives in one place.
+// These wire tags must match the Rust side in pkg/monitor/src/ipc/message.rs.
+// Nothing checks that at build time, so they live in one place. The two
+// messages travel in opposite directions and through different envelopes:
+//
+//   - GPURequestTag: pillar -> console, the "type" discriminator of the
+//     adjacently-tagged IpcMessage envelope ({"type":...,"message":...}),
+//     decoded straight into an IpcMessage::GPURequest variant.
+//   - GPUAckTag: console -> pillar, the "RequestType" discriminator of the
+//     request envelope ({"RequestType":...,"RequestData":...,"id":N}) that
+//     also carries SetInterfaceConfig/SetServer/RevertManualConfig - it is a
+//     Request variant, not a top-level IpcMessage variant, because that is
+//     the only envelope pillar's ipc_server.go understands from the console.
 const (
 	GPURequestTag = "GPURequest"
 	GPUAckTag     = "GPUAck"
