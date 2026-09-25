@@ -46,6 +46,20 @@ config:
       major: 226
       minor: 1
       mode: 0660
+    # pick_card probes card0..card3: a box with a discrete GPU alongside the
+    # iGPU, or an extra virtio-gpu, can put the connected head on card2. A node
+    # missing from this list is EACCES, not ENOENT, and the console would
+    # restart in a loop blaming the display.
+    - path: "/dev/dri/card2"
+      type: c
+      major: 226
+      minor: 2
+      mode: 0660
+    - path: "/dev/dri/card3"
+      type: c
+      major: 226
+      minor: 3
+      mode: 0660
     - path: "/dev/dri/renderD128"
       type: c
       major: 226

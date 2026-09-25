@@ -157,7 +157,7 @@ fn main() -> anyhow::Result<()> {
 
             // Guest hardware cursor.
             if let Some(vm) = vms.get(active) {
-                let g = vm.shared.lock().unwrap();
+                let g = guest::frame(&vm.shared);
                 if g.cursor_seq != cur_seq {
                     if let Some(c) = &g.cursor {
                         cur_seq = g.cursor_seq;
@@ -217,7 +217,7 @@ fn main() -> anyhow::Result<()> {
                 tabs.extend(vms.iter().map(|v| v.name.clone()));
                 let (orphans, cursor_visible, has_cursor) = match vms.get(active) {
                     Some(vm) => {
-                        let g = vm.shared.lock().unwrap();
+                        let g = guest::frame(&vm.shared);
                         (g.orphan_updates, g.cursor_visible, g.cursor.is_some())
                     }
                     None => (0, false, false),
@@ -477,7 +477,7 @@ fn reconcile_tabs(
         // re-attaches when the guest comes back. A hand-configured tab is
         // exempt: nothing would ever re-create it, so dropping it would strip
         // the rig of its only tab permanently rather than for one reconnect.
-        let alive = vm.source.is_empty() || !vm.shared.lock().map(|f| f.gone).unwrap_or(true);
+        let alive = vm.source.is_empty() || !guest::frame(&vm.shared).gone;
         let keep = listed && alive;
         if !keep {
             log::info!("tab gone: {} ({})", vm.name, if listed { "guest died" } else { "app removed" });
@@ -614,6 +614,26 @@ mod tests {
             ..Default::default()
         };
         std::sync::Arc::new(std::sync::Mutex::new(st))
+    }
+
+    /// A panic in one guest's listener must not take the console with it.
+    /// `.unwrap()` on a poisoned mutex from the render thread skips shutdown(),
+    /// which leaves DRM master and the GL objects behind and the panel black
+    /// until the box is rebooted.
+    #[test]
+    fn a_poisoned_guest_mutex_does_not_kill_the_render_thread() {
+        let vm = a_vm("vm1", "/nonexistent/eve-gui-test/qmp");
+        let shared = vm.shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = shared.lock().unwrap();
+            panic!("a guest listener died");
+        })
+        .join();
+        assert!(vm.shared.is_poisoned(), "the test needs a poisoned mutex");
+
+        // The render thread's accessor must still hand back the frame.
+        let f = guest::frame(&vm.shared);
+        assert!(!f.gone);
     }
 
     /// A guest that reboots keeps its QMP socket path, so pillar keeps listing

@@ -48,13 +48,24 @@ pub struct Gpu {
 /// across machines - the same GUI needs card1 on one box and card0 on another -
 /// and picking a card with no output looks identical to a broken renderer.
 fn has_connected_output(path: &str) -> bool {
-    let Ok(file) = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
-    else {
-        return false;
+    {
+        Ok(f) => f,
+        Err(e) => {
+            // Say which error it was. EACCES from the container's device
+            // cgroup and ENOENT from a node that does not exist are the same
+            // `false` here, but only one of them is a packaging bug - and the
+            // caller's "no card with a connected output" points at the display
+            // either way, which sends you looking in the wrong place.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("{path}: {e}");
+            }
+            return false;
+        }
     };
     let fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
     let Ok((drm, _n)) = DrmDevice::new(fd, false) else {

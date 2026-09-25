@@ -86,6 +86,13 @@ fn parse(var: &str, dflt: log::LevelFilter) -> log::LevelFilter {
     }
 }
 
+/// Cap for the log file. /run is tmpfs on EVE, so every byte here is RAM the
+/// device cannot use for anything else.
+const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Largest single write, and so the most the file may overshoot its cap.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
 pub fn init() {
     let ours = parse("GUI_LOG", log::LevelFilter::Info);
     let deps = parse("GUI_LOG_DEPS", log::LevelFilter::Warn);
@@ -104,6 +111,12 @@ pub fn init() {
                 None
             }
         };
+        // Bytes in the current file, so the cap survives a restart appending
+        // to an existing one.
+        let mut written: u64 = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map_or(0, |m| m.len());
         // Blocks on recv - no polling. Wakes only when there is something.
         while let Ok(first) = rx.recv() {
             let mut buf = String::new();
@@ -115,11 +128,38 @@ pub fn init() {
                     Msg::Sync(a) => acks.push(a),
                 }
                 // Drain whatever else queued while we were busy: one write for
-                // the whole burst.
+                // the whole burst - but a bounded one. An unbounded drain lets
+                // a backlog become a single write, which both holds the whole
+                // backlog in memory and skips past the file cap in one go.
+                if buf.len() >= MAX_BATCH_BYTES { break; }
                 match rx.try_recv() { Ok(m) => msg = m, Err(_) => break }
             }
             if !buf.is_empty() {
                 if let Some(f) = file.as_mut() {
+                    // /run is tmpfs, so this file is RAM. An error on a
+                    // per-frame path - a head that lost master, input against a
+                    // dead guest - writes at the frame rate, and filling /run
+                    // breaks writes for pillar and everything else on the box
+                    // long before anyone looks at the log. Start over at the
+                    // cap rather than rotating: the recent lines are the ones
+                    // worth having, and a rename needs somewhere to put the old
+                    // file.
+                    written += buf.len() as u64;
+                    if written > LOG_MAX_BYTES {
+                        // The file is open in append mode, so writes go to
+                        // the end regardless of the offset - truncating alone
+                        // is enough, no seek needed.
+                        match f.set_len(0) {
+                            Ok(_) => {
+                                written = buf.len() as u64;
+                                let _ = writeln!(f, "--- log restarted at {LOG_MAX_BYTES} bytes ---");
+                            }
+                            Err(e) => {
+                                let _ = writeln!(std::io::stderr(), "logger: cannot truncate: {e}");
+                                written = 0; // do not spin on a failing truncate
+                            }
+                        }
+                    }
                     let _ = f.write_all(buf.as_bytes());
                     let _ = f.flush();
                 }
@@ -149,5 +189,48 @@ pub fn drain() {
         if l.tx.send(Msg::Sync(tx)).is_ok() {
             let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    /// /run is tmpfs, so an unbounded log is RAM the device cannot use. A
+    /// per-frame error path writes at the frame rate; filling /run breaks
+    /// writes for pillar too, long before anyone reads the log.
+    /// Flush every so often without pulling in a dependency.
+    fn fastrand_ish() -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed) % 97 == 0
+    }
+
+    #[test]
+    fn the_log_file_is_capped() {
+        let dir = std::env::temp_dir().join(format!("eve-gui-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        std::env::set_var("GUI_LOG_FILE", &path);
+        super::init();
+
+        // Three times the cap: a per-frame error path reaches this in minutes.
+        let spam = "x".repeat(4096);
+        for _ in 0..(3 * super::LOG_MAX_BYTES / 4096) {
+            log::info!("{spam}");
+            // Let the writer keep up, so this exercises many bursts rather
+            // than one enormous one.
+            if fastrand_ish() { super::drain(); }
+        }
+        super::drain();
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let allowed = super::LOG_MAX_BYTES + super::MAX_BATCH_BYTES as u64;
+        assert!(
+            len <= allowed,
+            "log grew to {len} bytes, past the {allowed}-byte ceiling"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::io::stderr().flush();
     }
 }

@@ -57,18 +57,40 @@ pub struct Vm {
     pub dma_flip: bool,
     dma_tex: Option<GlesTexture>,
     dma_2d: Option<GlesTexture>,
-    /// Imported scanout textures, keyed by dma-buf inode.
+    /// Imported scanout textures, keyed by dma-buf identity.
     ///
     /// An installed GNOME sends a NEW `ScanoutDMABUF` every frame because it
     /// rotates its buffers, where Windows sends one and then only
     /// `UpdateDMABUF`. Re-importing an EGLImage, rebuilding the blit target and
     /// re-registering an egui texture on every one of those - at 60Hz - was
-    /// throttling the guest badly. The buffers repeat, so key on the inode.
-    dma_cache: HashMap<u64, GlesTexture>,
+    /// throttling the guest badly. The buffers repeat, so key on their identity.
+    ///
+    /// The `Dmabuf` is kept beside the texture, and not merely dropped after
+    /// the import, so that our own open fd pins the dma-buf for as long as the
+    /// entry lives. An inode is reused the moment its last reference goes, so
+    /// without that a guest compositor that tears down and reallocates its
+    /// buffer set - a session restart, a mode set to the same mode - could land
+    /// a new buffer on a cached inode and be served the old, freed texture:
+    /// stale pixels on screen, nothing logged, and nothing that recovers short
+    /// of a resize.
+    dma_cache: HashMap<BufferKey, (GlesTexture, Dmabuf)>,
 }
 
 /// More buffers than any sane compositor rotates; a resize also clears it.
 const DMA_CACHE_MAX: usize = 8;
+
+/// What makes one imported scanout buffer the same as another. The inode alone
+/// is not enough even with the fd pinned: a guest may hand back the same buffer
+/// re-described, and sampling it through the old geometry would tear.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct BufferKey {
+    ino: u64,
+    w: u32,
+    h: u32,
+    stride: u32,
+    fourcc: u32,
+    modifier: u64,
+}
 
 impl Vm {
     pub fn new(
@@ -110,7 +132,7 @@ impl Vm {
         probe: bool,
         frame: u32,
     ) {
-        if std::mem::take(&mut self.shared.lock().unwrap().copy_takeover) && self.dma_id.is_some() {
+        if std::mem::take(&mut guest::frame(&self.shared).copy_takeover) && self.dma_id.is_some() {
             log::info!("{}: guest switched back to the copy path", self.name);
             self.release_gl();
         }
@@ -121,7 +143,7 @@ impl Vm {
 
     /// dmabuf path: import (or reuse) the buffer QEMU handed us.
     fn take_scanout(&mut self, renderer: &mut GlowRenderer) {
-        let d = match self.shared.lock().unwrap().dmabuf.take() {
+        let d = match guest::frame(&self.shared).dmabuf.take() {
             Some(d) => d,
             None => return,
         };
@@ -129,8 +151,16 @@ impl Vm {
         let new_size = egui::vec2(d.w as f32, d.h as f32);
         let resized = self.dma_size != new_size;
 
+        let key = BufferKey {
+            ino: d.ino,
+            w: d.w,
+            h: d.h,
+            stride: d.stride,
+            fourcc: d.fourcc,
+            modifier: d.modifier,
+        };
         let cached = (d.ino != 0)
-            .then(|| self.dma_cache.get(&d.ino).cloned())
+            .then(|| self.dma_cache.get(&key).map(|(t, _)| t.clone()))
             .flatten();
         let tex = match cached {
             Some(t) => Some(t),
@@ -145,9 +175,11 @@ impl Vm {
                     b.add_plane(d.fd, 0, 0, d.stride);
                     b.build()
                 });
-                let t = built.and_then(|buf| renderer.import_dmabuf(&buf, None).ok());
-                match &t {
-                    Some(t) => {
+                let imported = built.and_then(|buf| {
+                    renderer.import_dmabuf(&buf, None).ok().map(|t| (t, buf))
+                });
+                match imported {
+                    Some((t, buf)) => {
                         if resized || self.dma_cache.is_empty() {
                             log::info!("imported scanout dmabuf {}x{} zero-copy", d.w, d.h);
                         } else {
@@ -158,16 +190,21 @@ impl Vm {
                             if resized || self.dma_cache.len() > DMA_CACHE_MAX {
                                 self.dma_cache.clear();
                             }
-                            self.dma_cache.insert(d.ino, t.clone());
+                            // Storing `buf` keeps our fd open, which is what
+                            // makes the inode in the key trustworthy.
+                            self.dma_cache.insert(key, (t.clone(), buf));
                         }
+                        Some(t)
                     }
-                    None => log::error!(
-                        "dmabuf import FAILED (fourcc=0x{:08x} mod=0x{:x})",
-                        d.fourcc,
-                        d.modifier
-                    ),
+                    None => {
+                        log::error!(
+                            "dmabuf import FAILED (fourcc=0x{:08x} mod=0x{:x})",
+                            d.fourcc,
+                            d.modifier
+                        );
+                        None
+                    }
                 }
-                t
             }
         };
 
@@ -186,7 +223,7 @@ impl Vm {
 
     /// Copy path: upload the pixels, damaged rectangle only where we can.
     fn upload_copy(&mut self, egui_ctx: &egui::Context) {
-        let mut g = self.shared.lock().unwrap();
+        let mut g = guest::frame(&self.shared);
         if self.dma_id.is_some() {
             // Only the copy branch advances seq, and it is skipped on the
             // dmabuf path - so the frame counter and guest rate read 0 forever.
@@ -285,8 +322,14 @@ impl Vm {
         }
         if self.dma_id.is_none() {
             let id = target.tex_id();
-            let gl_tex = glow::NativeTexture(std::num::NonZeroU32::new(id).unwrap());
-            self.dma_id = Some(painter.register_native_texture(gl_tex));
+            // A panic here skips shutdown(), which leaves DRM master and the
+            // GL objects behind and the panel black until the box is rebooted.
+            // Texture 0 means the blit failed; drawing nothing is recoverable.
+            let Some(id) = std::num::NonZeroU32::new(id) else {
+                log::error!("{}: blit produced texture 0, skipping this frame", self.name);
+                return;
+            };
+            self.dma_id = Some(painter.register_native_texture(glow::NativeTexture(id)));
             log::info!("external->2D blit active, egui texture registered");
         }
     }

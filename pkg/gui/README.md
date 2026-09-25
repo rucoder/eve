@@ -39,10 +39,15 @@ though Windows has no 3D guest driver — only the host side changes.
 
 ### QEMU configuration that matters
 
-Pass **`-vga none`**. `q35` adds an implicit default VGA adapter, so a guest
-given `virtio-gpu-gl-pci` sees *two* DRM cards (`bochs-drm` and virtio) and may
-render to the one we are not watching — which looks like a rendering bug, and
-additionally denies it a hardware cursor plane.
+A guest must end up with exactly **one** DRM card. `q35` adds an implicit
+default VGA adapter, so a guest given `virtio-gpu-gl-pci` alongside it sees
+*two* (`bochs-drm` and virtio) and may render to the one we are not watching —
+which looks like a rendering bug, and additionally denies it a hardware cursor
+plane.
+
+On EVE this is already handled: `domainmgr` passes `-nodefaults`, which
+suppresses the implicit adapter, so `-vga none` is unnecessary there. Pass
+`-vga none` when starting QEMU by hand.
 
 ## Configuration
 
@@ -51,7 +56,7 @@ All optional; a positional argument overrides `GUI_CARD`.
 | variable | default | meaning |
 |---|---|---|
 | `GUI_VMS` | – | `name=<d-bus addr>` pairs, **semicolon** separated (an address contains a comma) |
-| `GUI_CARD` | `/dev/dri/card0` | DRM device |
+| `GUI_CARD` | probed | DRM device; unset, `card0..card3` are probed and the first with a connected output wins |
 | `GUI_ORIENT` | `1` | 0=none 1=flipY 2=flipX 3=rot180 |
 | `GUI_PTR_SCALE` | `1.0` | pointer sensitivity; motion is otherwise raw 1:1 |
 | `GUI_FRAMES` | `0` | frame limit, 0 = run until signalled |
@@ -76,12 +81,14 @@ scanout, pointer motion does not reliably.
 
 ## Known gaps
 
-* **Not yet wired to pillar.** `run-gui.sh` reads guest bus addresses from
-  `/run/eve-gui/vms`; nothing writes that file yet, and `domainmgr` does not
-  start guests with `-display dbus`.
+* **`GUI_VMS` is a development path only.** On EVE the tabs come from pillar
+  over `/run/monitor.sock`, and each one attaches to its app's QMP socket. A
+  tab named in `GUI_VMS` is kept whatever pillar says, and is never rebuilt if
+  its guest dies, because nothing else knows about it.
 * **No input hotplug.** libinput devices are enumerated once at startup, so a
   keyboard or mouse plugged in later is not seen.
-* **The kernel needs DRM.** `CONFIG_DRM` is unset in EVE's 6.12 kernel; the
-  6.18 hwe flavor carries `i915`/`xe`/`virtio-gpu`.
+* **The kernel needs DRM.** `CONFIG_DRM` is unset in EVE's stock 6.12 kernel;
+  the core flavor on the `drm-core` branch enables `DRM`, `DRM_I915` and
+  `DRM_VIRTIO_GPU`. Build with `KERNEL_TAG` pointing at that kernel.
 * Windows has no 3D guest driver, so its desktop is still software-rendered.
   That is a guest-side gap, unrelated to the transport.

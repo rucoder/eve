@@ -47,7 +47,10 @@ COPY --from=cacher /app/target /app/target
 COPY --from=cacher $CARGO_HOME $CARGO_HOME
 RUN echo "Cargo target: $CARGO_BUILD_TARGET"
 
-RUN cargo build --release
+# --locked: the package must build the dependency set Cargo.lock names, not
+# whatever resolves today. Without it the shipped binary and the one CI tested
+# can differ silently.
+RUN cargo build --locked --release
 RUN cargo sbom > sbom.spdx.json
 RUN cp "/app/target/$CARGO_BUILD_TARGET/release/eve-gui" /app/target/
 # Single source of truth for the version: the crate manifest.

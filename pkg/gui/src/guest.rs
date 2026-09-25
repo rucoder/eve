@@ -138,18 +138,22 @@ impl Listener {
         let bpp = 4usize;
         let (gw, gh) = { let g = self.f.lock().unwrap(); (g.w as usize, g.h as usize) };
         if self.raw.is_empty() || gw == 0 { return; }
+        // Clamp before the cast: `x as usize` on a negative i32 is a huge
+        // number, and the bounds check below then wraps in release mode rather
+        // than rejecting it. The guest supplies these.
+        let (x0, y0) = (x.max(0) as usize, y.max(0) as usize);
         for row in 0..h.max(0) as usize {
-            let dy = y as usize + row;
+            let dy = y0 + row;
             if dy >= gh { break; }
             let s = row * stride as usize;
-            let d = dy * self.stride as usize + x as usize * bpp;
+            let d = dy * self.stride as usize + x0 * bpp;
             let len = (w.max(0) as usize * bpp).min(data.len().saturating_sub(s));
             if d + len <= self.raw.len() && s + len <= data.len() {
                 self.raw[d..d + len].copy_from_slice(&data[s..s + len]);
             }
         }
         self.tick(w.max(0) as u32, h.max(0) as u32);
-        self.repack(x.max(0) as u32, y.max(0) as u32, w.max(0) as u32, h.max(0) as u32);
+        self.repack(x0 as u32, y0 as u32, w.max(0) as u32, h.max(0) as u32);
     }
     #[zbus(name = "ScanoutDMABUF")]
     async fn scanout_dmabuf(&mut self, fd: Fd<'_>, w: u32, h: u32, stride: u32,
@@ -283,6 +287,17 @@ pub enum Transport {
     /// A socket QEMU already accepted through QMP `add_client`. This is the
     /// EVE path: no bus daemon exists or is needed.
     Fd(std::os::fd::OwnedFd),
+}
+
+/// Lock a guest's frame from the render thread, tolerating poisoning.
+///
+/// A panic in one guest's listener poisons only that guest's mutex, but
+/// `.unwrap()` on the render side would turn it into a panic on the render
+/// thread - which skips shutdown(), leaves DRM master and the GL objects
+/// behind, and leaves the panel black until the box is rebooted. One guest
+/// must not be able to do that to the console.
+pub fn frame(shared: &Shared) -> std::sync::MutexGuard<'_, GuestFrame> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Mark the tab dead so the render loop tears it down and retries.
