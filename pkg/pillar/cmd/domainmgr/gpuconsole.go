@@ -46,8 +46,14 @@ func waitForRelease(poll func() (found bool, released bool), timeout time.Durati
 	return false
 }
 
-// drainGPUConsoleStatus processes one pending GPUConsoleStatus change, if any
-// arrives within a short window, so a subsequent Get() reflects it.
+// drainGPUConsoleStatus processes every GPUConsoleStatus change already
+// sitting on the channel, non-blocking, so a subsequent Get() reflects the
+// latest one. It does not wait for a change that hasn't arrived yet -
+// waitForRelease's own 50ms poll cadence provides that; blocking here too
+// would only delay noticing a message that arrived just after an empty
+// drain (an immediate {Released:false} answer consuming one drain, with the
+// real ack left queued until the next poll instead of being picked up
+// alongside it).
 //
 // releaseGPUForDomain runs on the same goroutine that would otherwise service
 // subGPUConsoleStatus's channel from Run()'s select loop: doAssignIoAdapters-
@@ -55,14 +61,15 @@ func waitForRelease(poll func() (found bool, released bool), timeout time.Durati
 // handleGlobalConfigImpl, both run inline on it, not on a spawned goroutine.
 // While that single goroutine is blocked here polling, nothing else can call
 // ProcessChange for this subscription, so Get() would otherwise only ever
-// see whatever was cached before the wait began. Draining the channel
-// ourselves is what lets an ack that arrives during the wait actually be
-// observed.
+// see whatever was cached before the wait began.
 func drainGPUConsoleStatus(ctx *domainContext) {
-	select {
-	case change := <-ctx.subGPUConsoleStatus.MsgChan():
-		ctx.subGPUConsoleStatus.ProcessChange(change)
-	case <-time.After(10 * time.Millisecond):
+	for {
+		select {
+		case change := <-ctx.subGPUConsoleStatus.MsgChan():
+			ctx.subGPUConsoleStatus.ProcessChange(change)
+		default:
+			return
+		}
 	}
 }
 
@@ -96,6 +103,8 @@ func releaseGPUForDomain(ctx *domainContext, domain string, timeout time.Duratio
 	if !released {
 		log.Warnf("releaseGPUForDomain(%s): console did not release the GPU "+
 			"within %s; proceeding with passthrough anyway", domain, timeout)
+	} else {
+		ctx.gpuReleased = true
 	}
 	return released
 }
@@ -107,6 +116,7 @@ func releaseGPUForDomain(ctx *domainContext, domain string, timeout time.Duratio
 // the same "the caller wins" rule as releaseGPUForDomain - nothing here
 // should be able to block on the console either.
 func restoreGPUToConsole(ctx *domainContext, domain string) {
+	ctx.gpuReleased = false
 	cfg := types.GPUConsoleConfig{Domain: domain, Release: false, RequestID: nextGPURequestID()}
 	if err := ctx.pubGPUConsoleConfig.Publish(cfg.Key(), cfg); err != nil {
 		log.Errorf("restoreGPUToConsole(%s): failed to publish GPUConsoleConfig: %v", domain, err)

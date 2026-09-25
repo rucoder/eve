@@ -31,11 +31,14 @@ type GPURequest struct {
 	Release bool `json:"release"`
 }
 
-// GPUAck is the console's answer. Released mirrors the request it is
-// answering, so a late ack for a superseded request is recognisable.
+// GPUAck is the console's answer. RequestID echoes the GPURequest it is
+// answering, so pillar can drop a late ack for a request that has since been
+// superseded by a newer one (Released only distinguishes a release-ack from
+// a restore-ack, not one release-ack from the next).
 type GPUAck struct {
-	Domain   string `json:"domain"`
-	Released bool   `json:"released"`
+	Domain    string `json:"domain"`
+	Released  bool   `json:"released"`
+	RequestID uint64 `json:"request_id"`
 }
 
 // NewGPURequest builds the request domainmgr sends to ask the console to give

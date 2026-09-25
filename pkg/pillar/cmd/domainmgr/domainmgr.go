@@ -132,9 +132,17 @@ type domainContext struct {
 	subNodeAgentStatus     pubsub.Subscription
 	pubGPUConsoleConfig    pubsub.Publication
 	subGPUConsoleStatus    pubsub.Subscription
-	cipherMetrics          *cipher.AgentMetrics
-	createSema             *sema.Semaphore
-	GCComplete             bool
+	// gpuReleased is true once the console has acked (or a release has
+	// otherwise been resolved) since the last restoreGPUToConsole. All
+	// readers/writers run inline on the single goroutine that drives
+	// Run()'s select loop (see drainGPUConsoleStatus's doc comment), so a
+	// plain bool is safe. It lets updatePortAndPciBackIoMember's pool-fill
+	// hook skip a redundant wait when updateVgaAccess already released the
+	// GPU earlier in the same call chain.
+	gpuReleased   bool
+	cipherMetrics *cipher.AgentMetrics
+	createSema    *sema.Semaphore
+	GCComplete    bool
 
 	usbAccess               bool
 	setInitialUsbAccess     bool
@@ -4223,8 +4231,11 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 			// vgaAccess knob via updateVgaAccess, and a fresh device
 			// inventory via handlePhysicalIOAdapterListImpl) - ask the
 			// console to let go first, regardless of which caller got us
-			// here. isBootVGA bounds it to at most one wait per pass.
-			if isBootVGA(ib) {
+			// here. isBootVGA bounds it to at most one wait per pass, and
+			// gpuReleased skips it entirely when updateVgaAccess already
+			// released the GPU earlier in this same call chain - otherwise
+			// a vgaAccess=false flip pays the wait twice.
+			if isBootVGA(ib) && !ctx.gpuReleased {
 				releaseGPUForDomain(ctx, "", gpuReleaseTimeout)
 			}
 			err := hyper.PCIReserve(ib.PciLong)

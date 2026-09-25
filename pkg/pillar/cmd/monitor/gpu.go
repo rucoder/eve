@@ -8,10 +8,12 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types/monitorapi"
 )
 
-// gpuStatusFor is the answer to a release request. With no console attached
-// there is nobody holding DRM master, so the GPU is already free and the
-// answer is immediate - a device whose console has died must not stop an app
-// from starting.
+// gpuStatusFor is the answer to a config change. With no console attached
+// there is nobody holding DRM master, so a release request is trivially
+// satisfied - a device whose console has died must not stop an app from
+// starting. A restore with no console attached is answered the same way
+// (Released: true) purely because there is nothing to wait for either; it is
+// not claiming the GPU was released.
 func (ctx *monitor) gpuStatusFor(cfg types.GPUConsoleConfig, clientAttached bool) types.GPUConsoleStatus {
 	if !clientAttached {
 		return types.GPUConsoleStatus{Domain: cfg.Domain, Released: true, RequestID: cfg.RequestID}
@@ -27,8 +29,8 @@ func (ctx *monitor) gpuStatusFor(cfg types.GPUConsoleConfig, clientAttached bool
 func (ctx *monitor) handleGPUConsoleConfig(cfg types.GPUConsoleConfig) {
 	attached := ctx.IPCServer.hasClient()
 	if attached {
-		// GPUAck (console -> pillar) only echoes Domain, not RequestID, so
-		// remember it here for handleGPUAck to stamp onto the real status.
+		// Remember the in-flight id so handleGPUAck can drop a late ack for
+		// a request this has since superseded.
 		ctx.pendingGPURequestID.Store(cfg.RequestID)
 		req := monitorapi.NewGPURequest(cfg.Domain, cfg.Release)
 		if err := ctx.IPCServer.sendIpcMessage(monitorapi.GPURequestTag, req); err != nil {
@@ -38,12 +40,20 @@ func (ctx *monitor) handleGPUConsoleConfig(cfg types.GPUConsoleConfig) {
 	ctx.publishGPUConsoleStatus(ctx.gpuStatusFor(cfg, attached))
 }
 
-// handleGPUAck publishes what the console reported.
+// handleGPUAck publishes what the console reported, unless it answers a
+// request that has since been superseded by a newer one: pendingGPURequestID
+// is a single slot, not a queue, so a slow console's ack for an old request
+// must not be mistaken for an answer to the current one.
 func (ctx *monitor) handleGPUAck(ack monitorapi.GPUAck) {
+	if pending := ctx.pendingGPURequestID.Load(); ack.RequestID != pending {
+		log.Warnf("handleGPUAck: dropping ack for request %d, %d is pending",
+			ack.RequestID, pending)
+		return
+	}
 	ctx.publishGPUConsoleStatus(types.GPUConsoleStatus{
 		Domain:    ack.Domain,
 		Released:  ack.Released,
-		RequestID: ctx.pendingGPURequestID.Load(),
+		RequestID: ack.RequestID,
 	})
 }
 

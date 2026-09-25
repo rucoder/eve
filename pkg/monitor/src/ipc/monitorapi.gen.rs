@@ -275,6 +275,8 @@ pub struct GpuAck {
     pub domain: String,
     #[serde(rename = "released")]
     pub released: bool,
+    #[serde(rename = "request_id")]
+    pub request_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

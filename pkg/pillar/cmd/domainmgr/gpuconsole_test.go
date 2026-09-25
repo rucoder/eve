@@ -137,10 +137,22 @@ func TestReleaseObservesAnAckThatArrivesDuringTheWait(t *testing.T) {
 	ctx, monitorPub := newGPUConsoleTestContext(t)
 
 	result := make(chan bool, 1)
+	resultConsumed := false
 	start := time.Now()
 	go func() {
 		result <- releaseGPUForDomain(ctx, "vm1", 5*time.Second)
 	}()
+	// If a t.Fatal below fires before the select at the bottom consumes
+	// result, the goroutine must not keep running against ctx and the
+	// package log past the end of the test - block here until it finishes.
+	// resultConsumed guards against double-receiving on the normal path,
+	// where the select below already drained the one value this channel
+	// ever gets.
+	t.Cleanup(func() {
+		if !resultConsumed {
+			<-result
+		}
+	})
 
 	// Wait for the request to actually be published, then answer it the way
 	// the monitor agent would - after domainmgr has started waiting, not
@@ -167,6 +179,7 @@ func TestReleaseObservesAnAckThatArrivesDuringTheWait(t *testing.T) {
 
 	select {
 	case ok := <-result:
+		resultConsumed = true
 		if !ok {
 			t.Error("expected the release to be observed as successful")
 		}
@@ -184,11 +197,27 @@ func TestReleaseObservesAnAckThatArrivesDuringTheWait(t *testing.T) {
 // matches (it is "" on every restore and every updateVgaAccess call). Before
 // the request-id fix, this test returns true almost instantly instead of
 // timing out.
+//
+// The planted id is captured from nextGPURequestID() itself, not a fixed
+// literal: gpuRequestID is a package-global counter starting at 0, so a
+// small literal (e.g. 1) can collide with the real request this test's own
+// releaseGPUForDomain call generates when this test happens to run first in
+// the process - flaky in isolation, masked by the full package run where
+// earlier tests have already bumped the counter. Capturing the id here and
+// consuming it before the real call guarantees the real call gets the next
+// one instead, so they can never collide regardless of run order.
+// (math.MaxUint64 was tried first and rejected: it does not survive this
+// package's pubsub memdriver round-trip - the value comes back altered,
+// "18446744073709552000" instead of "...551615", and fails to unmarshal,
+// apparently via a float64 intermediate somewhere in the driver. Not a
+// concern for the real counter, which will never get remotely close to
+// that range, but unusable as a test sentinel here.)
 func TestReleaseIgnoresAStaleStatusFromAPreviousCycle(t *testing.T) {
 	ctx, monitorPub := newGPUConsoleTestContext(t)
 
+	staleID := nextGPURequestID()
 	if err := monitorPub.Publish(types.GPUConsoleStatus{}.Key(), types.GPUConsoleStatus{
-		Domain: "", Released: true, RequestID: 1,
+		Domain: "", Released: true, RequestID: staleID,
 	}); err != nil {
 		t.Fatal(err)
 	}
