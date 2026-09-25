@@ -11,8 +11,8 @@ import (
 )
 
 // rustOutRel is the committed generated Rust file, relative to this package
-// (pkg/pillar/types/monitorapi -> pkg/gui/src/ipc).
-var rustOutRel = filepath.Join("..", "..", "..", "gui", "src", "ipc", "monitorapi.gen.rs")
+// (pkg/pillar/types/monitorapi -> pkg/monitor/src/ipc).
+var rustOutRel = filepath.Join("..", "..", "..", "monitor", "src", "ipc", "monitorapi.gen.rs")
 
 // TestGeneratedUpToDate is the CI drift-gate: it regenerates both the Go codec
 // and the Rust contract into a temp dir and fails if they differ from the
@@ -30,7 +30,7 @@ func TestGeneratedUpToDate(t *testing.T) {
 
 	assertSame(t, filepath.Join(tmp, "union_json.gen.go"), "union_json.gen.go")
 
-	// The Rust comparison needs the sibling pkg/gui checkout. EVE's
+	// The Rust comparison needs the sibling pkg/monitor checkout. EVE's
 	// `make test` builds pillar in isolation without it; there we skip this
 	// half — the Rust Tests workflow runs the full gate against a complete
 	// checkout (see .github/workflows/rust-tests.yml).

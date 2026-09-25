@@ -11,8 +11,8 @@ on:  # yamllint disable-line rule:truthy
       - "feature/*"
     paths:
       # Extend this list when adding a crate to the matrix below.
-      - 'pkg/gui/**'
-      - 'pkg/pillar/types/monitorapi/**'  # contract source for pkg/gui
+      - 'pkg/monitor/**'
+      - 'pkg/pillar/types/monitorapi/**'  # contract source for pkg/monitor
       - '.github/workflows/rust-tests.yml'
   pull_request:
     branches:
@@ -21,7 +21,7 @@ on:  # yamllint disable-line rule:truthy
       - "[0-9]+.[0-9]+-stable"
       - "feature/*"
     paths:
-      - 'pkg/gui/**'
+      - 'pkg/monitor/**'
       - 'pkg/pillar/types/monitorapi/**'
       - '.github/workflows/rust-tests.yml'
 
@@ -39,7 +39,7 @@ jobs:
         # To add a crate, add its directory here (and its path to the `paths`
         # filters above). Each entry must contain a Cargo.toml.
         crate:
-          - pkg/gui
+          - pkg/monitor
           # - pkg/installer
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -64,9 +64,9 @@ jobs:
             cargo test --locked
 
   # Verify the committed generated contract (Rust + Go union codec) matches what
-  # the generator produces. This needs both pkg/pillar and pkg/gui, so it
+  # the generator produces. This needs both pkg/pillar and pkg/monitor, so it
   # runs against a full checkout with Go available (EVE's `make test` builds
-  # pillar in isolation and can't see pkg/gui).
+  # pillar in isolation and can't see pkg/monitor).
   generated:
     name: generated code up to date
     runs-on: zededa-ubuntu-2204
