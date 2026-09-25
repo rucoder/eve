@@ -4194,6 +4194,13 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 			}
 		}
 		ib.IsPCIBack = false
+		if isBootVGA(ib) {
+			// The boot VGA just left pciback by a route other than
+			// restoreGPUToConsole (e.g. keepInHost flipping true for some
+			// other reason) - clear the flag so the next pool-fill bind
+			// doesn't skip the handshake believing one already happened.
+			ctx.gpuReleased = false
+		}
 		// Verify that it has been returned from pciback
 		_, err = types.IoBundleToPci(log, ib)
 		if err != nil || ib.UsbAddr != "" {
@@ -4678,6 +4685,12 @@ func handleIBDelete(ctx *domainContext, phylabel string) {
 					ib.Type, ib.Phylabel, ib.AssignmentGroup, ib.PciLong, err)
 			}
 			ib.IsPCIBack = false
+			if isBootVGA(ib) {
+				// The boot VGA is disappearing from the adapter list
+				// entirely, with no restoreGPUToConsole call - same
+				// staleness risk as the pciback take-back branch above.
+				ctx.gpuReleased = false
+			}
 		}
 	}
 	// Create a new list with everything but "ib" included

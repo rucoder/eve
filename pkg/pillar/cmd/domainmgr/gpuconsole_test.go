@@ -205,13 +205,8 @@ func TestReleaseObservesAnAckThatArrivesDuringTheWait(t *testing.T) {
 // the process - flaky in isolation, masked by the full package run where
 // earlier tests have already bumped the counter. Capturing the id here and
 // consuming it before the real call guarantees the real call gets the next
-// one instead, so they can never collide regardless of run order.
-// (math.MaxUint64 was tried first and rejected: it does not survive this
-// package's pubsub memdriver round-trip - the value comes back altered,
-// "18446744073709552000" instead of "...551615", and fails to unmarshal,
-// apparently via a float64 intermediate somewhere in the driver. Not a
-// concern for the real counter, which will never get remotely close to
-// that range, but unusable as a test sentinel here.)
+// one instead, so they can never collide regardless of run order - capturing
+// the id is collision-proof by construction, unlike a fixed sentinel value.
 func TestReleaseIgnoresAStaleStatusFromAPreviousCycle(t *testing.T) {
 	ctx, monitorPub := newGPUConsoleTestContext(t)
 
