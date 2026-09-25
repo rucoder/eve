@@ -63,8 +63,49 @@ RUN awk -F'"' '/^version = / {print $2; exit}' Cargo.toml > /app/monitor-version
 
 
 FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS runtime
-ENV PKGS="kbd pciutils usbutils"
+# mesa-dri-gallium carries the iris driver used by Gen12+ Intel graphics, which
+# is what the gui frontend's EGL/GBM path needs at runtime; without it EGL
+# falls back to software or fails outright.
+# libxkbcommon is deliberately absent: smithay wants -lxkbcommon at LINK time,
+# but nothing resolves it at run time - the gui binary's NEEDED list is
+# libgbm, libinput, libgcc_s and libc, and no shipped library dlopens it. It
+# reads evdev directly and puts the VT keyboard in K_OFF, so there is no
+# keymap to build.
+ENV PKGS="kbd pciutils usbutils mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs"
 RUN eve-alpine-deploy.sh
+
+# The stage below copies /out/usr/lib (and part of /out/usr/share) wholesale,
+# so anything a package drags in ships. Each removal here was checked against
+# the actual link closure of the binaries we run plus the libraries mesa
+# dlopens - not guessed from names.
+#
+# NOT removed, though they look unused: usr/lib/gbm/dri_gbm.so, which libgbm
+# resolves through GBM_BACKENDS_PATH rather than NEEDED, and
+# usr/share/hwdata/pci.ids, which libpciaccess reads at run time.
+#
+# libLLVM stays too: libgallium.so lists it NEEDED, so removing it stops the
+# loader dead even for iris, which does not itself use it. Dropping it means
+# building mesa with -Dllvm=disabled -Dgallium-drivers=iris.
+RUN set -e; \
+    # Gallium drivers for hardware this image will never see. EVE's console
+    # targets Gen12+ Intel; a host with no supported GPU has no render node
+    # either, so it gets no display at all and never reaches a driver.
+    find /out/usr/lib/gallium-pipe -name 'pipe_*.so' ! -name 'pipe_iris.so' -delete; \
+    # apk's library has no business in a runtime image, and it is the only
+    # thing here that pulls in the TLS stack.
+    rm -f /out/usr/lib/libapk.so.* /out/usr/lib/libcrypto.so.* /out/usr/lib/libssl.so.*; \
+    rm -rf /out/usr/lib/engines-3 /out/usr/lib/ossl-modules; \
+    # libgallium needs libSPIRV-Tools.so, which needs only libstdc++ and libc;
+    # the -opt/-shared/-reduce/-diff/-link/-lint siblings are unreachable.
+    find /out/usr/lib -name 'libSPIRV-Tools-*.so' -delete; \
+    # libgallium links the xcb shims. libX11-xcb.so has no NEEDED entries at
+    # all, so libX11 itself is never loaded - and with it goes the xkb data.
+    rm -f /out/usr/lib/libX11.so.*; \
+    rm -rf /out/usr/share/X11; \
+    # Alias directory of symlinks to ../../libLLVM.so.20.1, which stays put.
+    rm -rf /out/usr/lib/llvm20; \
+    # Radeon KMS helper: libgallium needs libdrm_amdgpu and libdrm_intel only.
+    rm -f /out/usr/lib/libdrm_radeon.so.*
 
 # Register the monitor TUI in the APK DB (mandatory for SBOM inclusion). The
 # version comes from the crate manifest (Cargo.toml) — the single source of
@@ -79,6 +120,8 @@ COPY --from=runtime /out/bin/dmesg /usr/bin/dmesg
 COPY --from=runtime /out/usr/bin/lsusb /usr/bin/lsusb
 COPY --from=runtime /out/usr/bin/lspci /usr/bin/lspci
 COPY --from=runtime /out/usr/share/keymaps/xkb/us.map.gz /usr/share/keymaps/xkb/us.map.gz
+# libpciaccess (mesa) reads this at run time; see the prune block above.
+COPY --from=runtime /out/usr/share/hwdata /usr/share/hwdata
 COPY --from=runtime /out/lib /lib
 COPY --from=runtime /out/usr/lib /usr/lib
 
