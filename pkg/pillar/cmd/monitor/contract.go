@@ -50,21 +50,32 @@ func deviceStatusToContract(server string, ob types.OnboardingStatus, enInfo typ
 	}
 }
 
-// kvmQmpSocket mirrors hypervisor.GetQmpExecutorSocket, which is not used
+// qmpKvmStateDir mirrors hypervisor.kvmStateDir, which is not imported
 // directly because importing hypervisor here would pull kvm, xen and
 // containerd into an agent that is deliberately dependency-lean. Keep in step
 // with kvmStateDir in hypervisor/kvm.go.
+const qmpKvmStateDir = "/run/hypervisor/kvm"
+
+// qmpSocketFor is qmpSocketAt against the production kvm state directory.
+func qmpSocketFor(domainName string, hasVirtualGPU bool) string {
+	return qmpSocketAt(qmpKvmStateDir, domainName, hasVirtualGPU)
+}
+
+// qmpSocketAt is qmpSocketFor with the kvm state directory overridable for
+// tests.
 //
-// The path is reported only if it exists. A name alone says nothing about
-// whether the instance has a monitor to reach: under Xen there is none, and a
-// container's shim VM has no display behind it. Reporting one regardless would
-// have the console dial a socket that can never answer, for every app, for the
-// life of the device.
-func kvmQmpSocket(domainName string) string {
-	if domainName == "" {
+// The path is reported only if the app has a virtual GPU behind it and the
+// socket exists. A name alone says nothing about whether the instance has a
+// monitor to reach: under Xen there is none, a container's shim VM has no
+// display behind it, and an app with no GPU at all - the common case - has
+// nothing for the console to show even when QEMU is running. Reporting a
+// socket regardless would have the console dial one that can never answer,
+// for every such app, for the life of the device.
+func qmpSocketAt(dir, domainName string, hasVirtualGPU bool) string {
+	if domainName == "" || !hasVirtualGPU {
 		return ""
 	}
-	sock := filepath.Join("/run/hypervisor/kvm", domainName, "qmp")
+	sock := filepath.Join(dir, domainName, "qmp")
 	if _, err := os.Stat(sock); err != nil {
 		return ""
 	}
@@ -80,7 +91,7 @@ func appsListToContract(apps []types.AppInstanceStatus) monitorapi.AppsList {
 			Version:   a.UUIDandVersion.Version,
 			State:     swStateToContract(a.State),
 			Error:     a.ErrorAndTimeWithSource.Error,
-			QMPSocket: kvmQmpSocket(a.DomainName),
+			QMPSocket: qmpSocketFor(a.DomainName, types.GPUModeFor(a.UUIDandVersion.UUID.String()) == types.GPUModeVirtual),
 		})
 	}
 	return out

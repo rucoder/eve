@@ -5,6 +5,8 @@ package monitor
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -104,11 +106,39 @@ func TestProxyToContract_ManualByScheme(t *testing.T) {
 // A name is not a monitor. Under Xen, or for an instance that never got a
 // QEMU, the reconstructed path does not exist; reporting it anyway has the
 // console dial a socket that can never answer, once per app, forever.
-func TestKvmQmpSocketOnlyReportsAPathThatExists(t *testing.T) {
-	if got := kvmQmpSocket(""); got != "" {
+func TestQmpSocketForOnlyReportsAPathThatExists(t *testing.T) {
+	if got := qmpSocketFor("", true); got != "" {
 		t.Errorf("no domain name should report no socket, got %q", got)
 	}
-	if got := kvmQmpSocket("6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1"); got != "" {
+	if got := qmpSocketFor("6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1", true); got != "" {
 		t.Errorf("a domain with no socket on disk should report none, got %q", got)
+	}
+}
+
+// An app with no virtual GPU has no display behind its QMP socket, so the
+// console must not be told to dial it.
+func TestQMPSocketOnlyForVirtualGPUApps(t *testing.T) {
+	if got := qmpSocketFor("vm1.1.1", false); got != "" {
+		t.Errorf("an app without a virtual GPU must report no socket, got %q", got)
+	}
+}
+
+// The positive case: an app that does have a virtual GPU, and whose socket
+// exists on disk, must still be reported so the console can dial it. Without
+// this, an implementation that ignored hasVirtualGPU entirely (or always
+// returned "") would pass every other test in this file.
+func TestQMPSocketReportedForVirtualGPUAppWithSocket(t *testing.T) {
+	domainName := "6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1"
+	dir := filepath.Join(t.TempDir(), domainName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sock := filepath.Join(dir, "qmp")
+	if err := os.WriteFile(sock, nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if got := qmpSocketAt(filepath.Dir(dir), domainName, true); got != sock {
+		t.Errorf("expected %q, got %q", sock, got)
 	}
 }
