@@ -1916,17 +1916,19 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 					// reserved it - see skipForVirtualGPU), so it must not
 					// be handed to QEMU as a vfio-pci passthrough device
 					// here either - it would fail to open, since it is
-					// still bound to i915.
+					// still bound to i915. This only skips the PCI
+					// assignment below - a bundle that also carries a
+					// serial or CAN interface must still get that handling.
 					logrus.Infof("Skipping PCI passthrough of %s for %s: virtual GPU mode",
 						ib.PciLong, domainName)
-					continue
-				}
-				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
+				} else {
+					logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
 
-				if ib.Type.IsNet() {
-					tap.netIntfOrder = adapter.IntfOrder
+					if ib.Type.IsNet() {
+						tap.netIntfOrder = adapter.IntfOrder
+					}
+					pciAssignments = addNoDuplicatePCI(pciAssignments, tap)
 				}
-				pciAssignments = addNoDuplicatePCI(pciAssignments, tap)
 			}
 			if ib.Serial != "" {
 				logrus.Infof("Adding serial <%s>\n", ib.Serial)

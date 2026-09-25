@@ -3626,6 +3626,9 @@ func TestArm64ContextClaimsNoVirtualGPU(t *testing.T) {
 // sysfs lookup, faked via a redirected sysfsPciDevices - so a regression
 // here shows up as a device actually present or missing in the rendered
 // config, not just a boolean the template-only tests already covered.
+//
+// Not t.Parallel(): it mutates the package-global sysfsPciDevices for the
+// duration of the test and restores it with defer.
 func TestVirtualGPUModeOmitsPassthroughDevice(t *testing.T) {
 	const pciLong = "0000:00:02.0"
 	sysfsDir := t.TempDir()
@@ -3643,62 +3646,81 @@ func TestVirtualGPUModeOmitsPassthroughDevice(t *testing.T) {
 	sysfsPciDevices = sysfsDir + "/"
 	defer func() { sysfsPciDevices = origSysfs }()
 
-	id, err := uuid.NewV4()
-	if err != nil {
-		t.Fatalf("uuid.NewV4: %v", err)
-	}
-	domainName := id.String() + ".1.1"
-
-	gpuModeDirTest := t.TempDir()
-	if err := os.WriteFile(filepath.Join(gpuModeDirTest, id.String()+".json"), []byte(`{"mode":"virtual"}`), 0644); err != nil {
-		t.Fatalf("WriteFile gpu mode: %v", err)
-	}
-
 	const adapterName = "igpu"
-	aa := types.AssignableAdapters{
-		IoBundleList: []types.IoBundle{
-			{
-				Phylabel:     adapterName,
-				Logicallabel: adapterName,
-				Type:         types.IoHDMI,
-				PciLong:      pciLong,
-				UsedByUUID:   id,
+
+	// render builds the config for one app - a fresh UUID/domain each time,
+	// so the two runs never share a gpu-mode file - and returns the
+	// rendered text. gpuModeBody is written to that app's mode file first;
+	// "" leaves it absent, which defaults to passthrough.
+	render := func(t *testing.T, gpuModeBody string) string {
+		id, err := uuid.NewV4()
+		if err != nil {
+			t.Fatalf("uuid.NewV4: %v", err)
+		}
+		domainName := id.String() + ".1.1"
+
+		gpuModeDirTest := t.TempDir()
+		if gpuModeBody != "" {
+			if err := os.WriteFile(filepath.Join(gpuModeDirTest, id.String()+".json"), []byte(gpuModeBody), 0644); err != nil {
+				t.Fatalf("WriteFile gpu mode: %v", err)
+			}
+		}
+
+		aa := types.AssignableAdapters{
+			IoBundleList: []types.IoBundle{
+				{
+					Phylabel:     adapterName,
+					Logicallabel: adapterName,
+					Type:         types.IoHDMI,
+					PciLong:      pciLong,
+					UsedByUUID:   id,
+				},
 			},
-		},
-	}
-	config := types.DomainConfig{
-		UUIDandVersion: types.UUIDandVersion{UUID: id},
-		IoAdapterList:  []types.IoAdapter{{Type: types.IoHDMI, Name: adapterName}},
-	}
-	status := types.DomainStatus{DomainName: domainName}
+		}
+		config := types.DomainConfig{
+			UUIDandVersion: types.UUIDandVersion{UUID: id},
+			IoAdapterList:  []types.IoAdapter{{Type: types.IoHDMI, Name: adapterName}},
+		}
+		status := types.DomainStatus{DomainName: domainName}
+		ctx := KvmContext{
+			devicemodel: "pc-q35-3.1",
+			dmArgs:      []string{},
+			virtualGPU:  true,
+			gpuModeDir:  gpuModeDirTest,
+		}
 
-	ctx := KvmContext{
-		devicemodel: "pc-q35-3.1",
-		dmArgs:      []string{},
-		virtualGPU:  true,
-		gpuModeDir:  gpuModeDirTest,
+		conf, err := os.CreateTemp(t.TempDir(), "config")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		defer conf.Close()
+
+		if err := ctx.CreateDomConfig(domainName, config, status, nil, &aa, nil, "", conf); err != nil {
+			t.Fatalf("CreateDomConfig: %v", err)
+		}
+		result, err := os.ReadFile(conf.Name())
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		return string(result)
 	}
 
-	conf, err := os.CreateTemp(t.TempDir(), "config")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
+	virtual := render(t, `{"mode":"virtual"}`)
+	if strings.Contains(virtual, `driver = "vfio-pci"`) {
+		t.Errorf("virtual GPU mode must not emit a vfio-pci device for the iGPU, got:\n%s", virtual)
 	}
-	defer conf.Close()
-
-	if err := ctx.CreateDomConfig(domainName, config, status, nil, &aa, nil, "", conf); err != nil {
-		t.Fatalf("CreateDomConfig: %v", err)
+	if !strings.Contains(virtual, `driver = "virtio-vga-gl"`) {
+		t.Errorf("virtual GPU mode must emit virtio-vga-gl, got:\n%s", virtual)
 	}
 
-	result, err := os.ReadFile(conf.Name())
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
+	// The other direction: an ordinary passthrough app (the default, absent
+	// mode file) must still get the vfio-pci device, not virtio-vga-gl -
+	// otherwise this test would pass even if the skip fired unconditionally.
+	passthrough := render(t, "")
+	if !strings.Contains(passthrough, `driver = "vfio-pci"`) {
+		t.Errorf("passthrough mode must emit a vfio-pci device for the iGPU, got:\n%s", passthrough)
 	}
-	got := string(result)
-
-	if strings.Contains(got, `driver = "vfio-pci"`) {
-		t.Errorf("virtual GPU mode must not emit a vfio-pci device for the iGPU, got:\n%s", got)
-	}
-	if !strings.Contains(got, `driver = "virtio-vga-gl"`) {
-		t.Errorf("virtual GPU mode must emit virtio-vga-gl, got:\n%s", got)
+	if strings.Contains(passthrough, "virtio-vga-gl") {
+		t.Errorf("passthrough mode must not emit virtio-vga-gl, got:\n%s", passthrough)
 	}
 }
