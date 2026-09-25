@@ -28,9 +28,15 @@ onboot:
     - /rootfs.img:/bits/rootfs.img:ro   # this is the rootfs it will install
     - /persist.img:/bits/persist.img:ro # this is the persist image
     - /config.img:/bits/config.img:ro   # this is the config image
-  - name: poweroff
-    image: linuxkit/poweroff:401dc53c604c0b2179ed0369a6968fd4179cc176
-    command: ["/bin/sh", "/poweroff.sh", "10"]
+  # DEV RIG ONLY - REVERT BEFORE MERGE. Powering off ten seconds after the
+  # installer finishes destroys the only console there is: the installer's own
+  # failure shell gets no input on this hardware, so tty1's automatic root
+  # login (from set_getty in conf/grub.cfg) is the single way to ask the kernel
+  # what it actually sees. With the box powered off, a failed install leaves no
+  # way to run lsblk or dmesg.
+  #- name: poweroff
+  #  image: linuxkit/poweroff:401dc53c604c0b2179ed0369a6968fd4179cc176
+  #  command: ["/bin/sh", "/poweroff.sh", "10"]
 volumes:
 - name: mkimage-raw-efi
   image: MKRAW_TAG

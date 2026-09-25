@@ -335,38 +335,62 @@ if [ -z "$INSTALL_DEV" ] ; then
    INSTALL_DEV=$(set ${FREE_DISKS:-""} ; echo "$1")
 fi
 
+# resolve_disk turns whatever the operator wrote in eve_install_disk into the
+# kernel name this boot. It accepts, in order of preference:
+#
+#   nvme0n1      a kernel name, as before
+#   serial:SSSS  the drive's serial, read straight out of sysfs via lsblk
+#   <by-id name> an entry in /dev/disk/by-id
+#
+# The serial form exists because it is the only one that works everywhere:
+# kernel names are not stable (see below), and /dev/disk/by-id needs udev rules
+# that a minimal installer image does not necessarily carry.
+resolve_disk() {
+   local WANT="$1"
+   local SERIAL
+   local NAME
+
+   [ -b "/dev/$WANT" ] && { echo "$WANT"; return 0; }
+
+   case "$WANT" in
+      serial:*)
+         SERIAL="${WANT#serial:}"
+         lsblk -dn -o NAME,SERIAL 2>/dev/null | while read -r NAME S; do
+            [ "$S" = "$SERIAL" ] && { echo "$NAME"; break; }
+         done
+         return 0
+         ;;
+   esac
+
+   if [ -L "/dev/disk/by-id/$WANT" ]; then
+      NAME=$(readlink -f "/dev/disk/by-id/$WANT")
+      echo "${NAME##*/}"
+      return 0
+   fi
+   return 1
+}
+
 # The target may not exist the moment this script runs: NVMe probing, and udev
 # populating /dev/disk/by-id, race the installer's start - a few seconds on a
 # machine whose drives sit behind Intel VMD. Declaring the disk missing here
 # used to mean silently writing to a regular file of that name instead. Wait
 # for it to turn up.
-wait_for_disk() {
-   local NAME="$1"
-   local I=0
+if [ -n "$INSTALL_DEV" ]; then
+   I=0
    while [ "$I" -lt 30 ]; do
-      { [ -b "/dev/$NAME" ] || [ -L "/dev/disk/by-id/$NAME" ]; } && return 0
+      RESOLVED_DEV=$(resolve_disk "$INSTALL_DEV")
+      [ -n "$RESOLVED_DEV" ] && [ -b "/dev/$RESOLVED_DEV" ] && break
       I=$((I + 1))
       sleep 1
    done
-   return 1
-}
-
-if [ -n "$INSTALL_DEV" ]; then
-   wait_for_disk "$INSTALL_DEV" || logmsg "WARNING: $INSTALL_DEV has not appeared after 30s"
-fi
-
-# eve_install_disk may name the disk by a stable identifier from
-# /dev/disk/by-id instead of by its kernel name. NVMe namespace numbers are
-# handed out in probe-completion order, and where the drives sit behind Intel
-# VMD that order is not stable across boots: nvme0n1 and nvme1n1 can and do
-# swap. Pinning by kernel name can therefore install onto a different disk than
-# the operator meant - including one holding another OS, since a foreign
-# filesystem is not a reason for this script to skip a disk. Resolve the stable
-# name to whatever the kernel called it this boot.
-if [ -n "$INSTALL_DEV" ] && [ ! -b "/dev/$INSTALL_DEV" ] && [ -L "/dev/disk/by-id/$INSTALL_DEV" ]; then
-   RESOLVED_DEV=$(readlink -f "/dev/disk/by-id/$INSTALL_DEV")
-   logmsg "eve_install_disk=$INSTALL_DEV resolved to ${RESOLVED_DEV##*/}"
-   INSTALL_DEV="${RESOLVED_DEV##*/}"
+   # Always say what this kernel actually found. Without it, a target that
+   # never turns up is indistinguishable from one that turned up wrong, and
+   # the operator is left reading a corrupt-partition-table error instead.
+   logmsg "block devices seen: $(lsblk -dn -o NAME,SIZE,SERIAL 2>/dev/null | tr '\n' '|')"
+   if [ -n "$RESOLVED_DEV" ] && [ "$RESOLVED_DEV" != "$INSTALL_DEV" ]; then
+      logmsg "eve_install_disk=$INSTALL_DEV resolved to $RESOLVED_DEV"
+   fi
+   [ -n "$RESOLVED_DEV" ] && INSTALL_DEV="$RESOLVED_DEV"
 fi
 
 logmsg "Installing EVE-OS on device $INSTALL_DEV"
@@ -384,10 +408,12 @@ logmsg "Installing EVE-OS on device $INSTALL_DEV"
 INSTALL_PERSIST=$(<"$CMDLINEFILE" tr ' ' '\012' | sed -ne '/^eve_persist_disk=/s#^.*=##p')
 INSTALL_PERSIST=${INSTALL_PERSIST:-$INSTALL_DEV}
 # Same stable-identifier treatment as the install disk above.
-if [ -n "$INSTALL_PERSIST" ] && [ ! -b "/dev/$INSTALL_PERSIST" ] && [ -L "/dev/disk/by-id/$INSTALL_PERSIST" ]; then
-   RESOLVED_PERSIST=$(readlink -f "/dev/disk/by-id/$INSTALL_PERSIST")
-   logmsg "eve_persist_disk=$INSTALL_PERSIST resolved to ${RESOLVED_PERSIST##*/}"
-   INSTALL_PERSIST="${RESOLVED_PERSIST##*/}"
+if [ -n "$INSTALL_PERSIST" ] && [ ! -b "/dev/$INSTALL_PERSIST" ]; then
+   RESOLVED_PERSIST=$(resolve_disk "$INSTALL_PERSIST")
+   if [ -n "$RESOLVED_PERSIST" ]; then
+      logmsg "eve_persist_disk=$INSTALL_PERSIST resolved to $RESOLVED_PERSIST"
+      INSTALL_PERSIST="$RESOLVED_PERSIST"
+   fi
 fi
 
 logmsg "Installing persist on disk(s) $INSTALL_PERSIST"
