@@ -335,6 +335,26 @@ if [ -z "$INSTALL_DEV" ] ; then
    INSTALL_DEV=$(set ${FREE_DISKS:-""} ; echo "$1")
 fi
 
+# The target may not exist the moment this script runs: NVMe probing, and udev
+# populating /dev/disk/by-id, race the installer's start - a few seconds on a
+# machine whose drives sit behind Intel VMD. Declaring the disk missing here
+# used to mean silently writing to a regular file of that name instead. Wait
+# for it to turn up.
+wait_for_disk() {
+   local NAME="$1"
+   local I=0
+   while [ "$I" -lt 30 ]; do
+      { [ -b "/dev/$NAME" ] || [ -L "/dev/disk/by-id/$NAME" ]; } && return 0
+      I=$((I + 1))
+      sleep 1
+   done
+   return 1
+}
+
+if [ -n "$INSTALL_DEV" ]; then
+   wait_for_disk "$INSTALL_DEV" || logmsg "WARNING: $INSTALL_DEV has not appeared after 30s"
+fi
+
 # eve_install_disk may name the disk by a stable identifier from
 # /dev/disk/by-id instead of by its kernel name. NVMe namespace numbers are
 # handed out in probe-completion order, and where the drives sit behind Intel
