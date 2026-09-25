@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
     logger::init();
     let cfg = Config::from_env();
     // Held for the whole run; Drop puts the VT keyboard back.
-    let _vtkbd = vt::VtKeyboard::take();
+    let _cad = vt::CtrlAltDelGuard::take();
     vt::install_signal_handlers();
     log::info!("orientation mode = {} (0=none 1=flipY 2=flipX 3=rot180)", cfg.orient);
 

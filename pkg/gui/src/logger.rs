@@ -22,7 +22,10 @@
 //!   debug       per-event detail (input events, guest scanouts)
 //!   trace       firehose; will itself perturb timing
 //!
-//! `GUI_LOG_FILE` overrides the destination (default `/run/eve-gui.log`).
+//! `GUI_LOG_FILE` overrides the destination (default
+//! `/persist/eve-gui.log`). /persist and not /run: /run is tmpfs, so the log
+//! dies with the machine, and a console that has just rebooted is exactly when
+//! you need the previous boot's log.
 //! We also mirror warn/error to stderr, since the app owns a VT and the file is
 //! usually the only way to see anything.
 
@@ -86,8 +89,9 @@ fn parse(var: &str, dflt: log::LevelFilter) -> log::LevelFilter {
     }
 }
 
-/// Cap for the log file. /run is tmpfs on EVE, so every byte here is RAM the
-/// device cannot use for anything else.
+/// Cap for the log file. /persist is a real filesystem, but it is shared with
+/// everything else EVE keeps, so the console does not get to grow without
+/// bound there either.
 const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Largest single write, and so the most the file may overshoot its cap.
@@ -96,7 +100,7 @@ const MAX_BATCH_BYTES: usize = 256 * 1024;
 pub fn init() {
     let ours = parse("GUI_LOG", log::LevelFilter::Info);
     let deps = parse("GUI_LOG_DEPS", log::LevelFilter::Warn);
-    let path = std::env::var("GUI_LOG_FILE").unwrap_or_else(|_| "/run/eve-gui.log".into());
+    let path = std::env::var("GUI_LOG_FILE").unwrap_or_else(|_| "/persist/eve-gui.log".into());
     let (tx, rx) = channel::<Msg>();
     let dest = path.clone();
 

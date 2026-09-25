@@ -90,7 +90,7 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
                 }
             }
             ui.separator();
-            // The chord itself is forwarded too (see vt::VtKeyboard), but a
+            // The chord itself is forwarded too (see vt::CtrlAltDelGuard), but a
             // Windows logon screen is precisely where you are not grabbed yet.
             if ui
                 .button("Ctrl+Alt+Del")

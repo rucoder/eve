@@ -62,7 +62,7 @@ All optional; a positional argument overrides `GUI_CARD`.
 | `GUI_FRAMES` | `0` | frame limit, 0 = run until signalled |
 | `GUI_LOG` | `info` | `error\|warn\|info\|debug\|trace` |
 | `GUI_LOG_DEPS` | `warn` | same, for libraries |
-| `GUI_LOG_FILE` | `/run/eve-gui.log` | logging is asynchronous; a hot path never does I/O |
+| `GUI_LOG_FILE` | `/persist/eve-gui.log` | logging is asynchronous; a hot path never does I/O. /persist, not /run: a log on tmpfs is gone after the reboot you wanted to debug |
 | `GUI_PROBE` | – | read the blit target back and count non-black pixels |
 | `GUI_VT_KBD` | – | `0` leaves the VT keyboard to the kernel |
 
@@ -70,7 +70,8 @@ All optional; a positional argument overrides `GUI_CARD`.
 
 Click in a guest to grab input; **Ctrl+Alt+G** releases. **Ctrl+Alt+1..9**
 switches tab and works while grabbed. **Ctrl+Alt+Del** reaches the guest rather
-than rebooting the host, because the VT keyboard is put in `K_OFF` — there is
+than rebooting the host, because the kernel's Ctrl+Alt+Del reboot is turned
+off with `reboot(RB_DISABLE_CAD)` — there is
 also a button for it, which is what you need at a Windows logon screen where you
 are not grabbed yet.
 

@@ -364,8 +364,10 @@ impl Input {
                     log::debug!("KEY code={code} down={down} focus={:?}", self.focus);
                     // Modifier state (both sides). These ARE forwarded to the
                     // guest - it needs its own Ctrl/Alt, and Ctrl+Alt+Del must
-                    // reach a Windows logon screen intact. main::VtKeyboard puts
-                    // the VT in K_OFF so the kernel no longer acts on those
+                    // reach a Windows logon screen intact. vt::CtrlAltDelGuard
+                    // stops the kernel rebooting on Ctrl+Alt+Del; we see the
+                    // keys regardless, because libinput reads evdev and does
+                    // not care what the VT layer does with its copy
                     // chords itself (it used to reboot the host on Ctrl+Alt+Del
                     // and VT-switch on Ctrl+Alt+Fn).
                     match code {

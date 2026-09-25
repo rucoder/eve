@@ -35,77 +35,49 @@ pub fn install_signal_handlers() {
     }
 }
 
-// libc::Ioctl is c_int on musl and c_ulong on glibc; the Dockerfile builds musl.
-const KDGKBMODE: libc::Ioctl = 0x4B44;
-const KDSKBMODE: libc::Ioctl = 0x4B45;
-const K_OFF: i32 = 0x04;
-const K_UNICODE: i32 = 0x03;
-
-/// Takes the VT's keyboard away from the kernel for as long as it is held.
+/// Stops Ctrl+Alt+Del from rebooting the host, and nothing else.
 ///
-/// In the normal VT modes the kernel keyboard driver acts on some chords BEFORE
-/// userspace ever sees them: Ctrl+Alt+Del reboots the machine, Ctrl+Alt+Fn
-/// switches VT (which yanks our DRM master and kills us). Neither is something
-/// a VM console may swallow - Ctrl+Alt+Del in particular is exactly the chord a
-/// Windows guest needs at its logon screen.
+/// The kernel acts on Ctrl+Alt+Del before any userspace process sees it, which
+/// is wrong for a VM console: that chord is exactly what a Windows guest needs
+/// at its logon screen. `RB_DISABLE_CAD` turns off the reboot specifically -
+/// the kernel then delivers SIGINT to init instead, which linuxkit's init
+/// ignores.
 ///
-/// `K_OFF` makes the VT driver ignore the keyboard entirely. We still get every
-/// key, because libinput reads the evdev devices directly and does not care what
-/// mode the VT is in. This is what a Wayland compositor does.
+/// Deliberately NOT `KDSKBMODE`/`K_OFF`, which is the usual compositor trick.
+/// K_OFF takes the whole keyboard away from the VT layer, and with it
+/// Ctrl+Alt+Fn - so the operator can no longer reach a text console, which on a
+/// device whose only other access is a serial line makes it undebuggable. The
+/// TUI this console replaced never touched the keyboard mode and VT switching
+/// worked; there is no reason for us to be different. libinput reads evdev
+/// directly, so we still see every key including Ctrl+Alt+Del and can forward
+/// it to the guest, whatever the VT layer does with its copy.
 ///
-/// Restored on Drop. If the process is SIGKILLed the VT keyboard stays dead;
-/// recover with `kbd_mode -u -C /dev/ttyN`. Opt out with `GUI_VT_KBD=0`.
-pub struct VtKeyboard {
-    fd: i32,
-    saved: i32,
-    owned: bool,
+/// Restored on Drop. Opt out with `GUI_VT_KBD=0`.
+pub struct CtrlAltDelGuard {
+    restore: bool,
 }
 
-impl VtKeyboard {
+impl CtrlAltDelGuard {
     pub fn take() -> Option<Self> {
         if std::env::var("GUI_VT_KBD").as_deref() == Ok("0") {
-            log::warn!("VT keyboard: left to the kernel; Ctrl+Alt+Del will REBOOT THE HOST");
+            log::warn!("Ctrl+Alt+Del left to the kernel; it will REBOOT THE HOST");
             return None;
         }
-        // openvt(1) hands us the VT as stdio, so fd 0 is it; /dev/tty is the
-        // controlling terminal and works when started some other way.
-        let (fd, owned) = match std::fs::File::open("/dev/tty") {
-            Ok(f) => (std::os::fd::IntoRawFd::into_raw_fd(f), true),
-            Err(_) => (0, false),
-        };
-        let mut saved: i32 = 0;
-        if unsafe { libc::ioctl(fd, KDGKBMODE, &mut saved) } < 0 {
-            log::warn!("VT keyboard: cannot read mode; Ctrl+Alt+Del will reboot the HOST");
-            if owned {
-                unsafe { libc::close(fd) };
-            }
+        if unsafe { libc::reboot(libc::RB_DISABLE_CAD) } < 0 {
+            let e = std::io::Error::last_os_error();
+            log::warn!("cannot disable Ctrl+Alt+Del ({e}); it will REBOOT THE HOST");
             return None;
         }
-        if unsafe { libc::ioctl(fd, KDSKBMODE, K_OFF) } < 0 {
-            log::warn!("VT keyboard: cannot set K_OFF; Ctrl+Alt+Del will reboot the HOST");
-            if owned {
-                unsafe { libc::close(fd) };
-            }
-            return None;
-        }
-        // Finding K_OFF already set means a previous instance was killed before
-        // it could restore; "restoring" that would leave the console keyboard
-        // dead forever. Put it back to unicode instead.
-        if saved == K_OFF {
-            log::warn!("VT keyboard was already K_OFF (stale from a killed run); will restore K_UNICODE");
-            saved = K_UNICODE;
-        }
-        log::info!("VT keyboard: K_OFF (was {saved}); Ctrl+Alt+Del and Ctrl+Alt+Fn now reach the guest");
-        Some(Self { fd, saved, owned })
+        log::info!("Ctrl+Alt+Del disabled at the kernel; VT switching (Ctrl+Alt+Fn) still works");
+        Some(Self { restore: true })
     }
 }
 
-impl Drop for VtKeyboard {
+impl Drop for CtrlAltDelGuard {
     fn drop(&mut self) {
-        unsafe { libc::ioctl(self.fd, KDSKBMODE, self.saved) };
-        if self.owned {
-            unsafe { libc::close(self.fd) };
+        if self.restore {
+            unsafe { libc::reboot(libc::RB_ENABLE_CAD) };
+            log::info!("Ctrl+Alt+Del handed back to the kernel");
         }
-        log::info!("VT keyboard: restored mode {}", self.saved);
     }
 }
