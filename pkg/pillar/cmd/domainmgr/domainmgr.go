@@ -1856,7 +1856,8 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 				log.Noticef("doAssignIoAdaptersToDomain: skip PCI assign for NOHYPE IoNetEth %s (%s)",
 					ib.Phylabel, ib.PciLong)
 			} else if ib.PciLong != "" && !ib.IsPCIBack {
-				if skipForVirtualGPU(ctx, config, isBootVGA(ib)) {
+				isBoot := isBootVGA(ib)
+				if skipForVirtualGPU(ctx, config, isBoot) {
 					// Operator opted this app into a virtual GPU: leave the
 					// iGPU with the host driver instead of reserving it for
 					// passthrough, so the console keeps rendering this
@@ -1871,7 +1872,7 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 					ib.Phylabel, ib.PciLong, status.DomainName)
 				assignmentsPci = addNoDuplicate(assignmentsPci, ib.PciLong)
 				ib.IsPCIBack = true
-				if isBootVGA(ib) {
+				if isBoot {
 					hasBootVga = true
 				}
 			}

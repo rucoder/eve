@@ -17,8 +17,10 @@ import (
 	utils "github.com/lf-edge/eve/pkg/pillar/utils/file"
 )
 
-// define a path in sysfs to the PCI devices
-const sysfsPciDevices = "/sys/bus/pci/devices/"
+// define a path in sysfs to the PCI devices. A var, not a const, so tests
+// can redirect it at a fabricated sysfs tree (see kvm_test.go) rather than
+// depending on real hardware.
+var sysfsPciDevices = "/sys/bus/pci/devices/"
 
 // define go constants for the flags as defined in include/linux/pci_ids.h
 //
@@ -109,6 +111,19 @@ func (d pciDevice) vid() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(strings.TrimSuffix(string(vendorID), "\n")), nil
+}
+
+// isIntelVGA reports whether d is an Intel VGA-class PCI device - the iGPU.
+// Shared by detectIntelIGPU, the PCI passthrough template filler, and
+// virtual-GPU mode's skip when building the passthrough list, so all three
+// answer "is this the iGPU" the same way instead of three separately
+// maintained checks.
+func (d pciDevice) isIntelVGA() bool {
+	if !d.isVGA() {
+		return false
+	}
+	vendor, err := d.vid()
+	return err == nil && vendor == "0x8086"
 }
 
 // read device ID

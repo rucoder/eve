@@ -3535,27 +3535,42 @@ func TestVirtualGPUAgreesWithTheDisplay(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name         string
-		ctxGPU       bool
-		hasIntelIGPU bool
-		gpuModeBody  string // written to <tempdir>/<uuid>.json first; "" writes nothing
-		wantGPU      bool
-		wantDisplay  string
+		name            string
+		ctxGPU          bool
+		hasIntelIGPU    bool
+		igpuBoundToVfio bool
+		gpuModeBody     string // written to <tempdir>/<uuid>.json first; "" writes nothing
+		wantGPU         bool
+		wantDisplay     string
 	}{
-		{"vm on a device with a render node but no GPU assigned", true, false, "", false, "none"},
-		{"vm on a device without one", false, false, "", false, "none"},
+		{"vm on a device with a render node but no GPU assigned", true, false, false, "", false, "none"},
+		{"vm on a device without one", false, false, false, "", false, "none"},
 		// A container's shim VM never holds the iGPU adapter either, so it
 		// falls into the no-GPU-assigned case above: giving every one of
 		// twenty container apps a virgl context against one iGPU never
 		// happens because none of them are ever assigned it.
-		{"container shim vm", true, false, "", false, "none"},
+		{"container shim vm", true, false, false, "", false, "none"},
 		// The one app that was assigned the iGPU still defaults to real
 		// passthrough - no QEMU-side display - until an operator opts it
 		// into a virtual GPU.
-		{"GPU assigned, operator has not opted into a virtual GPU", true, true, "", false, "none"},
+		{"GPU assigned, operator has not opted into a virtual GPU", true, true, false, "", false, "none"},
 		// The operator flipped this one domain: it gets the GL-backed
 		// display instead of real passthrough.
-		{"GPU assigned, operator opted into a virtual GPU", true, true, `{"mode":"virtual"}`, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+		{"GPU assigned, operator opted into a virtual GPU", true, true, false, `{"mode":"virtual"}`, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+		// The iGPU was already bound to vfio-pci before this app activated
+		// (e.g. domainmgr's pool-fill path reserved it because
+		// debug.enable.vga is disabled) - skipForVirtualGPU never got a
+		// chance to run. Even with the operator's file saying "virtual",
+		// claiming a virtual GPU here would emit virtio-vga-gl against a
+		// render node the passthrough reservation just took away. Fail
+		// safe onto real passthrough instead.
+		{"GPU assigned, already bound to vfio-pci, mode says virtual", true, true, true, `{"mode":"virtual"}`, false, "none"},
+		// The ordinary passthrough app, the overwhelmingly common case: its
+		// iGPU is (correctly) bound to vfio-pci, and mode defaults to
+		// passthrough. This must resolve on the mode alone, without ever
+		// warning about the vfio bind - that warning means something only
+		// when the operator actually asked for virtual mode.
+		{"GPU assigned, already bound to vfio-pci, ordinary passthrough default", true, true, true, "", false, "none"},
 	}
 
 	for _, c := range cases {
@@ -3574,7 +3589,7 @@ func TestVirtualGPUAgreesWithTheDisplay(t *testing.T) {
 			ctx := KvmContext{virtualGPU: c.ctxGPU, gpuModeDir: dir}
 			config := types.DomainConfig{UUIDandVersion: types.UUIDandVersion{UUID: id}}
 
-			gotGPU := ctx.virtualGPUFor(config, c.hasIntelIGPU)
+			gotGPU := ctx.virtualGPUFor(config, c.hasIntelIGPU, c.igpuBoundToVfio)
 			if gotGPU != c.wantGPU {
 				t.Errorf("virtualGPUFor = %v, want %v", gotGPU, c.wantGPU)
 			}
@@ -3598,7 +3613,92 @@ func TestArm64ContextClaimsNoVirtualGPU(t *testing.T) {
 		t.Skip("newKvm's arm64 arm is only reachable on arm64")
 	}
 	ctx := KvmContext{} // the arm64 arm sets virtualGPU: false
-	if ctx.virtualGPUFor(types.DomainConfig{}, true) {
+	if ctx.virtualGPUFor(types.DomainConfig{}, true, false) {
 		t.Error("arm64 must not claim a virtual GPU while its display is none")
+	}
+}
+
+// The fix for the round where virtualGPUFor was correctly gated by
+// GPUModeFor but the loop that actually builds the PCI passthrough list
+// was not: a virtual-mode app still got a vfio-pci device for a GPU still
+// bound to i915, on top of virtio-vga-gl, and QEMU could not start. This
+// drives CreateDomConfig end to end - including detectIntelIGPU's real
+// sysfs lookup, faked via a redirected sysfsPciDevices - so a regression
+// here shows up as a device actually present or missing in the rendered
+// config, not just a boolean the template-only tests already covered.
+func TestVirtualGPUModeOmitsPassthroughDevice(t *testing.T) {
+	const pciLong = "0000:00:02.0"
+	sysfsDir := t.TempDir()
+	devDir := filepath.Join(sysfsDir, pciLong)
+	if err := os.MkdirAll(devDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(devDir, "boot_vga"), []byte("1\n"), 0644); err != nil {
+		t.Fatalf("WriteFile boot_vga: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(devDir, "vendor"), []byte("0x8086\n"), 0644); err != nil {
+		t.Fatalf("WriteFile vendor: %v", err)
+	}
+	origSysfs := sysfsPciDevices
+	sysfsPciDevices = sysfsDir + "/"
+	defer func() { sysfsPciDevices = origSysfs }()
+
+	id, err := uuid.NewV4()
+	if err != nil {
+		t.Fatalf("uuid.NewV4: %v", err)
+	}
+	domainName := id.String() + ".1.1"
+
+	gpuModeDirTest := t.TempDir()
+	if err := os.WriteFile(filepath.Join(gpuModeDirTest, id.String()+".json"), []byte(`{"mode":"virtual"}`), 0644); err != nil {
+		t.Fatalf("WriteFile gpu mode: %v", err)
+	}
+
+	const adapterName = "igpu"
+	aa := types.AssignableAdapters{
+		IoBundleList: []types.IoBundle{
+			{
+				Phylabel:     adapterName,
+				Logicallabel: adapterName,
+				Type:         types.IoHDMI,
+				PciLong:      pciLong,
+				UsedByUUID:   id,
+			},
+		},
+	}
+	config := types.DomainConfig{
+		UUIDandVersion: types.UUIDandVersion{UUID: id},
+		IoAdapterList:  []types.IoAdapter{{Type: types.IoHDMI, Name: adapterName}},
+	}
+	status := types.DomainStatus{DomainName: domainName}
+
+	ctx := KvmContext{
+		devicemodel: "pc-q35-3.1",
+		dmArgs:      []string{},
+		virtualGPU:  true,
+		gpuModeDir:  gpuModeDirTest,
+	}
+
+	conf, err := os.CreateTemp(t.TempDir(), "config")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer conf.Close()
+
+	if err := ctx.CreateDomConfig(domainName, config, status, nil, &aa, nil, "", conf); err != nil {
+		t.Fatalf("CreateDomConfig: %v", err)
+	}
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	got := string(result)
+
+	if strings.Contains(got, `driver = "vfio-pci"`) {
+		t.Errorf("virtual GPU mode must not emit a vfio-pci device for the iGPU, got:\n%s", got)
+	}
+	if !strings.Contains(got, `driver = "virtio-vga-gl"`) {
+		t.Errorf("virtual GPU mode must emit virtio-vga-gl, got:\n%s", got)
 	}
 }

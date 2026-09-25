@@ -56,13 +56,6 @@ func GPUModeRead(dir, key string) string {
 // whether to reserve the GPU; readers (GPUModeFor/GPUModeRead) never do.
 func GPUModeEnsureDefault(key string) { GPUModeEnsureDefaultAt(gpuModeDir, key) }
 
-// GPUModeAt is GPUModeFor with the directory overridable for tests; unlike
-// GPUModeRead it also creates the default file when absent.
-func GPUModeAt(dir, key string) string {
-	GPUModeEnsureDefaultAt(dir, key)
-	return GPUModeRead(dir, key)
-}
-
 // GPUModeEnsureDefaultAt is GPUModeEnsureDefault with the directory
 // overridable for tests.
 func GPUModeEnsureDefaultAt(dir, key string) {

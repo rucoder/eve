@@ -958,8 +958,8 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 	dmArgs := append([]string{}, ctx.dmArgs...)
 	// The display must match the video device the domain config just asked
 	// for, so both come from the same call.
-	hasIntelIGPU := detectIntelIGPU(config.IoAdapterList, aa)
-	dmArgs = append(dmArgs, displayArgs(ctx.virtualGPUFor(config, hasIntelIGPU))...)
+	hasIntelIGPU, igpuBoundToVfio := detectIntelIGPU(config.IoAdapterList, aa)
+	dmArgs = append(dmArgs, displayArgs(ctx.virtualGPUFor(config, hasIntelIGPU, igpuBoundToVfio))...)
 	if config.VirtualizationMode == types.FML {
 		dmArgs = append(dmArgs, ctx.dmFmlCPUArgs...)
 	} else {
@@ -1541,15 +1541,14 @@ func (f *pciAssignmentsTemplateFiller) do(pciAssignments []pciDevice) error {
 			Xopregion:    false,
 		}
 
-		isIntelIGPU := false
-		if vendor, err := pa.vid(); err == nil && vendor == "0x8086" && pciPTContext.Xvga {
+		isIntelIGPU := pa.isIntelVGA()
+		if isIntelIGPU {
 			// Intel iGPU passthrough: enable OpRegion / VBT passthrough
 			// (writes etc/igd-opregion to fw_cfg) and load an option-ROM
 			// containing IgdAssignmentDxe (and optionally a proprietary
 			// IntelGopDriver from a vendor ROM under /persist/vault/gop).
 			// See qemu/docs/igd-assign.txt.
 			pciPTContext.Xopregion = true
-			isIntelIGPU = true
 			path, missing := gopRomPath(f.gopRomFilename)
 			pciPTContext.Romfile = path
 			switch {
@@ -1739,29 +1738,29 @@ func loadIgpuIDs() (lpcDeviceID string) {
 	return parse(ids.LpcDeviceID)
 }
 
-// detectIntelIGPU returns true if any adapter in the passthrough list is
-// an Intel VGA-class device (vendor 0x8086, class 0x03xx).  Drives the
-// "this domain wants iGPU passthrough" branch in the QEMU config — guest
-// BDF pinning, OpRegion / fw_cfg setup, USB root port relocation.
-func detectIntelIGPU(adapters []types.IoAdapter, aa *types.AssignableAdapters) bool {
+// detectIntelIGPU reports whether any adapter in the passthrough list is an
+// Intel VGA-class device (vendor 0x8086, class 0x03xx) - the iGPU - and, if
+// so, whether it is currently bound to vfio-pci. present drives the "this
+// domain wants iGPU passthrough" branch in the QEMU config — guest BDF
+// pinning, OpRegion / fw_cfg setup, USB root port relocation. boundToVfio
+// lets virtualGPUFor detect the case where the iGPU was already reserved
+// for real passthrough (e.g. by the pool-fill path when host VGA access is
+// disabled) before this app was ever asked whether it wanted a virtual GPU.
+func detectIntelIGPU(adapters []types.IoAdapter, aa *types.AssignableAdapters) (present, boundToVfio bool) {
 	if aa == nil {
-		return false
+		return false, false
 	}
 	for _, adapter := range adapters {
 		for _, ib := range aa.LookupIoBundleAny(adapter.Name) {
 			if ib == nil || ib.PciLong == "" || ib.UsbAddr != "" {
 				continue
 			}
-			dev := pciDevice{ioBundle: *ib}
-			if !dev.isVGA() {
-				continue
-			}
-			if vendor, err := dev.vid(); err == nil && vendor == "0x8086" {
-				return true
+			if (pciDevice{ioBundle: *ib}).isIntelVGA() {
+				return true, ib.IsPCIBack
 			}
 		}
 	}
-	return false
+	return false, false
 }
 
 // CreateDomConfig creates a domain config (a qemu config file,
@@ -1788,8 +1787,8 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	//   4. Default (BOOT_ORDER_UNSPECIFIED) - no boot order modification
 	// By the time we get here, config.BootOrder has the final resolved value.
 	bootOrder := bootOrderToFwCfgString(config.BootOrder)
-	hasIntelIGPU := detectIntelIGPU(config.IoAdapterList, aa)
-	virtualGPU := ctx.virtualGPUFor(config, hasIntelIGPU)
+	hasIntelIGPU, igpuBoundToVfio := detectIntelIGPU(config.IoAdapterList, aa)
+	virtualGPU := ctx.virtualGPUFor(config, hasIntelIGPU, igpuBoundToVfio)
 	// A domain in virtual-GPU mode keeps the iGPU with the host driver -
 	// domainmgr never reserves or binds it for such a domain - so none of
 	// the passthrough plumbing hasIntelIGPU otherwise drives (the LPC ID
@@ -1910,8 +1909,19 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 					domainName)
 			}
 			if ib.PciLong != "" && ib.UsbAddr == "" {
-				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
 				tap := pciDevice{ioBundle: *ib}
+				if virtualGPU && tap.isIntelVGA() {
+					// Operator opted this domain into a virtual GPU: the
+					// iGPU stays with the host driver (domainmgr never
+					// reserved it - see skipForVirtualGPU), so it must not
+					// be handed to QEMU as a vfio-pci passthrough device
+					// here either - it would fail to open, since it is
+					// still bound to i915.
+					logrus.Infof("Skipping PCI passthrough of %s for %s: virtual GPU mode",
+						ib.PciLong, domainName)
+					continue
+				}
+				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
 
 				if ib.Type.IsNet() {
 					tap.netIntfOrder = adapter.IntfOrder
@@ -2341,11 +2351,36 @@ func (ctx KvmContext) gpuModeFor(key string) string {
 // domain name changes across a controller version bump
 // (config.GetTaskName() folds in AppNum), which would otherwise silently
 // revert an operator's choice on the next restart.
-func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, hasIntelIGPU bool) bool {
+//
+// igpuBoundToVfio is detectIntelIGPU's other result: whether the iGPU is
+// already bound to vfio-pci. That happens when domainmgr's pool-fill path
+// reserved it ahead of this app's activation - typically because
+// debug.enable.vga (host VGA access) is disabled - before skipForVirtualGPU
+// ever got a chance to leave it with the host driver. Releasing it back to
+// the host at this point would mean tearing down PCI state mid-activation,
+// which this decision does not attempt; fail safe onto real passthrough
+// instead so the VM still starts, and log the conflict for an operator to
+// act on.
+func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, hasIntelIGPU, igpuBoundToVfio bool) bool {
 	if !ctx.virtualGPU || !hasIntelIGPU {
 		return false
 	}
-	return ctx.gpuModeFor(config.UUIDandVersion.UUID.String()) == types.GPUModeVirtual
+	// Check the mode before the vfio-bound fact: the overwhelmingly common
+	// case is a passthrough app whose iGPU is (correctly) bound to vfio-pci,
+	// and warning about that on every start would be log noise that hides
+	// the one case the warning actually means something for - an operator
+	// who asked for virtual mode but hasn't gotten it.
+	if ctx.gpuModeFor(config.UUIDandVersion.UUID.String()) != types.GPUModeVirtual {
+		return false
+	}
+	if igpuBoundToVfio {
+		logrus.Warnf("virtualGPUFor: domain %s asked for a virtual GPU but "+
+			"the iGPU is already bound to vfio-pci (host VGA access is "+
+			"likely disabled) - falling back to real passthrough",
+			config.UUIDandVersion.UUID.String())
+		return false
+	}
+	return true
 }
 
 // renderNode is the DRM render node QEMU uses to back a guest's virtual GPU

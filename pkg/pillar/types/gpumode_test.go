@@ -13,7 +13,8 @@ import (
 // the path or the schema, and the default preserves today's behaviour.
 func TestGPUModeCreatesTheFileWithPassthroughDefault(t *testing.T) {
 	dir := t.TempDir()
-	mode := GPUModeAt(dir, "vm1.1.1")
+	GPUModeEnsureDefaultAt(dir, "vm1.1.1")
+	mode := GPUModeRead(dir, "vm1.1.1")
 	if mode != "passthrough" {
 		t.Errorf("default must be passthrough for backward compatibility, got %q", mode)
 	}
@@ -26,7 +27,8 @@ func TestGPUModeCreatesTheFileWithPassthroughDefault(t *testing.T) {
 func TestGPUModeReadsVirtual(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "vm1.1.1.json"), []byte(`{"mode":"virtual"}`), 0644)
-	if got := GPUModeAt(dir, "vm1.1.1"); got != "virtual" {
+	GPUModeEnsureDefaultAt(dir, "vm1.1.1") // must not overwrite the file just written
+	if got := GPUModeRead(dir, "vm1.1.1"); got != "virtual" {
 		t.Errorf("got %q, want virtual", got)
 	}
 }
@@ -38,7 +40,7 @@ func TestGPUModeFallsBackOnGarbage(t *testing.T) {
 	for _, body := range []string{`{"mode":`, `{"mode":"banana"}`, ``, `null`} {
 		dir := t.TempDir()
 		os.WriteFile(filepath.Join(dir, "vm1.1.1.json"), []byte(body), 0644)
-		if got := GPUModeAt(dir, "vm1.1.1"); got != "passthrough" {
+		if got := GPUModeRead(dir, "vm1.1.1"); got != "passthrough" {
 			t.Errorf("body %q: got %q, want passthrough", body, got)
 		}
 	}
