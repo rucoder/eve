@@ -354,10 +354,11 @@ resolve_disk() {
 
    case "$WANT" in
       serial:*)
+         # awk, not `while read`: lsblk pads its columns, and the padding
+         # defeats a shell read that compares the trailing field. awk splits
+         # on whitespace, so the comparison is against the value itself.
          SERIAL="${WANT#serial:}"
-         lsblk -dn -o NAME,SERIAL 2>/dev/null | while read -r NAME S; do
-            [ "$S" = "$SERIAL" ] && { echo "$NAME"; break; }
-         done
+         lsblk -dn -o NAME,SERIAL 2>/dev/null | awk -v s="$SERIAL" '$2 == s { print $1; exit }'
          return 0
          ;;
    esac
