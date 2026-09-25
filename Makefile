@@ -304,8 +304,20 @@ QEMU_OPTS_amd64=-smbios type=1,serial=$(QEMU_EVE_SERIAL)
 QEMU_OPTS_arm64=-smbios type=1,serial=$(QEMU_EVE_SERIAL) -drive file=fat:rw:$(dir $(DEVICETREE_DTB)),label=QEMU_DTB,format=vvfat
 QEMU_OPTS_riscv64=-kernel $(UBOOT_IMG)/u-boot.bin -device virtio-blk,drive=uefi-disk
 QEMU_OPTS_NO_DISPLAY=-display none
-QEMU_OPTS_VGA_DISPLAY_amd64=-vga std
-QEMU_OPTS_VGA_DISPLAY_arm64=-device virtio-gpu-pci -usb -device usb-ehci,id=ehci -device usb-kbd,bus=ehci.0
+# The guest needs a DRM device its own kernel has a driver for. EVE's kernel
+# enables DRM_I915 and DRM_VIRTIO_GPU and nothing else - no bochs, cirrus or
+# qxl - so "-vga std" leaves the graphical console with no /dev/dri/card* to
+# open at all. virtio-vga-gl is the virtio GPU plus 3D through virglrenderer,
+# which is what makes the console's EGL/GBM path work: the guest's virgl
+# driver is built into libgallium, so no extra mesa package is needed.
+#
+# gtk,gl=on: the window goes to $DISPLAY, so X11 forwarding over ssh shows it
+# exactly as it does locally. gl=on is what gives the guest virgl.
+QEMU_GUI_DISPLAY?=gtk,gl=on
+QEMU_OPTS_VGA_DISPLAY_amd64=-device virtio-vga-gl -display $(QEMU_GUI_DISPLAY) \
+    -usb -device usb-tablet -device usb-kbd
+QEMU_OPTS_VGA_DISPLAY_arm64=-device virtio-gpu-gl-pci -display $(QEMU_GUI_DISPLAY) \
+    -usb -device usb-ehci,id=ehci -device usb-kbd,bus=ehci.0 -device usb-tablet,bus=ehci.0
 QEMU_OPTS_VGA_DISPLAY_riscv64=-vga std
 QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp 8  $(QEMU_OPTS_BIOS) \
         -pidfile $(QEMU_PID_FILE) \
@@ -474,7 +486,7 @@ else
         PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube|external-boot-image$$")
         # nvidia platform requires more space
         ifeq (, $(findstring nvidia,$(PLATFORM)))
-            ROOTFS_MAXSIZE_MB=290
+            ROOTFS_MAXSIZE_MB=500
         else
             ROOTFS_MAXSIZE_MB=10240
         endif

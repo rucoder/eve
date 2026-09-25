@@ -39,6 +39,10 @@ type monitor struct {
 	pubDevicePortConfig pubsub.Publication
 	clientConnected     chan bool
 	serverNameAndPort   string
+	// subsActivated guards Activate(): it starts a watcher goroutine per
+	// subscription and is not idempotent, so calling it once per client
+	// connection leaks an inotify watcher every time.
+	subsActivated bool
 
 	// latest of each input feeding the aggregated DeviceStatus snapshot
 	lastOnboarding   types.OnboardingStatus

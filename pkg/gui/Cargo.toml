@@ -46,6 +46,10 @@ chrono = { version = "0.4", default-features = false, features = ["serde"] }
 macaddr = { version = "1", features = ["serde"] }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# Wait for pillar's socket to appear rather than polling for it. Same approach
+# the TUI console used; see ipc_client.rs for why polling is not a substitute.
+async-inotify = "0.1.0"
+inotify = "0.10.2"
 futures = "0.3"
 
 # QEMU's D-Bus display is a peer-to-peer connection over a socket QEMU itself

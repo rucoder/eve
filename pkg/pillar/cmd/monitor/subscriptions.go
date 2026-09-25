@@ -390,17 +390,29 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 }
 
 func (ctx *monitor) handleClientConnected() {
-	// go over all the subscriptions and process the current state
-	log.Noticef("Client connected. Activating subscriptions")
+	log.Noticef("Client connected")
 
+	// A new client needs the current state, every time.
 	ctx.sendDeviceStatus()
 	ctx.sendAppsList()
 
+	// Activating, on the other hand, happens once for the life of the agent.
+	// Subscription.Activate() ends in Subscriber.Start(), which spawns a fresh
+	// watch.WatchStatus goroutine - and so a fresh inotify watcher - without
+	// stopping the previous one. Doing that per connection leaks a descriptor
+	// per subscription per connect, and a client that reconnects on a timer
+	// walks the agent into "too many open files: NewWatcher". The agent then
+	// dies and the watchdog reboots the device, which is what it did here: a
+	// console reconnecting every two seconds rebooted the box in a loop.
+	if ctx.subsActivated {
+		return
+	}
 	for _, sub := range ctx.subscriptions {
 		if err := sub.Activate(); err != nil {
 			log.Errorf("Failed to activate subscription %s", err)
 		}
 	}
+	ctx.subsActivated = true
 }
 
 func (ctx *monitor) process(ps *pubsub.PubSub) {
