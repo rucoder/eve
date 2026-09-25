@@ -29,6 +29,12 @@ type GPURequest struct {
 	// Release is true when the console must let go, false when it may claim
 	// the GPU again.
 	Release bool `json:"release"`
+	// RequestID identifies this request. The console must echo it back
+	// unchanged in the GPUAck it sends for this request - pillar uses it to
+	// drop a late ack for a request that has since been superseded by a
+	// newer one, and has no other way to tell them apart (Domain repeats,
+	// e.g. "" on every restore).
+	RequestID uint64 `json:"request_id"`
 }
 
 // GPUAck is the console's answer. RequestID echoes the GPURequest it is
@@ -43,7 +49,7 @@ type GPUAck struct {
 
 // NewGPURequest builds the request domainmgr sends to ask the console to give
 // up the GPU (release=true) or to let it know the GPU is available again
-// (release=false).
-func NewGPURequest(domain string, release bool) *GPURequest {
-	return &GPURequest{Domain: domain, Release: release}
+// (release=false). requestID is echoed back in the console's GPUAck.
+func NewGPURequest(domain string, release bool, requestID uint64) *GPURequest {
+	return &GPURequest{Domain: domain, Release: release, RequestID: requestID}
 }

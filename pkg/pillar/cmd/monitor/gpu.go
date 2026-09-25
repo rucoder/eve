@@ -30,9 +30,10 @@ func (ctx *monitor) handleGPUConsoleConfig(cfg types.GPUConsoleConfig) {
 	attached := ctx.IPCServer.hasClient()
 	if attached {
 		// Remember the in-flight id so handleGPUAck can drop a late ack for
-		// a request this has since superseded.
+		// a request this has since superseded, and hand the same id to the
+		// console so it has something to echo back.
 		ctx.pendingGPURequestID.Store(cfg.RequestID)
-		req := monitorapi.NewGPURequest(cfg.Domain, cfg.Release)
+		req := monitorapi.NewGPURequest(cfg.Domain, cfg.Release, cfg.RequestID)
 		if err := ctx.IPCServer.sendIpcMessage(monitorapi.GPURequestTag, req); err != nil {
 			log.Errorf("Failed to forward GPU request to console: %v", err)
 		}

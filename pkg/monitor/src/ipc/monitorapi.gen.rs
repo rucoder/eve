@@ -285,6 +285,8 @@ pub struct GpuRequest {
     pub domain: String,
     #[serde(rename = "release")]
     pub release: bool,
+    #[serde(rename = "request_id")]
+    pub request_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
