@@ -335,14 +335,40 @@ if [ -z "$INSTALL_DEV" ] ; then
    INSTALL_DEV=$(set ${FREE_DISKS:-""} ; echo "$1")
 fi
 
+# eve_install_disk may name the disk by a stable identifier from
+# /dev/disk/by-id instead of by its kernel name. NVMe namespace numbers are
+# handed out in probe-completion order, and where the drives sit behind Intel
+# VMD that order is not stable across boots: nvme0n1 and nvme1n1 can and do
+# swap. Pinning by kernel name can therefore install onto a different disk than
+# the operator meant - including one holding another OS, since a foreign
+# filesystem is not a reason for this script to skip a disk. Resolve the stable
+# name to whatever the kernel called it this boot.
+if [ -n "$INSTALL_DEV" ] && [ ! -b "/dev/$INSTALL_DEV" ] && [ -L "/dev/disk/by-id/$INSTALL_DEV" ]; then
+   RESOLVED_DEV=$(readlink -f "/dev/disk/by-id/$INSTALL_DEV")
+   logmsg "eve_install_disk=$INSTALL_DEV resolved to ${RESOLVED_DEV##*/}"
+   INSTALL_DEV="${RESOLVED_DEV##*/}"
+fi
+
 logmsg "Installing EVE-OS on device $INSTALL_DEV"
 
 # ...if we didn't find a single free disk - bail
 [ -z "$INSTALL_DEV" ] && bail "FATAL: didn't find a single free disk"
 
+# A named target that is not a block device is an operator error, and ploughing
+# on is worse than stopping: every write below would create a regular file at
+# that path instead, and the mistake only surfaces later as an unreadable
+# partition table on a disk nobody has actually touched.
+[ -b "/dev/$INSTALL_DEV" ] || bail "FATAL: /dev/$INSTALL_DEV is not a block device (eve_install_disk names a disk this kernel does not have)"
+
 # we allow for P3 partition to reside on a separate disk
 INSTALL_PERSIST=$(<"$CMDLINEFILE" tr ' ' '\012' | sed -ne '/^eve_persist_disk=/s#^.*=##p')
 INSTALL_PERSIST=${INSTALL_PERSIST:-$INSTALL_DEV}
+# Same stable-identifier treatment as the install disk above.
+if [ -n "$INSTALL_PERSIST" ] && [ ! -b "/dev/$INSTALL_PERSIST" ] && [ -L "/dev/disk/by-id/$INSTALL_PERSIST" ]; then
+   RESOLVED_PERSIST=$(readlink -f "/dev/disk/by-id/$INSTALL_PERSIST")
+   logmsg "eve_persist_disk=$INSTALL_PERSIST resolved to ${RESOLVED_PERSIST##*/}"
+   INSTALL_PERSIST="${RESOLVED_PERSIST##*/}"
+fi
 
 logmsg "Installing persist on disk(s) $INSTALL_PERSIST"
 
