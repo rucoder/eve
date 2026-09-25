@@ -130,6 +130,8 @@ type domainContext struct {
 	pubCipherBlockStatus   pubsub.Publication
 	pubCapabilities        pubsub.Publication
 	subNodeAgentStatus     pubsub.Subscription
+	pubGPUConsoleConfig    pubsub.Publication
+	subGPUConsoleStatus    pubsub.Subscription
 	cipherMetrics          *cipher.AgentMetrics
 	createSema             *sema.Semaphore
 	GCComplete             bool
@@ -344,6 +346,29 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Fatal(err)
 	}
 	domainCtx.pubCapabilities = capabilitiesInfoPub
+
+	pubGPUConsoleConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.GPUConsoleConfig{},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	domainCtx.pubGPUConsoleConfig = pubGPUConsoleConfig
+
+	subGPUConsoleStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "monitor",
+		MyAgentName: agentName,
+		TopicImpl:   types.GPUConsoleStatus{},
+		Activate:    true,
+		Ctx:         &domainCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	domainCtx.subGPUConsoleStatus = subGPUConsoleStatus
 
 	// Look for nodeagent status
 	subNodeAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -584,6 +609,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case change := <-subZFSPoolStatus.MsgChan():
 			subZFSPoolStatus.ProcessChange(change)
 
+		case change := <-subGPUConsoleStatus.MsgChan():
+			subGPUConsoleStatus.ProcessChange(change)
+
 		case <-domainCtx.publishTicker.C:
 			publishProcessesHandler(&domainCtx)
 
@@ -806,6 +834,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 		case change := <-subZFSPoolStatus.MsgChan():
 			subZFSPoolStatus.ProcessChange(change)
+
+		case change := <-subGPUConsoleStatus.MsgChan():
+			subGPUConsoleStatus.ProcessChange(change)
 
 		case change := <-subPhysicalIOAdapter.MsgChan():
 			subPhysicalIOAdapter.ProcessChange(change)
@@ -1730,6 +1761,7 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 	publishAssignableAdapters := false
 	var assignmentsPci []string
 	var assignmentsUsb []string
+	hasBootVga := false
 	for _, adapter := range config.IoAdapterList {
 		log.Functionf("doAssignIoAdaptersToDomain processing adapter %d %s",
 			adapter.Type, adapter.Name)
@@ -1815,26 +1847,48 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 					ib.Phylabel, ib.PciLong, status.DomainName)
 				assignmentsPci = addNoDuplicate(assignmentsPci, ib.PciLong)
 				ib.IsPCIBack = true
+				if isBootVGA(ib) {
+					hasBootVga = true
+				}
 			}
 		}
 		publishAssignableAdapters = publishAssignableAdapters || len(assignmentsUsb) > 0 || len(assignmentsPci) > 0
 	}
 
-	for i, long := range assignmentsPci {
-		err := hyper.PCIReserve(long)
-		if err != nil {
-			// Undo what we assigned
-			for j, long := range assignmentsPci {
-				if j >= i {
-					break
+	// The boot VGA device may still be sitting with the host driver (e.g.
+	// vgaAccess left the operator's default of keeping it there) even though
+	// this app was explicitly configured to take it. i915 will not unbind
+	// while the console holds DRM master, so ask it to let go first. On
+	// timeout releaseGPUForDomain proceeds anyway - the app wins - and a
+	// failed reserve below hands the GPU straight back.
+	release := func() bool { return false }
+	restore := func() {}
+	if hasBootVga {
+		release = func() bool { return releaseGPUForDomain(ctx, status.DomainName, gpuReleaseTimeout) }
+		restore = func() { restoreGPUToConsole(ctx) }
+	}
+
+	err := assignWithGPU(release, func() error {
+		for i, long := range assignmentsPci {
+			err := hyper.PCIReserve(long)
+			if err != nil {
+				// Undo what we assigned
+				for j, long := range assignmentsPci {
+					if j >= i {
+						break
+					}
+					hyper.PCIRelease(long)
 				}
-				hyper.PCIRelease(long)
+				return err
 			}
-			if publishAssignableAdapters {
-				ctx.publishAssignableAdapters()
-			}
-			return err
 		}
+		return nil
+	}, restore)
+	if err != nil {
+		if publishAssignableAdapters {
+			ctx.publishAssignableAdapters()
+		}
+		return err
 	}
 	checkIoBundleAll(ctx)
 	if publishAssignableAdapters {
@@ -2462,6 +2516,7 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 	log.Functionf("releaseAdapters(%s)", myUUID)
 	ignoreErrors := (status == nil)
 	var assignments []string
+	bootVgaPciLong := ""
 	for _, adapter := range ioAdapterList {
 		log.Tracef("releaseAdapters processing adapter %d %s",
 			adapter.Type, adapter.Name)
@@ -2513,6 +2568,9 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 					ib.Phylabel, ib.PciLong, myUUID)
 				assignments = addNoDuplicate(assignments, ib.PciLong)
 				ib.IsPCIBack = false
+				if isBootVGA(ib) {
+					bootVgaPciLong = ib.PciLong
+				}
 			}
 			ib.UsedByUUID = nilUUID
 		}
@@ -2522,6 +2580,11 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 		err := hyper.PCIRelease(long)
 		if err != nil && !ignoreErrors {
 			status.SetErrorNow(err.Error())
+		}
+		// Only tell the console it can reclaim the GPU once it is actually
+		// back with the host driver, not merely marked so.
+		if err == nil && long == bootVgaPciLong {
+			restoreGPUToConsole(ctx)
 		}
 	}
 	ctx.publishAssignableAdapters()
@@ -4356,6 +4419,9 @@ func updateVgaAccess(ctx *domainContext) {
 			if err := chvt(currentTTY); err != nil {
 				log.Errorf("Cannot switch to VT: %v", err)
 			}
+			// The framebuffer console is back in a usable state; let the
+			// GUI console reclaim the GPU too. No need to wait for it here.
+			restoreGPUToConsole(ctx)
 			vgaSwitch = false
 		}
 
@@ -4363,6 +4429,13 @@ func updateVgaAccess(ctx *domainContext) {
 	}
 
 	if !vgaSwitch {
+		// Ask the console to give up DRM master before we blank the screen
+		// and pull the framebuffer driver out from under it - i915 won't
+		// unbind while it still holds the card. On timeout proceed anyway:
+		// the operator asked for VGA access off, and that must not be
+		// blocked by a console that will not answer.
+		releaseGPUForDomain(ctx, "", gpuReleaseTimeout)
+
 		// Get active TTY, in case of error just consider tty2 which is
 		// the one used by TUI Monitor
 		ttyDev, err := getActiveTTY()
