@@ -345,6 +345,17 @@ fi
 # The serial form exists because it is the only one that works everywhere:
 # kernel names are not stable (see below), and /dev/disk/by-id needs udev rules
 # that a minimal installer image does not necessarily carry.
+# disk_serial prints the trimmed serial of a kernel block device name, or
+# nothing. NVMe hangs the serial off the controller rather than the namespace;
+# SATA and USB pad theirs with trailing spaces.
+disk_serial() {
+   local D="/sys/block/$1"
+   local S=""
+   [ -r "$D/serial" ] && S=$(cat "$D/serial" 2>/dev/null)
+   [ -z "$S" ] && [ -r "$D/device/serial" ] && S=$(cat "$D/device/serial" 2>/dev/null)
+   printf '%s' "$S" | tr -d ' \t\r\n'
+}
+
 resolve_disk() {
    local WANT="$1"
    local SERIAL
@@ -361,17 +372,18 @@ resolve_disk() {
          for D in /sys/block/*; do
             N="${D##*/}"
             [ -b "/dev/$N" ] || continue
-            S=""
-            [ -r "$D/serial" ] && S=$(cat "$D/serial" 2>/dev/null)
-            # NVMe hangs the serial off the controller, not the namespace.
-            [ -z "$S" ] && [ -r "$D/device/serial" ] && S=$(cat "$D/device/serial" 2>/dev/null)
-            # SATA and USB pad theirs.
-            S=$(printf '%s' "$S" | tr -d ' \t\r\n')
+            S=$(disk_serial "$N")
             if [ "$S" = "$SERIAL" ]; then
                echo "$N"
                return 0
             fi
          done
+         # Fallback. lsblk is known to work in this image - the inventory of
+         # block devices logged below comes from it - so if the sysfs walk
+         # found nothing, ask lsblk the same question. grep and cut only: no
+         # awk (busybox's is numeric-happy) and no shell read (lsblk pads).
+         N=$(lsblk -dn -o NAME,SERIAL 2>/dev/null | grep -w -- "$SERIAL" | head -1 | cut -d' ' -f1)
+         [ -n "$N" ] && [ -b "/dev/$N" ] && echo "$N"
          return 0
          ;;
    esac
@@ -401,6 +413,16 @@ if [ -n "$INSTALL_DEV" ]; then
    # never turns up is indistinguishable from one that turned up wrong, and
    # the operator is left reading a corrupt-partition-table error instead.
    logmsg "block devices seen: $(lsblk -dn -o NAME,SIZE,SERIAL 2>/dev/null | tr '\n' '|')"
+   # What the sysfs walk itself sees, which is not always the same thing -
+   # this is the line that tells you whether resolution failed because the
+   # serial did not match or because the walk came up empty.
+   SCAN=""
+   for D in /sys/block/*; do
+      N="${D##*/}"
+      [ -b "/dev/$N" ] || continue
+      SCAN="$SCAN $N=[$(disk_serial "$N")]"
+   done
+   logmsg "sysfs serials:$SCAN"
    if [ -n "$RESOLVED_DEV" ] && [ "$RESOLVED_DEV" != "$INSTALL_DEV" ]; then
       logmsg "eve_install_disk=$INSTALL_DEV resolved to $RESOLVED_DEV"
    fi
