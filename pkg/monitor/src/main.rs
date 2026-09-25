@@ -208,10 +208,14 @@ const GPU_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 /// match the request it is waiting on (see PillarState::pending_gpu_ack and
 /// handleGPUAck in pkg/pillar/cmd/monitor/gpu.go). Never called before the
 /// change `req` asked for has actually happened; see the two call sites.
+///
+/// Returns whether it actually queued something, so a caller that is about
+/// to exit can decide whether waiting a moment for the background IPC
+/// thread to flush it is worth it.
 fn ack_gpu_request(
     outbox: &tokio::sync::mpsc::UnboundedSender<ipc::message::IpcMessage>,
     req: ipc::monitorapi::GpuRequest,
-) {
+) -> bool {
     let id = req.request_id;
     let ack = ipc::monitorapi::GpuAck {
         domain: req.domain,
@@ -219,8 +223,12 @@ fn ack_gpu_request(
         request_id: req.request_id,
     };
     let msg = ipc::message::IpcMessage::Request { request: ipc::message::Request::GPUAck(ack), id };
-    if outbox.send(msg).is_err() {
-        log::warn!("gpu: outbox closed, dropping ack for request {id}");
+    match outbox.send(msg) {
+        Ok(()) => true,
+        Err(_) => {
+            log::warn!("gpu: outbox closed, dropping ack for request {id}");
+            false
+        }
     }
 }
 
@@ -274,16 +282,25 @@ fn spawn_gui_gpu_watcher(
 /// `capable` gates whether an available GPU ever asks `switch` to hand
 /// control to the GUI: a device with no GPU (see `Console::new`) must stay on
 /// the TUI regardless of what pillar reports, or this would fight
-/// `Console::want()` and restart the TUI session in a tight loop. But
-/// `capable` can be a stale "no" from the boot-time probe - a device that
-/// booted with the iGPU already in vfio-pci (e.g. `debug.enable.vga=false`)
-/// has no card to find at startup - so when the GPU becomes available while
-/// still believed incapable, this re-probes with `probe` before giving up,
-/// the same way `Console::refresh_capable` does for the session-boundary
-/// case. Re-probing is cheap enough to just repeat on the same
-/// `GPU_POLL_INTERVAL` cadence for as long as a genuinely GPU-less device
-/// keeps reporting the GPU as available (which pillar has no reason to do,
-/// since it only manages real GPUs).
+/// `Console::want()` and restart the TUI session in a tight loop.
+///
+/// `capable` can be a stale "no" from the boot-time probe, though - a device
+/// that booted with the iGPU already in vfio-pci (e.g.
+/// `debug.enable.vga=false`) has no card to find at startup - so this
+/// re-probes with `probe` once up front, and again on every restore
+/// afterwards (a restore is the one moment that stale answer needs
+/// rechecking; a release never changes whether a card exists). It does
+/// *not* probe on every tick: `PillarState::gpu_available` defaults to
+/// `true` with no pillar involvement at all (see `PillarState::default`),
+/// so an always-on GPU-less device would otherwise drive a DRM scan and a
+/// `frontend::choose` log line 20 times a second, forever - `choose` is for
+/// logging the boot-time decision once, not for a polling predicate, hence
+/// `probe()` is called directly here instead.
+///
+/// Returns the `capable` this watcher ends up believing, so the caller can
+/// hand it to `Console` directly (`Console::adopt_capable`) instead of
+/// probing DRM a second time, which could disagree with this watcher on a
+/// card that flaps between the two probes.
 ///
 /// Stops once `stop` is set, which the caller does right after the TUI
 /// session ends for any reason.
@@ -294,51 +311,61 @@ fn spawn_tui_gpu_watcher(
     probe: impl Fn() -> Option<String> + Send + 'static,
     switch: tokio_util::sync::CancellationToken,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<bool> {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        if !capable {
+            capable = probe().is_some();
+        }
         while !stop.load(Ordering::SeqCst) {
             let (available, pending) = {
                 let mut st = state.lock().unwrap();
                 (st.gpu_available, st.pending_gpu_ack.take())
             };
             if let Some(req) = pending {
+                if !capable && !req.release {
+                    capable = probe().is_some();
+                }
                 ack_gpu_request(&outbox, req);
             }
-            if available {
-                if !capable {
-                    capable = frontend::choose(&probe) == frontend::Frontend::Gui;
-                }
-                if capable {
-                    switch.cancel();
-                    return;
-                }
+            if available && capable {
+                switch.cancel();
+                return capable;
             }
             std::thread::sleep(GPU_POLL_INTERVAL);
         }
+        capable
     })
 }
 
 /// Joins a watcher thread, logging rather than silently swallowing a panic -
 /// a poisoned lock or a bug in the watcher itself would otherwise stop the
-/// GPU handover for the rest of this session with no trace of why.
-fn join_watcher(handle: std::thread::JoinHandle<()>, name: &str) {
-    if let Err(e) = handle.join() {
-        log::error!("{name} panicked: {e:?}");
+/// GPU handover for the rest of this session with no trace of why. Returns
+/// whatever the watcher returned, or `None` if it panicked.
+fn join_watcher<T>(handle: std::thread::JoinHandle<T>, name: &str) -> Option<T> {
+    match handle.join() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::error!("{name} panicked: {e:?}");
+            None
+        }
     }
 }
 
-/// Applies pillar's latest `gpu_available` to `console`, re-probing DRM
-/// first when the device isn't currently believed capable and the GPU has
-/// just become available. `Console::capable` is otherwise fixed at the
-/// boot-time probe (see `Console::refresh_capable`), so without this a
-/// device that booted with the iGPU already in vfio-pci would never get the
-/// GUI back after a restore - this call site is the authoritative one; the
-/// TUI watcher does its own copy of the same check so a live session
-/// notices without waiting for it to end first.
-fn sync_console(console: &mut frontend::Console, available: bool) {
-    if available && !console.capable() {
-        console.refresh_capable(&frontend::probe_drm);
+/// Applies pillar's latest `gpu_available` to `console` after a GUI session,
+/// re-probing DRM first if the device isn't currently believed capable.
+/// `Console::capable` is otherwise fixed at the boot-time probe, so without
+/// this a device that booted with the iGPU already in vfio-pci would never
+/// get the GUI back after a restore.
+///
+/// GUI-arm only: `Console::try_upgrade_capable` is safe to call here because
+/// nothing else is probing DRM concurrently in that arm. The TUI arm instead
+/// hands `console.adopt_capable` the result its own watcher already found -
+/// see `spawn_tui_gpu_watcher`'s doc comment for why probing independently
+/// there could disagree with that watcher on a flapping card.
+fn sync_console_after_gui(console: &mut frontend::Console, available: bool) {
+    if available {
+        console.try_upgrade_capable(&frontend::probe_drm);
     }
     console.set_gpu_available(available);
 }
@@ -360,6 +387,14 @@ async fn main() -> Result<()> {
     let mut client = ipc::spawn(&get_ipc_socket_path());
 
     let mut console = frontend::Console::new(frontend::choose(&frontend::probe_drm));
+
+    // Whether the last thing this loop did was successfully queue a GpuAck -
+    // read after the loop to decide whether the final process::exit below is
+    // worth delaying for. `Application::new(...)?` and
+    // `TerminalWrapper::close_terminal()?` in the TUI arm can return out of
+    // main() entirely on failure, bypassing both this and the loop - this
+    // flag is a best-effort nicety, not a delivery guarantee.
+    let mut acked_last;
 
     // Which frontend is showing changes only at the top of this loop, so
     // asking for the one already running is a no-op: the match below simply
@@ -396,10 +431,8 @@ async fn main() -> Result<()> {
                 // let domainmgr bind vfio while this process still holds the
                 // card.
                 let pending = client.state.lock().unwrap().pending_gpu_ack.take();
-                if let Some(req) = pending {
-                    ack_gpu_request(&client.outbox, req);
-                }
-                sync_console(&mut console, client.state.lock().unwrap().gpu_available);
+                acked_last = pending.is_some_and(|req| ack_gpu_request(&client.outbox, req));
+                sync_console_after_gui(&mut console, client.state.lock().unwrap().gpu_available);
 
                 // `switch` set means main asked the GUI to hand back control
                 // (console.want() no longer wants it); anything else - the VT
@@ -434,17 +467,21 @@ async fn main() -> Result<()> {
                 TerminalWrapper::close_terminal()?;
 
                 stop_watcher.store(true, std::sync::atomic::Ordering::SeqCst);
-                join_watcher(watcher, "tui gpu watcher");
+                // Adopt what the watcher already found rather than probing
+                // DRM again here - see spawn_tui_gpu_watcher's doc comment
+                // for why probing twice independently could disagree on a
+                // flapping card and restart this session in a loop.
+                if let Some(found) = join_watcher(watcher, "tui gpu watcher") {
+                    console.adopt_capable(found);
+                }
 
                 // Symmetric with the GUI arm above: the watcher could still
                 // be mid-sleep when `stop_watcher` was set and miss a request
                 // that landed in that last window. The TUI never holds DRM
                 // master, so answering it here is always safe.
                 let pending = client.state.lock().unwrap().pending_gpu_ack.take();
-                if let Some(req) = pending {
-                    ack_gpu_request(&client.outbox, req);
-                }
-                sync_console(&mut console, client.state.lock().unwrap().gpu_available);
+                acked_last = pending.is_some_and(|req| ack_gpu_request(&client.outbox, req));
+                console.set_gpu_available(client.state.lock().unwrap().gpu_available);
 
                 if !switch.is_cancelled() {
                     break;
@@ -452,14 +489,17 @@ async fn main() -> Result<()> {
             }
         }
     }
-    // A GpuAck may have just been queued on `client.outbox` (a release that
-    // arrived right as this process was told to shut down) without the
-    // background IPC thread having had a chance to write it to the socket
-    // yet - process::exit below is immediate and does not wait for that.
-    // This is the same "console never answers" symptom the whole handshake
-    // exists to avoid, just at shutdown instead of at a frontend switch, so
-    // give it a brief window rather than none at all.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if acked_last {
+        // A GpuAck was just queued on `client.outbox` (a release that
+        // arrived right as this process was told to shut down) and the
+        // background IPC thread may not have had a chance to write it to the
+        // socket yet - process::exit below is immediate and does not wait
+        // for that. This is the same "console never answers" symptom the
+        // whole handshake exists to avoid, just at shutdown instead of at a
+        // frontend switch, so give it a brief window rather than none at
+        // all; skipped entirely in the common case where nothing was queued.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     std::process::exit(EXIT_SUCCESS);
 }
 
@@ -528,7 +568,13 @@ mod gpu_handover_tests {
         let switch = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_gui_gpu_watcher(state.clone(), tx, switch.clone(), stop);
+        // sleep -> stop -> join, not a bare join: if the switch decision this
+        // test guards ever regresses so the watcher stops noticing
+        // `!available`, a bare join would hang the whole suite instead of
+        // failing it.
+        let handle = spawn_gui_gpu_watcher(state.clone(), tx, switch.clone(), stop.clone());
+        std::thread::sleep(A_FEW_TICKS);
+        stop.store(true, Ordering::SeqCst);
         handle.join().expect("watcher must not panic");
 
         assert!(switch.load(Ordering::SeqCst), "must ask to hand back control");
@@ -598,10 +644,15 @@ mod gpu_handover_tests {
         let switch = tokio_util::sync::CancellationToken::new();
         let stop = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_tui_gpu_watcher(state, tx, true, || None, switch.clone(), stop);
-        handle.join().expect("watcher must not panic");
+        // sleep -> stop -> join: a regression that stopped switching would
+        // otherwise hang this test instead of failing it.
+        let handle = spawn_tui_gpu_watcher(state, tx, true, || None, switch.clone(), stop.clone());
+        std::thread::sleep(A_FEW_TICKS);
+        stop.store(true, Ordering::SeqCst);
+        let found_gpu = handle.join().expect("watcher must not panic");
 
         assert!(switch.is_cancelled());
+        assert!(found_gpu);
     }
 
     /// The bug from review round 1: a device that booted with the iGPU
@@ -618,16 +669,53 @@ mod gpu_handover_tests {
         let switch = tokio_util::sync::CancellationToken::new();
         let stop = Arc::new(AtomicBool::new(false));
 
+        // sleep -> stop -> join: a regression that dropped the up-front
+        // re-probe would otherwise hang this test instead of failing it.
         let handle = spawn_tui_gpu_watcher(
             state,
             tx,
             false, // the stale boot-time answer
             || Some("/dev/dri/card0".into()), // but a probe now finds a card
             switch.clone(),
-            stop,
+            stop.clone(),
         );
-        handle.join().expect("watcher must not panic");
+        std::thread::sleep(A_FEW_TICKS);
+        stop.store(true, Ordering::SeqCst);
+        let found_gpu = handle.join().expect("watcher must not panic");
 
         assert!(switch.is_cancelled(), "must re-probe rather than trust the boot-time answer");
+        assert!(found_gpu);
+    }
+
+    /// The reprobe must be bounded to the first tick plus every restore, not
+    /// every tick - a GPU-less device (`gpu_available` defaults to `true`
+    /// with no pillar involvement at all) would otherwise drive a DRM scan
+    /// and a log line 20 times a second, forever. `probe_count` counts every
+    /// call the watcher makes to the injected probe over several ticks with
+    /// nothing arriving; it must be exactly one (the up-front check), not one
+    /// per tick.
+    #[test]
+    fn tui_watcher_does_not_reprobe_every_tick() {
+        let state: ipc::Shared = Default::default(); // gpu_available: true, nothing pending
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let switch = tokio_util::sync::CancellationToken::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let counted_probe = {
+            let probe_count = probe_count.clone();
+            move || {
+                probe_count.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        };
+        let handle = spawn_tui_gpu_watcher(state, tx, false, counted_probe, switch.clone(), stop.clone());
+        // Several ticks' worth of waiting, with nothing ever arriving.
+        std::thread::sleep(A_FEW_TICKS * 3);
+        stop.store(true, Ordering::SeqCst);
+        handle.join().expect("watcher must not panic");
+
+        assert!(!switch.is_cancelled());
+        assert_eq!(probe_count.load(Ordering::SeqCst), 1, "must probe once up front, not once per tick");
     }
 }

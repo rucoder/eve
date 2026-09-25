@@ -227,13 +227,11 @@ async fn pump(
                 match frame {
                     Some(Ok(bytes)) => {
                         let msg = IpcMessage::from(bytes);
-                        // `apply` hands back anything it didn't need to store
-                        // (untouched, not cloned - large variants like TpmLogs
-                        // pass straight through) so it can still be forwarded
-                        // to `events`.
-                        if let Some(msg) = apply(&mut out.lock().unwrap(), msg) {
-                            send_event(events, msg);
-                        }
+                        // `apply` hands the message back (untouched, not
+                        // cloned - large variants like TpmLogs pass straight
+                        // through) so it can still be forwarded to `events`.
+                        let msg = apply(&mut out.lock().unwrap(), msg);
+                        send_event(events, msg);
                     }
                     Some(Err(e)) => {
                         log::warn!("pillar: read: {e}");
@@ -249,27 +247,30 @@ async fn pump(
     }
 }
 
-/// Applies one decoded message to `state`. Pulled out of the read loop in
-/// `pump` so the GPU handover can be unit-tested without a socket - see
-/// `gui_client_tests` below.
+/// Applies one decoded message to `state` and hands it back. Pulled out of
+/// the read loop in `pump` so the GPU handover can be unit-tested without a
+/// socket - see `gui_client_tests` below.
 ///
-/// Returns `msg` back when `state` didn't need to consume it (every variant
-/// but the four below), so the caller can still forward it to `events`
-/// without having to clone a message that can be arbitrarily large (e.g.
-/// `TpmLogs`) just to keep a copy neither side ends up using.
-pub fn apply(state: &mut PillarState, msg: IpcMessage) -> Option<IpcMessage> {
+/// Every variant is returned, including the four `state` also stores into -
+/// this is not a filter, it's what lets `pump` forward the same message to
+/// `events` without cloning it first: the four below are cheaply
+/// reconstructed from what was stored (or, for `GPURequest`, from a second
+/// clone of the small request itself), while everything else - including
+/// arbitrarily large variants like `TpmLogs` - passes straight through with
+/// no copy at all.
+pub fn apply(state: &mut PillarState, msg: IpcMessage) -> IpcMessage {
     match msg {
         IpcMessage::DeviceStatus(d) => {
             state.device = Some(d.clone());
-            Some(IpcMessage::DeviceStatus(d))
+            IpcMessage::DeviceStatus(d)
         }
         IpcMessage::NetworkStatus(n) => {
             state.network = Some(n.clone());
-            Some(IpcMessage::NetworkStatus(n))
+            IpcMessage::NetworkStatus(n)
         }
         IpcMessage::AppsList(a) => {
             state.apps = a.instances.clone();
-            Some(IpcMessage::AppsList(a))
+            IpcMessage::AppsList(a)
         }
         // Pillar asking the console to give up the GPU (release) or telling
         // it the GPU is available again (restore). Flip the flag the
@@ -280,9 +281,9 @@ pub fn apply(state: &mut PillarState, msg: IpcMessage) -> Option<IpcMessage> {
         IpcMessage::GPURequest(r) => {
             state.gpu_available = !r.release;
             state.pending_gpu_ack = Some(r.clone());
-            Some(IpcMessage::GPURequest(r))
+            IpcMessage::GPURequest(r)
         }
-        other => Some(other),
+        other => other,
     }
 }
 
@@ -496,5 +497,27 @@ mod gui_client_tests {
         apply(&mut st, IpcMessage::AppsList(monitorapi::AppsList { instances: Vec::new() }));
         assert!(!st.gpu_available);
         assert!(st.pending_gpu_ack.is_none());
+    }
+
+    /// `apply` must hand back a faithful copy of a message it also stores
+    /// into, not just claim to - `pump` relies on this to still forward the
+    /// message to `events` (the TUI's own connectivity/status handling)
+    /// after storing it.
+    #[test]
+    fn apply_hands_back_the_message_it_stored() {
+        let mut st = PillarState::default();
+        let req = monitorapi::GpuRequest { domain: "vm1".into(), release: true, request_id: 5 };
+        match apply(&mut st, IpcMessage::GPURequest(req.clone())) {
+            IpcMessage::GPURequest(r) => assert_eq!(r, req),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// And a message `apply` never needed to look at passes straight
+    /// through unchanged.
+    #[test]
+    fn apply_passes_through_a_message_it_does_not_store() {
+        let mut st = PillarState::default();
+        assert!(matches!(apply(&mut st, IpcMessage::Ready), IpcMessage::Ready));
     }
 }
