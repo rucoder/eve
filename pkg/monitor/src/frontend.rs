@@ -30,8 +30,9 @@ pub fn choose(probe: &dyn Fn() -> Option<String>) -> Frontend {
     }
 }
 
-/// Tracks which console should be showing. `capable` is fixed at startup: a
-/// device with no GPU never switches, whatever pillar reports.
+/// Tracks which console should be showing. `capable` starts fixed at the
+/// boot-time probe - see `refresh_capable` for why it does not always stay
+/// that way.
 pub struct Console {
     capable: bool,
     gpu_available: bool,
@@ -48,6 +49,24 @@ impl Console {
     /// Pillar has taken the GPU for an app, or given it back.
     pub fn set_gpu_available(&mut self, yes: bool) {
         self.gpu_available = yes;
+    }
+
+    /// Whether this device can show the GUI at all right now.
+    pub fn capable(&self) -> bool {
+        self.capable
+    }
+
+    /// Re-probes for a usable DRM device, replacing whatever `capable`
+    /// currently holds.
+    ///
+    /// A device that boots with the iGPU already bound to vfio-pci (e.g.
+    /// `debug.enable.vga=false` from the start) finds no `/dev/dri/card*` at
+    /// `Console::new` time and would otherwise stay `capable: false` for the
+    /// life of the process - even after pillar restores the GPU and a real
+    /// card exists. Call this on that restore so the boot-time answer isn't
+    /// treated as permanent.
+    pub fn refresh_capable(&mut self, probe: &dyn Fn() -> Option<String>) {
+        self.capable = choose(probe) == Frontend::Gui;
     }
 
     pub fn want(&self) -> Frontend {
@@ -103,6 +122,33 @@ mod tests {
     fn a_tui_only_device_ignores_gpu_messages() {
         let mut c = Console::new(Frontend::Tui);
         c.set_gpu_available(true);
+        assert_eq!(c.want(), Frontend::Tui);
+    }
+
+    /// A device that boots with the iGPU already in vfio-pci (e.g.
+    /// debug.enable.vga=false) starts `capable: false`. If pillar later
+    /// restores the GPU and a real card now exists, refreshing must be able
+    /// to discover it - otherwise the GUI would never come back short of a
+    /// process restart, exactly the bug this method exists to avoid.
+    #[test]
+    fn a_restore_can_discover_a_gpu_that_only_appears_after_boot() {
+        let mut c = Console::new(Frontend::Tui);
+        assert!(!c.capable());
+        assert_eq!(c.want(), Frontend::Tui);
+
+        c.refresh_capable(&|| Some("/dev/dri/card0".into()));
+        assert!(c.capable());
+        c.set_gpu_available(true);
+        assert_eq!(c.want(), Frontend::Gui);
+    }
+
+    /// Refreshing is not a one-way latch to capable - a probe that still
+    /// finds nothing must leave the device on the TUI.
+    #[test]
+    fn refresh_capable_can_also_confirm_there_is_still_no_gpu() {
+        let mut c = Console::new(Frontend::Tui);
+        c.refresh_capable(&|| None);
+        assert!(!c.capable());
         assert_eq!(c.want(), Frontend::Tui);
     }
 }

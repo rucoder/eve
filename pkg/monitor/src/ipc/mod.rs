@@ -227,12 +227,13 @@ async fn pump(
                 match frame {
                     Some(Ok(bytes)) => {
                         let msg = IpcMessage::from(bytes);
-                        // `apply` takes `msg` by value (so it is callable with a
-                        // bare owned message in tests); `events` still needs the
-                        // original to forward, so it gets a clone rather than
-                        // the message itself.
-                        apply(&mut out.lock().unwrap(), msg.clone());
-                        send_event(events, msg);
+                        // `apply` hands back anything it didn't need to store
+                        // (untouched, not cloned - large variants like TpmLogs
+                        // pass straight through) so it can still be forwarded
+                        // to `events`.
+                        if let Some(msg) = apply(&mut out.lock().unwrap(), msg) {
+                            send_event(events, msg);
+                        }
                     }
                     Some(Err(e)) => {
                         log::warn!("pillar: read: {e}");
@@ -251,11 +252,25 @@ async fn pump(
 /// Applies one decoded message to `state`. Pulled out of the read loop in
 /// `pump` so the GPU handover can be unit-tested without a socket - see
 /// `gui_client_tests` below.
-pub fn apply(state: &mut PillarState, msg: IpcMessage) {
+///
+/// Returns `msg` back when `state` didn't need to consume it (every variant
+/// but the four below), so the caller can still forward it to `events`
+/// without having to clone a message that can be arbitrarily large (e.g.
+/// `TpmLogs`) just to keep a copy neither side ends up using.
+pub fn apply(state: &mut PillarState, msg: IpcMessage) -> Option<IpcMessage> {
     match msg {
-        IpcMessage::DeviceStatus(d) => state.device = Some(d),
-        IpcMessage::NetworkStatus(n) => state.network = Some(n),
-        IpcMessage::AppsList(a) => state.apps = a.instances,
+        IpcMessage::DeviceStatus(d) => {
+            state.device = Some(d.clone());
+            Some(IpcMessage::DeviceStatus(d))
+        }
+        IpcMessage::NetworkStatus(n) => {
+            state.network = Some(n.clone());
+            Some(IpcMessage::NetworkStatus(n))
+        }
+        IpcMessage::AppsList(a) => {
+            state.apps = a.instances.clone();
+            Some(IpcMessage::AppsList(a))
+        }
         // Pillar asking the console to give up the GPU (release) or telling
         // it the GPU is available again (restore). Flip the flag the
         // frontend loop reads immediately, and remember the request id so
@@ -264,9 +279,10 @@ pub fn apply(state: &mut PillarState, msg: IpcMessage) {
         // on (see PillarState::pending_gpu_ack).
         IpcMessage::GPURequest(r) => {
             state.gpu_available = !r.release;
-            state.pending_gpu_ack = Some(r);
+            state.pending_gpu_ack = Some(r.clone());
+            Some(IpcMessage::GPURequest(r))
         }
-        _ => {}
+        other => Some(other),
     }
 }
 

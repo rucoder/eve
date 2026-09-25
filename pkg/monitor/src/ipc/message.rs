@@ -35,7 +35,7 @@ impl AtomicIdGenerator {
 static REQ_ID: AtomicIdGenerator = AtomicIdGenerator(AtomicU64::new(1));
 static MSG_INDEX: AtomicIdGenerator = AtomicIdGenerator(AtomicU64::new(1));
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "RequestType", content = "RequestData")]
 pub enum Request {
     SetInterfaceConfig(SetInterfaceConfig),
@@ -52,7 +52,7 @@ pub enum Request {
 // This is the IPC wire type; variant shapes mirror EVE messages and must not
 // be boxed, so accept the size difference.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "message")]
 pub enum IpcMessage {
     Connecting,
