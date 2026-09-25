@@ -11,6 +11,7 @@ import (
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/types/monitorapi"
+	uuid "github.com/satori/go.uuid"
 )
 
 func TestDeviceNetworkStatusToContract_NestsVLANs(t *testing.T) {
@@ -140,5 +141,80 @@ func TestQMPSocketReportedForVirtualGPUAppWithSocket(t *testing.T) {
 
 	if got := qmpSocketAt(filepath.Dir(dir), domainName, true); got != sock {
 		t.Errorf("expected %q, got %q", sock, got)
+	}
+}
+
+// appsListToContract itself - not just qmpSocketFor - must key the GPU-mode
+// lookup by UUID, never by DomainName (Task 7's settled decision:
+// DomainName is "" until an app activates, and it changes across a
+// controller version bump). A regression to
+// types.GPUModeFor(a.DomainName) would still pass every qmpSocketFor test
+// in this file, since those pass hasVirtualGPU in by hand; only a test that
+// drives the lookup through appsListToContract itself exercises the key.
+func appInstanceWithDomain(uuidStr, domainName string) types.AppInstanceStatus {
+	appUUID, err := uuid.FromString(uuidStr)
+	if err != nil {
+		panic(err)
+	}
+	var a types.AppInstanceStatus
+	a.UUIDandVersion.UUID = appUUID
+	a.DomainName = domainName
+	return a
+}
+
+func TestAppsListToContractReportsSocketForVirtualGPUApp(t *testing.T) {
+	const appUUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	domainName := appUUID + ".1.1"
+
+	gpuModeDir := t.TempDir()
+	modeFile := filepath.Join(gpuModeDir, appUUID+".json")
+	if err := os.WriteFile(modeFile, []byte(`{"mode":"virtual"}`), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	qmpDir := t.TempDir()
+	sockDir := filepath.Join(qmpDir, domainName)
+	if err := os.MkdirAll(sockDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sock := filepath.Join(sockDir, "qmp")
+	if err := os.WriteFile(sock, nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	apps := []types.AppInstanceStatus{appInstanceWithDomain(appUUID, domainName)}
+	got := appsListToContractAt(apps, gpuModeDir, qmpDir)
+	if len(got.Instances) != 1 || got.Instances[0].QMPSocket != sock {
+		t.Fatalf("expected socket %q reported, got %+v", sock, got.Instances)
+	}
+}
+
+// This is the assertion that pins the keying: the mode file is named after
+// DomainName rather than UUID (the shape of the regression this test
+// guards against), so a correct UUID-keyed lookup finds nothing and
+// defaults to passthrough - no socket - even though one exists on disk.
+func TestAppsListToContractKeysGPUModeByUUIDNotDomainName(t *testing.T) {
+	const appUUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	domainName := appUUID + ".1.1"
+
+	gpuModeDir := t.TempDir()
+	modeFile := filepath.Join(gpuModeDir, domainName+".json")
+	if err := os.WriteFile(modeFile, []byte(`{"mode":"virtual"}`), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	qmpDir := t.TempDir()
+	sockDir := filepath.Join(qmpDir, domainName)
+	if err := os.MkdirAll(sockDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sockDir, "qmp"), nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	apps := []types.AppInstanceStatus{appInstanceWithDomain(appUUID, domainName)}
+	got := appsListToContractAt(apps, gpuModeDir, qmpDir)
+	if len(got.Instances) != 1 || got.Instances[0].QMPSocket != "" {
+		t.Fatalf("a mode file keyed by DomainName must not be found by a UUID-keyed lookup, got %+v", got.Instances)
 	}
 }

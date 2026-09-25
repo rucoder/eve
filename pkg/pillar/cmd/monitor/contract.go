@@ -82,16 +82,37 @@ func qmpSocketAt(dir, domainName string, hasVirtualGPU bool) string {
 	return sock
 }
 
+// appsListToContract is appsListToContractAt against the production GPU-mode
+// and kvm-state directories.
 func appsListToContract(apps []types.AppInstanceStatus) monitorapi.AppsList {
+	return appsListToContractAt(apps, "", qmpKvmStateDir)
+}
+
+// appsListToContractAt is appsListToContract with the GPU-mode directory
+// (mirrors KvmContext.gpuModeDir in hypervisor/kvm.go and
+// domainContext.gpuModeDir in cmd/domainmgr/gpuconsole.go: empty means the
+// production types.GPUModeFor) and kvm state directory overridable for
+// tests.
+func appsListToContractAt(apps []types.AppInstanceStatus, gpuModeDir, qmpDir string) monitorapi.AppsList {
 	out := monitorapi.AppsList{Instances: make([]monitorapi.AppInstance, 0, len(apps))}
 	for _, a := range apps {
+		key := a.UUIDandVersion.UUID.String()
+		mode := types.GPUModeFor(key)
+		if gpuModeDir != "" {
+			mode = types.GPUModeRead(gpuModeDir, key)
+		}
+		// hasVirtualGPU is the operator's persisted mode-file choice, keyed
+		// by UUID - never DomainName, which is "" until the app activates -
+		// not whether QEMU is actually running a virtio-vga-gl device right
+		// now.
+		hasVirtualGPU := mode == types.GPUModeVirtual
 		out.Instances = append(out.Instances, monitorapi.AppInstance{
 			UUID:      a.UUIDandVersion.UUID,
 			Name:      a.DisplayName,
 			Version:   a.UUIDandVersion.Version,
 			State:     swStateToContract(a.State),
 			Error:     a.ErrorAndTimeWithSource.Error,
-			QMPSocket: qmpSocketFor(a.DomainName, types.GPUModeFor(a.UUIDandVersion.UUID.String()) == types.GPUModeVirtual),
+			QMPSocket: qmpSocketAt(qmpDir, a.DomainName, hasVirtualGPU),
 		})
 	}
 	return out
