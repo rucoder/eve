@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -3519,28 +3520,45 @@ func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
 func TestVirtualGPUAgreesWithTheDisplay(t *testing.T) {
 	t.Parallel()
 
+	gpuAdapters := []types.IoAdapter{{Type: types.IoHDMI, Name: "hdmi0"}}
+
 	cases := []struct {
 		name        string
 		ctxGPU      bool
-		ociDir      string
-		enableVnc   bool
+		adapters    []types.IoAdapter
+		gpuModeBody string // written to <tempdir>/<domain>.json first; "" writes nothing
 		wantGPU     bool
 		wantDisplay string
 	}{
-		{"vm on a device with a render node", true, "", false, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
-		{"vm on a device without one", false, "", false, false, "none"},
-		// A container's shim VM has no framebuffer worth showing, and giving
-		// every one of them a virgl context would have a device with twenty
-		// container apps holding twenty EGL contexts against one iGPU.
-		{"container shim vm", true, "/persist/oci/app", false, false, "none"},
-		{"container shim vm with vnc asked for", true, "/persist/oci/app", true, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+		{"vm on a device with a render node but no GPU assigned", true, nil, "", false, "none"},
+		{"vm on a device without one", false, nil, "", false, "none"},
+		// A container's shim VM never holds the iGPU adapter either, so it
+		// falls into the no-GPU-assigned case above: giving every one of
+		// twenty container apps a virgl context against one iGPU never
+		// happens because none of them are ever assigned it.
+		{"container shim vm", true, nil, "", false, "none"},
+		// The one app that was assigned the iGPU still defaults to real
+		// passthrough - no QEMU-side display - until an operator opts it
+		// into a virtual GPU.
+		{"GPU assigned, operator has not opted into a virtual GPU", true, gpuAdapters, "", false, "none"},
+		// The operator flipped this one domain: it gets the GL-backed
+		// display instead of real passthrough.
+		{"GPU assigned, operator opted into a virtual GPU", true, gpuAdapters, `{"mode":"virtual"}`, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
 	}
 
-	for _, c := range cases {
+	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ctx := KvmContext{virtualGPU: c.ctxGPU}
-			config := types.DomainConfig{VmConfig: types.VmConfig{EnableVnc: c.enableVnc}}
-			status := types.DomainStatus{OCIConfigDir: c.ociDir}
+			dir := t.TempDir()
+			domain := fmt.Sprintf("vm%d.1.1", i)
+			if c.gpuModeBody != "" {
+				if err := os.WriteFile(filepath.Join(dir, domain+".json"), []byte(c.gpuModeBody), 0644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+
+			ctx := KvmContext{virtualGPU: c.ctxGPU, gpuModeDir: dir}
+			config := types.DomainConfig{IoAdapterList: c.adapters}
+			status := types.DomainStatus{DomainName: domain}
 
 			gotGPU := ctx.virtualGPUFor(config, status)
 			if gotGPU != c.wantGPU {

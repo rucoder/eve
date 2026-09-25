@@ -753,6 +753,11 @@ type KvmContext struct {
 	// gone. Deciding it twice - once here, once per domain - let the two
 	// disagree whenever the render node appeared or vanished in between.
 	virtualGPU bool
+	// gpuModeDir overrides where the per-domain passthrough/virtual choice
+	// is read from; empty means the production default (types.GPUModeFor).
+	// Tests set this to a temp dir so they exercise the real JSON read
+	// without touching /persist/gpu.
+	gpuModeDir string
 }
 
 func newKvm() Hypervisor {
@@ -2298,17 +2303,39 @@ func usbBusPort(USBAddr string) (string, string) {
 	return "", ""
 }
 
-// virtualGPUFor reports whether this domain gets a GL-backed virtual GPU.
+// hasGPUAdapter reports whether config assigns this domain the iGPU -
+// the same types.IoHDMI marker domainmgr uses to identify the boot VGA.
+func hasGPUAdapter(adapters []types.IoAdapter) bool {
+	for _, a := range adapters {
+		if a.Type == types.IoHDMI {
+			return true
+		}
+	}
+	return false
+}
+
+// virtualGPUFor reports whether this domain gets a GL-backed virtual GPU
+// instead of a real passthrough of the host's iGPU.
 //
-// A shim VM running an OCI container has no framebuffer anyone wants to look
-// at, and giving each one a virgl context would have a device with twenty
-// container apps holding twenty EGL contexts against one iGPU. It still gets a
-// video device when VNC is explicitly enabled for it.
+// Only a domain that was actually assigned the iGPU faces that choice at
+// all - every other app (including a shim VM running an OCI container,
+// which never holds it) keeps "-display none" as before, so it never holds
+// a virgl context. For the one app that was assigned the iGPU, the choice
+// is per-app and operator controlled (types.GPUModeFor), defaulting to
+// passthrough so existing behaviour - real hardware passthrough, no
+// QEMU-side display - is unchanged until an operator opts that domain into
+// a virtual GPU.
 func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, status types.DomainStatus) bool {
-	if !ctx.virtualGPU {
+	if !ctx.virtualGPU || !hasGPUAdapter(config.IoAdapterList) {
 		return false
 	}
-	return status.OCIConfigDir == "" || config.EnableVnc
+	var mode string
+	if ctx.gpuModeDir != "" {
+		mode = types.GPUModeAt(ctx.gpuModeDir, status.DomainName)
+	} else {
+		mode = types.GPUModeFor(status.DomainName)
+	}
+	return mode == types.GPUModeVirtual
 }
 
 // renderNode is the DRM render node QEMU uses to back a guest's virtual GPU
