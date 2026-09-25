@@ -14,11 +14,11 @@ import (
 // from starting.
 func (ctx *monitor) gpuStatusFor(cfg types.GPUConsoleConfig, clientAttached bool) types.GPUConsoleStatus {
 	if !clientAttached {
-		return types.GPUConsoleStatus{Domain: cfg.Domain, Released: true}
+		return types.GPUConsoleStatus{Domain: cfg.Domain, Released: true, RequestID: cfg.RequestID}
 	}
 	// A console is attached; it has to answer for itself. The ack arrives
 	// later, over IPC, and publishes the real status then.
-	return types.GPUConsoleStatus{Domain: cfg.Domain, Released: false}
+	return types.GPUConsoleStatus{Domain: cfg.Domain, Released: false, RequestID: cfg.RequestID}
 }
 
 // handleGPUConsoleConfig forwards the request to the console and publishes the
@@ -27,6 +27,9 @@ func (ctx *monitor) gpuStatusFor(cfg types.GPUConsoleConfig, clientAttached bool
 func (ctx *monitor) handleGPUConsoleConfig(cfg types.GPUConsoleConfig) {
 	attached := ctx.IPCServer.hasClient()
 	if attached {
+		// GPUAck (console -> pillar) only echoes Domain, not RequestID, so
+		// remember it here for handleGPUAck to stamp onto the real status.
+		ctx.pendingGPURequestID.Store(cfg.RequestID)
 		req := monitorapi.NewGPURequest(cfg.Domain, cfg.Release)
 		if err := ctx.IPCServer.sendIpcMessage(monitorapi.GPURequestTag, req); err != nil {
 			log.Errorf("Failed to forward GPU request to console: %v", err)
@@ -38,8 +41,9 @@ func (ctx *monitor) handleGPUConsoleConfig(cfg types.GPUConsoleConfig) {
 // handleGPUAck publishes what the console reported.
 func (ctx *monitor) handleGPUAck(ack monitorapi.GPUAck) {
 	ctx.publishGPUConsoleStatus(types.GPUConsoleStatus{
-		Domain:   ack.Domain,
-		Released: ack.Released,
+		Domain:    ack.Domain,
+		Released:  ack.Released,
+		RequestID: ctx.pendingGPURequestID.Load(),
 	})
 }
 

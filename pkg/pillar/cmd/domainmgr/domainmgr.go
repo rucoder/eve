@@ -1861,11 +1861,11 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 	// while the console holds DRM master, so ask it to let go first. On
 	// timeout releaseGPUForDomain proceeds anyway - the app wins - and a
 	// failed reserve below hands the GPU straight back.
-	release := func() bool { return false }
+	release := func() {}
 	restore := func() {}
 	if hasBootVga {
-		release = func() bool { return releaseGPUForDomain(ctx, status.DomainName, gpuReleaseTimeout) }
-		restore = func() { restoreGPUToConsole(ctx) }
+		release = func() { releaseGPUForDomain(ctx, status.DomainName, gpuReleaseTimeout) }
+		restore = func() { restoreGPUToConsole(ctx, status.DomainName) }
 	}
 
 	err := assignWithGPU(release, func() error {
@@ -2515,6 +2515,10 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 
 	log.Functionf("releaseAdapters(%s)", myUUID)
 	ignoreErrors := (status == nil)
+	domain := ""
+	if status != nil {
+		domain = status.DomainName
+	}
 	var assignments []string
 	bootVgaPciLong := ""
 	for _, adapter := range ioAdapterList {
@@ -2584,7 +2588,7 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 		// Only tell the console it can reclaim the GPU once it is actually
 		// back with the host driver, not merely marked so.
 		if err == nil && long == bootVgaPciLong {
-			restoreGPUToConsole(ctx)
+			restoreGPUToConsole(ctx, domain)
 		}
 	}
 	ctx.publishAssignableAdapters()
@@ -4214,6 +4218,15 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 		} else if ib.PciLong != "" && ib.UsbAddr == "" {
 			log.Noticef("Assigning %s (%s) to pciback",
 				ib.Phylabel, ib.PciLong)
+			// This is the single choke point for every path that can bind
+			// the boot VGA to vfio-pci with no app involved yet (the
+			// vgaAccess knob via updateVgaAccess, and a fresh device
+			// inventory via handlePhysicalIOAdapterListImpl) - ask the
+			// console to let go first, regardless of which caller got us
+			// here. isBootVGA bounds it to at most one wait per pass.
+			if isBootVGA(ib) {
+				releaseGPUForDomain(ctx, "", gpuReleaseTimeout)
+			}
 			err := hyper.PCIReserve(ib.PciLong)
 			if err != nil {
 				return changed, err
@@ -4421,7 +4434,7 @@ func updateVgaAccess(ctx *domainContext) {
 			}
 			// The framebuffer console is back in a usable state; let the
 			// GUI console reclaim the GPU too. No need to wait for it here.
-			restoreGPUToConsole(ctx)
+			restoreGPUToConsole(ctx, "")
 			vgaSwitch = false
 		}
 
