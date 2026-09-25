@@ -203,6 +203,16 @@ fn log_system_info() {
 /// gui::run.
 const GPU_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long `spawn_tui_gpu_watcher` keeps retrying its DRM probe after a
+/// restore whose first probe found nothing. i915 rebind is racy enough that
+/// a connector can still read `Unknown` rather than `Connected` (which
+/// `pick_card` requires) right at the moment pillar says the GPU is
+/// available again, or the driver can hit `-EPROBE_DEFER` - a single probe
+/// on the restore tick can lose that race and leave the console stuck on
+/// the TUI, silently and permanently, until some other restore happens to
+/// arrive later (which may be never).
+const RESTORE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Sends the console's answer to a GPURequest, echoing its `request_id`
 /// unchanged - pillar matches acks by that id and drops any that does not
 /// match the request it is waiting on (see PillarState::pending_gpu_ack and
@@ -287,15 +297,18 @@ fn spawn_gui_gpu_watcher(
 /// `capable` can be a stale "no" from the boot-time probe, though - a device
 /// that booted with the iGPU already in vfio-pci (e.g.
 /// `debug.enable.vga=false`) has no card to find at startup - so this
-/// re-probes with `probe` once up front, and again on every restore
-/// afterwards (a restore is the one moment that stale answer needs
-/// rechecking; a release never changes whether a card exists). It does
-/// *not* probe on every tick: `PillarState::gpu_available` defaults to
-/// `true` with no pillar involvement at all (see `PillarState::default`),
-/// so an always-on GPU-less device would otherwise drive a DRM scan and a
-/// `frontend::choose` log line 20 times a second, forever - `choose` is for
-/// logging the boot-time decision once, not for a polling predicate, hence
-/// `probe()` is called directly here instead.
+/// re-probes with `probe` once up front, and again for up to
+/// `RESTORE_RETRY_WINDOW` after every restore (a restore is the one moment
+/// that stale answer needs rechecking; a release never changes whether a
+/// card exists). The retry window covers a first restore-tick probe losing
+/// the race with a still-rebinding driver - see `RESTORE_RETRY_WINDOW`'s own
+/// doc for why one probe isn't enough. It does *not* probe on every tick
+/// otherwise: `PillarState::gpu_available` defaults to `true` with no pillar
+/// involvement at all (see `PillarState::default`), so an always-on
+/// GPU-less device would otherwise drive a DRM scan and a `frontend::choose`
+/// log line 20 times a second, forever - `choose` is for logging the
+/// boot-time decision once, not for a polling predicate, hence `probe()` is
+/// called directly here instead.
 ///
 /// Returns the `capable` this watcher ends up believing, so the caller can
 /// hand it to `Console` directly (`Console::adopt_capable`) instead of
@@ -317,6 +330,11 @@ fn spawn_tui_gpu_watcher(
         if !capable {
             capable = probe().is_some();
         }
+        // Set on a restore that didn't immediately find a card; cleared once
+        // the window closes. A GPU-less device never receives a restore, so
+        // this never gets set and the loop below never probes past the
+        // up-front check above.
+        let mut retry_until: Option<std::time::Instant> = None;
         while !stop.load(Ordering::SeqCst) {
             let (available, pending) = {
                 let mut st = state.lock().unwrap();
@@ -324,9 +342,18 @@ fn spawn_tui_gpu_watcher(
             };
             if let Some(req) = pending {
                 if !capable && !req.release {
-                    capable = probe().is_some();
+                    retry_until = Some(std::time::Instant::now() + RESTORE_RETRY_WINDOW);
                 }
                 ack_gpu_request(&outbox, req);
+            }
+            if !capable {
+                if let Some(deadline) = retry_until {
+                    if std::time::Instant::now() < deadline {
+                        capable = probe().is_some();
+                    } else {
+                        retry_until = None;
+                    }
+                }
             }
             if available && capable {
                 switch.cancel();
@@ -717,5 +744,46 @@ mod gpu_handover_tests {
 
         assert!(!switch.is_cancelled());
         assert_eq!(probe_count.load(Ordering::SeqCst), 1, "must probe once up front, not once per tick");
+    }
+
+    /// The regression this retry window exists for: i915 rebind is racy, so
+    /// the first probe right on the restore tick can still find nothing even
+    /// though the card is about to become usable moments later. A
+    /// single-shot probe would give up here and leave the console on the TUI
+    /// permanently; this must keep retrying within RESTORE_RETRY_WINDOW and
+    /// still switch once the card shows up.
+    #[test]
+    fn tui_watcher_retries_the_restore_probe_within_the_window() {
+        let state: ipc::Shared = Default::default();
+        {
+            state.lock().unwrap().pending_gpu_ack = Some(a_request("", false, 20));
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let switch = tokio_util::sync::CancellationToken::new();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The first couple of probes see the not-yet-rebound driver; a later
+        // one, still well inside the retry window, finds the card.
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let flaky_probe = {
+            let calls = calls.clone();
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 { None } else { Some("/dev/dri/card0".into()) }
+            }
+        };
+
+        let handle = spawn_tui_gpu_watcher(state, tx, false, flaky_probe, switch.clone(), stop.clone());
+        // A handful of ticks - enough for the retries to land, nowhere near
+        // RESTORE_RETRY_WINDOW (2s).
+        std::thread::sleep(A_FEW_TICKS * 2);
+        stop.store(true, Ordering::SeqCst);
+        let found_gpu = handle.join().expect("watcher must not panic");
+
+        assert!(
+            switch.is_cancelled(),
+            "must keep retrying within the window rather than giving up after one probe"
+        );
+        assert!(found_gpu);
     }
 }

@@ -161,8 +161,10 @@ mod tests {
         assert_eq!(c.want(), Frontend::Gui);
     }
 
-    /// Upgrading is not a one-way latch to capable - a probe that still
-    /// finds nothing must leave the device on the TUI.
+    /// A probe that still finds nothing must leave a never-capable device on
+    /// the TUI, not upgrade it on the strength of merely having been asked -
+    /// `try_upgrade_capable` only ever moves false to true, and only when
+    /// the probe actually says so.
     #[test]
     fn try_upgrade_capable_can_also_confirm_there_is_still_no_gpu() {
         let mut c = Console::new(Frontend::Tui);
