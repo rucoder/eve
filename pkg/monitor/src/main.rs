@@ -6,6 +6,7 @@ mod application;
 mod diff;
 mod efi;
 mod events;
+mod frontend;
 mod gui;
 mod ipc;
 mod model;
@@ -27,6 +28,16 @@ use terminal::TerminalWrapper;
 
 const EVE_MONITOR_BASE_DIR_EVE: &str = "/persist/monitor/";
 const EVE_MONITOR_BASE_DIR_PC: &str = "./persist/monitor/";
+
+/// Where pillar's monitor agent listens. `XDG_RUNTIME_DIR` set means a
+/// desktop dev box, not the device; mirrors `get_base_dir` below.
+fn get_ipc_socket_path() -> String {
+    if let Ok(xdg_runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        format!("{xdg_runtime_dir}/monitor.sock")
+    } else {
+        ipc::MONITOR_SOCKET.to_string()
+    }
+}
 
 fn get_base_dir() -> PathBuf {
     // we use XDG_RUNTIME_DIR to detect the fact that we are running on desktop linux
@@ -191,14 +202,31 @@ async fn main() -> Result<()> {
     initialize_panic_handler()?;
     log_system_info();
 
-    let mut app = Application::new(config)?;
-    let result = app.run().await;
-    if let Err(e) = &result {
-        log::error!("Application error: {}", e);
+    // Pillar's monitor agent accepts exactly one client connection per
+    // process (see crate::ipc's module doc). This is the only client for the
+    // whole process: it is created once here, before either frontend starts,
+    // and `client` is kept alive for the rest of main() so its `outbox`
+    // sender never closes early and triggers a reconnect.
+    let client = ipc::spawn(&get_ipc_socket_path());
+    let pillar = client.state.clone();
+
+    match frontend::choose(&frontend::probe_drm) {
+        frontend::Frontend::Gui => {
+            if let Err(e) = gui::run(pillar) {
+                log::error!("Gui error: {e}");
+            }
+        }
+        frontend::Frontend::Tui => {
+            let mut app = Application::new(config, client.events, client.outbox)?;
+            let result = app.run().await;
+            if let Err(e) = &result {
+                log::error!("Application error: {}", e);
+            }
+            // FIXME: this is a workaround for malfunctioning terminal event stream
+            // Terminal must be dropped and restored automatically but one of the threads doesn't exit
+            // and await? on a main function never finishes. Drops are executed later.
+            TerminalWrapper::close_terminal()?;
+        }
     }
-    // FIXME: this is a workaround for malfunctioning terminal event stream
-    // Terminal must be dropped and restored automatically but one of the threads doesn't exit
-    // and await? on a main function never finishes. Drops are executed later.
-    TerminalWrapper::close_terminal()?;
     std::process::exit(EXIT_SUCCESS);
 }
