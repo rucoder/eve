@@ -270,6 +270,22 @@ pub struct EfiVariable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuAck {
+    #[serde(rename = "domain")]
+    pub domain: String,
+    #[serde(rename = "released")]
+    pub released: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuRequest {
+    #[serde(rename = "domain")]
+    pub domain: String,
+    #[serde(rename = "release")]
+    pub release: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInterface {
     #[serde(rename = "name")]
     pub name: String,

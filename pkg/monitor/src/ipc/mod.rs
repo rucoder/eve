@@ -322,4 +322,27 @@ mod gui_client_tests {
             other => panic!("wrong variant: {other:?}"),
         }
     }
+
+    /// The release request pillar sends before it binds the GPU to vfio.
+    #[test]
+    fn decodes_a_gpu_release_request() {
+        let wire = r#"{"type":"GPURequest","message":{"domain":"vm1","release":true}}"#;
+        match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
+            IpcMessage::GPURequest(r) => {
+                assert_eq!(r.domain, "vm1");
+                assert!(r.release);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// And the message that gives it back.
+    #[test]
+    fn decodes_a_gpu_restore_request() {
+        let wire = r#"{"type":"GPURequest","message":{"domain":"","release":false}}"#;
+        match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
+            IpcMessage::GPURequest(r) => assert!(!r.release),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }

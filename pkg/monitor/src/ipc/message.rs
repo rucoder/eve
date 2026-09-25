@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use super::monitorapi::AppsList;
 use super::monitorapi::DeviceStatus;
+use super::monitorapi::GpuAck;
+use super::monitorapi::GpuRequest;
 use super::monitorapi::SetInterfaceConfig;
 use super::monitorapi::RevertManualConfig;
 use super::monitorapi::TpmLogs;
@@ -60,6 +62,12 @@ pub enum IpcMessage {
     AppsList(AppsList),
     TUIConfig(TuiConfig),
     TpmLogs(TpmLogs),
+    /// The release request pillar sends before it binds the GPU to vfio, and
+    /// the restore request once the app releases it. See GPUAck below.
+    GPURequest(GpuRequest),
+    /// The console's answer to a GPURequest, sent once it has actually let
+    /// go of (or reclaimed) DRM master.
+    GPUAck(GpuAck),
     Response {
         #[serde(flatten)]
         result: core::result::Result<String, String>,
