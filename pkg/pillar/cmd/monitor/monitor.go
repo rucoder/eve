@@ -37,6 +37,7 @@ type monitor struct {
 
 	subscriptions       map[string]pubsub.Subscription
 	pubDevicePortConfig pubsub.Publication
+	pubGPUConsoleStatus pubsub.Publication
 	clientConnected     chan bool
 	serverNameAndPort   string
 	// subsActivated guards Activate(): it starts a watcher goroutine per

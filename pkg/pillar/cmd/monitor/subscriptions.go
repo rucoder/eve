@@ -128,6 +128,22 @@ func handleOnboardingStatusUpdate(statusArg interface{}, ctxArg interface{}) {
 	ctx.sendDeviceStatus()
 }
 
+func handleGPUConsoleConfigCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleGPUConsoleConfigUpdate(statusArg, ctxArg)
+}
+
+func handleGPUConsoleConfigModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleGPUConsoleConfigUpdate(statusArg, ctxArg)
+}
+
+func handleGPUConsoleConfigUpdate(statusArg interface{}, ctxArg interface{}) {
+	cfg := statusArg.(types.GPUConsoleConfig)
+	ctx := ctxArg.(*monitor)
+	ctx.handleGPUConsoleConfig(cfg)
+}
+
 func handleVaultStatusCreate(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	handleVaultStatusUpdate(statusArg, ctxArg)
@@ -223,6 +239,32 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 	}
 	if err = ctx.pubDevicePortConfig.ClearRestarted(); err != nil {
 		log.Error("Cannot clear restarted for DevicePortConfig publication")
+		return err
+	}
+
+	ctx.pubGPUConsoleStatus, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.GPUConsoleStatus{},
+		})
+	if err != nil {
+		log.Error("Cannot create GPUConsoleStatus publication")
+		return err
+	}
+
+	subGPUConsoleConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "domainmgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.GPUConsoleConfig{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleGPUConsoleConfigCreate,
+		ModifyHandler: handleGPUConsoleConfigModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for GPUConsoleConfig")
 		return err
 	}
 
@@ -377,6 +419,7 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 		return err
 	}
 
+	ctx.subscriptions["GPUConsoleConfig"] = subGPUConsoleConfig
 	ctx.subscriptions["VaultStatus"] = subVaultStatus
 	ctx.subscriptions["OnboardingStatus"] = subOnboardStatus
 	ctx.subscriptions["NetworkStatus"] = subDeviceNetworkStatus
