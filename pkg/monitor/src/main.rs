@@ -195,6 +195,113 @@ fn log_system_info() {
         });
 }
 
+/// How often the GPU-handover watchers below re-check `PillarState` while a
+/// frontend session is already running. This is a control-plane path bounded
+/// by domainmgr's 5s ack timeout (see `gpuReleaseTimeout` in
+/// pkg/pillar/cmd/domainmgr/gpuconsole.go), not the render hot path - it has
+/// nothing to do with the per-frame `switch`/`vt::running()` checks in
+/// gui::run.
+const GPU_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Sends the console's answer to a GPURequest, echoing its `request_id`
+/// unchanged - pillar matches acks by that id and drops any that does not
+/// match the request it is waiting on (see PillarState::pending_gpu_ack and
+/// handleGPUAck in pkg/pillar/cmd/monitor/gpu.go). Never called before the
+/// change `req` asked for has actually happened; see the two call sites.
+fn ack_gpu_request(
+    outbox: &tokio::sync::mpsc::UnboundedSender<ipc::message::IpcMessage>,
+    req: ipc::monitorapi::GpuRequest,
+) {
+    let id = req.request_id;
+    let ack = ipc::monitorapi::GpuAck {
+        domain: req.domain,
+        released: req.release,
+        request_id: req.request_id,
+    };
+    let msg = ipc::message::IpcMessage::Request { request: ipc::message::Request::GPUAck(ack), id };
+    if outbox.send(msg).is_err() {
+        log::warn!("gpu: outbox closed, dropping ack for request {id}");
+    }
+}
+
+/// Runs alongside a live GUI session. A restore that arrives while the GUI
+/// already holds the card has nothing to wait for and is answered here; a
+/// release cannot be answered yet - the GUI still holds DRM master - so this
+/// only asks `switch` to hand control back, and the caller answers it once
+/// `gui::run` has actually returned (see `shutdown` in src/gui/mod.rs, which
+/// drops DRM master before `run` does). Stops once `stop` is set, which the
+/// caller does right after `gui::run` returns for any reason.
+fn spawn_gui_gpu_watcher(
+    state: ipc::Shared,
+    outbox: tokio::sync::mpsc::UnboundedSender<ipc::message::IpcMessage>,
+    switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            // One lock, one decision: taking `pending_gpu_ack` for a release
+            // and then just returning would drop it on the floor instead of
+            // leaving it for the caller, and reading availability in a
+            // separate lock from the take could race a fresh release landing
+            // in between the two. apply() only ever pairs
+            // `gpu_available: true` with a restore, so anything taken in
+            // that branch is always safe to answer immediately - it has
+            // nothing to wait for.
+            let (should_switch, pending) = {
+                let mut st = state.lock().unwrap();
+                if st.gpu_available {
+                    (false, st.pending_gpu_ack.take())
+                } else {
+                    (true, None)
+                }
+            };
+            if let Some(req) = pending {
+                ack_gpu_request(&outbox, req);
+            }
+            if should_switch {
+                switch.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(GPU_POLL_INTERVAL);
+        }
+    })
+}
+
+/// Runs alongside a live TUI session. The TUI never holds DRM master, so any
+/// GPURequest - release or restore - can be answered as soon as it arrives.
+/// `capable` gates whether an available GPU ever asks `switch` to hand
+/// control to the GUI: a device with no GPU (see `Console::new`) must stay on
+/// the TUI regardless of what pillar reports, or this would fight
+/// `Console::want()` and restart the TUI session in a tight loop. Stops once
+/// `stop` is set, which the caller does right after the TUI session ends for
+/// any reason.
+fn spawn_tui_gpu_watcher(
+    state: ipc::Shared,
+    outbox: tokio::sync::mpsc::UnboundedSender<ipc::message::IpcMessage>,
+    capable: bool,
+    switch: tokio_util::sync::CancellationToken,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            let (available, pending) = {
+                let mut st = state.lock().unwrap();
+                (st.gpu_available, st.pending_gpu_ack.take())
+            };
+            if let Some(req) = pending {
+                ack_gpu_request(&outbox, req);
+            }
+            if capable && available {
+                switch.cancel();
+                return;
+            }
+            std::thread::sleep(GPU_POLL_INTERVAL);
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = AppConfig::load_or_create_app_config(&get_base_dir());
@@ -211,9 +318,11 @@ async fn main() -> Result<()> {
     // never called a second time.
     let mut client = ipc::spawn(&get_ipc_socket_path());
 
-    // `mut` once something drives `set_gpu_available` (pillar's GPU-request
-    // messages; not wired up yet - nothing in this process calls it today).
-    let console = frontend::Console::new(frontend::choose(&frontend::probe_drm));
+    // `capable` is fixed at startup, same as inside Console: a device with
+    // no usable DRM device never gets a GUI, whatever pillar reports.
+    let initial = frontend::choose(&frontend::probe_drm);
+    let capable = initial == frontend::Frontend::Gui;
+    let mut console = frontend::Console::new(initial);
 
     // Which frontend is showing changes only at the top of this loop, so
     // asking for the one already running is a no-op: the match below simply
@@ -226,9 +335,31 @@ async fn main() -> Result<()> {
                 // signal. `gui::run` always tears down DRM/GL/input state
                 // before returning, however it returns.
                 let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop_watcher = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let watcher = spawn_gui_gpu_watcher(
+                    client.state.clone(),
+                    client.outbox.clone(),
+                    switch.clone(),
+                    stop_watcher.clone(),
+                );
+
                 if let Err(e) = gui::run(client.state.clone(), switch.clone()) {
                     log::error!("Gui error: {e}");
                 }
+                stop_watcher.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = watcher.join();
+
+                // gui::run's shutdown() has already dropped DRM master by the
+                // time it returns, whatever the reason - so only now is it
+                // safe to tell pillar the GPU is released. Acking any sooner
+                // would let domainmgr bind vfio while this process still
+                // holds the card.
+                let pending = client.state.lock().unwrap().pending_gpu_ack.take();
+                if let Some(req) = pending {
+                    ack_gpu_request(&client.outbox, req);
+                }
+                console.set_gpu_available(client.state.lock().unwrap().gpu_available);
+
                 // `switch` set means main asked the GUI to hand back control
                 // (console.want() no longer wants it); anything else - the VT
                 // going away, an unrecoverable error - is a real shutdown.
@@ -238,6 +369,15 @@ async fn main() -> Result<()> {
             }
             frontend::Frontend::Tui => {
                 let switch = tokio_util::sync::CancellationToken::new();
+                let stop_watcher = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let watcher = spawn_tui_gpu_watcher(
+                    client.state.clone(),
+                    client.outbox.clone(),
+                    capable,
+                    switch.clone(),
+                    stop_watcher.clone(),
+                );
+
                 // Borrows client.events/outbox for this session only, so
                 // main.rs still owns them - unconsumed - the moment this
                 // returns and can lend them again next time the TUI runs.
@@ -250,6 +390,11 @@ async fn main() -> Result<()> {
                 // Terminal must be dropped and restored automatically but one of the threads doesn't exit
                 // and await? on a main function never finishes. Drops are executed later.
                 TerminalWrapper::close_terminal()?;
+
+                stop_watcher.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = watcher.join();
+                console.set_gpu_available(client.state.lock().unwrap().gpu_available);
+
                 if !switch.is_cancelled() {
                     break;
                 }

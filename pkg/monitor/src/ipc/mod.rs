@@ -26,7 +26,7 @@ mod monitorapi_tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use message::IpcMessage;
-use monitorapi::{AppInstance, DeviceStatus, NetworkStatus};
+use monitorapi::{AppInstance, DeviceStatus, GpuRequest, NetworkStatus};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 /// Capacity of the `events` channel (see `Client::events`). Deliberately
@@ -39,7 +39,6 @@ pub const MONITOR_SOCKET: &str = "/run/monitor.sock";
 /// The latest of each message pillar sends. The render loop reads it, the
 /// client thread writes it; neither waits for the other, because the console
 /// must draw whether or not pillar is up — it may well start first.
-#[derive(Default)]
 pub struct PillarState {
     pub device: Option<DeviceStatus>,
     pub network: Option<NetworkStatus>,
@@ -47,6 +46,33 @@ pub struct PillarState {
     /// False until a message has arrived, so the UI can say so rather than
     /// showing empty fields as though they were facts.
     pub connected: bool,
+    /// Whether the console frontend loop may put the GUI on screen right
+    /// now. main.rs's frontend loop reads this (via `Console::set_gpu_available`)
+    /// to decide GUI vs TUI, both at the top of a session and, through a
+    /// watcher, while one is already running.
+    pub gpu_available: bool,
+    /// The most recent GPURequest not yet answered with a GpuAck, so the id
+    /// pillar is waiting on travels with the flag it caused, rather than
+    /// main.rs having to generate one. A release and a restore both land
+    /// here; like pillar's own `pendingGPURequestID`, this is a single slot,
+    /// not a queue - a request superseded before it is acked is simply
+    /// never acked, which is fine, because pillar would have dropped that
+    /// ack as stale anyway.
+    pub pending_gpu_ack: Option<GpuRequest>,
+}
+
+impl Default for PillarState {
+    fn default() -> Self {
+        Self {
+            device: None,
+            network: None,
+            apps: Vec::new(),
+            connected: false,
+            // Nobody has taken the GPU until pillar says so.
+            gpu_available: true,
+            pending_gpu_ack: None,
+        }
+    }
 }
 
 pub type Shared = std::sync::Arc<std::sync::Mutex<PillarState>>;
@@ -201,7 +227,11 @@ async fn pump(
                 match frame {
                     Some(Ok(bytes)) => {
                         let msg = IpcMessage::from(bytes);
-                        update_state(out, &msg);
+                        // `apply` takes `msg` by value (so it is callable with a
+                        // bare owned message in tests); `events` still needs the
+                        // original to forward, so it gets a clone rather than
+                        // the message itself.
+                        apply(&mut out.lock().unwrap(), msg.clone());
                         send_event(events, msg);
                     }
                     Some(Err(e)) => {
@@ -218,12 +248,24 @@ async fn pump(
     }
 }
 
-fn update_state(out: &Shared, msg: &IpcMessage) {
-    let mut s = out.lock().unwrap();
+/// Applies one decoded message to `state`. Pulled out of the read loop in
+/// `pump` so the GPU handover can be unit-tested without a socket - see
+/// `gui_client_tests` below.
+pub fn apply(state: &mut PillarState, msg: IpcMessage) {
     match msg {
-        IpcMessage::DeviceStatus(d) => s.device = Some(d.clone()),
-        IpcMessage::NetworkStatus(n) => s.network = Some(n.clone()),
-        IpcMessage::AppsList(a) => s.apps = a.instances.clone(),
+        IpcMessage::DeviceStatus(d) => state.device = Some(d),
+        IpcMessage::NetworkStatus(n) => state.network = Some(n),
+        IpcMessage::AppsList(a) => state.apps = a.instances,
+        // Pillar asking the console to give up the GPU (release) or telling
+        // it the GPU is available again (restore). Flip the flag the
+        // frontend loop reads immediately, and remember the request id so
+        // the eventual GpuAck echoes it rather than a fresh or zero one -
+        // pillar drops any ack whose id does not match what it is waiting
+        // on (see PillarState::pending_gpu_ack).
+        IpcMessage::GPURequest(r) => {
+            state.gpu_available = !r.release;
+            state.pending_gpu_ack = Some(r);
+        }
         _ => {}
     }
 }
@@ -327,11 +369,12 @@ mod gui_client_tests {
     /// The release request pillar sends before it binds the GPU to vfio.
     #[test]
     fn decodes_a_gpu_release_request() {
-        let wire = r#"{"type":"GPURequest","message":{"domain":"vm1","release":true}}"#;
+        let wire = r#"{"type":"GPURequest","message":{"domain":"vm1","release":true,"request_id":7}}"#;
         match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
             IpcMessage::GPURequest(r) => {
                 assert_eq!(r.domain, "vm1");
                 assert!(r.release);
+                assert_eq!(r.request_id, 7);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -340,9 +383,12 @@ mod gui_client_tests {
     /// And the message that gives it back.
     #[test]
     fn decodes_a_gpu_restore_request() {
-        let wire = r#"{"type":"GPURequest","message":{"domain":"","release":false}}"#;
+        let wire = r#"{"type":"GPURequest","message":{"domain":"","release":false,"request_id":8}}"#;
         match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
-            IpcMessage::GPURequest(r) => assert!(!r.release),
+            IpcMessage::GPURequest(r) => {
+                assert!(!r.release);
+                assert_eq!(r.request_id, 8);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
@@ -356,14 +402,83 @@ mod gui_client_tests {
     /// handshake until domainmgr's timeout.
     #[test]
     fn decodes_a_gpu_ack_as_a_request() {
-        let wire = r#"{"RequestType":"GPUAck","RequestData":{"domain":"vm1","released":true},"id":7}"#;
+        let wire = r#"{"RequestType":"GPUAck","RequestData":{"domain":"vm1","released":true,"request_id":7},"id":7}"#;
         match serde_json::from_str::<IpcMessage>(wire).expect("decode") {
             IpcMessage::Request { request: Request::GPUAck(ack), id } => {
                 assert_eq!(ack.domain, "vm1");
                 assert!(ack.released);
+                assert_eq!(ack.request_id, 7);
                 assert_eq!(id, 7);
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// A fresh PillarState must start with the GPU considered available - a
+    /// `#[derive(Default)]` bool would start every device in TUI mode, which
+    /// is wrong for a device that has never heard from pillar at all.
+    #[test]
+    fn a_fresh_state_assumes_the_gpu_is_available() {
+        assert!(PillarState::default().gpu_available);
+    }
+
+    /// A release request must flip the shared flag the frontend loop reads,
+    /// so the console switches to the TUI before pillar binds vfio.
+    #[test]
+    fn a_release_request_marks_the_gpu_unavailable() {
+        let mut st = PillarState::default();
+        apply(&mut st, IpcMessage::GPURequest(monitorapi::GpuRequest {
+            domain: "vm1".into(),
+            release: true,
+            request_id: 7,
+        }));
+        assert!(!st.gpu_available);
+
+        apply(&mut st, IpcMessage::GPURequest(monitorapi::GpuRequest {
+            domain: String::new(),
+            release: false,
+            request_id: 8,
+        }));
+        assert!(st.gpu_available);
+    }
+
+    /// The id pillar is waiting on must travel with the flag it caused, not
+    /// be invented later - main.rs echoes this in the GpuAck it sends once
+    /// the frontend has actually acted on it, and pillar drops any ack whose
+    /// id does not match what it is waiting on.
+    #[test]
+    fn a_gpu_request_is_remembered_for_the_eventual_ack() {
+        let mut st = PillarState::default();
+        assert!(st.pending_gpu_ack.is_none());
+
+        apply(&mut st, IpcMessage::GPURequest(monitorapi::GpuRequest {
+            domain: "vm1".into(),
+            release: true,
+            request_id: 42,
+        }));
+        let pending = st.pending_gpu_ack.as_ref().expect("a request is pending");
+        assert_eq!(pending.request_id, 42);
+        assert!(pending.release);
+
+        // A later request - even a restore - replaces it: this is a single
+        // slot mirroring pillar's own pendingGPURequestID, not a queue.
+        apply(&mut st, IpcMessage::GPURequest(monitorapi::GpuRequest {
+            domain: String::new(),
+            release: false,
+            request_id: 43,
+        }));
+        let pending = st.pending_gpu_ack.as_ref().expect("a request is pending");
+        assert_eq!(pending.request_id, 43);
+        assert!(!pending.release);
+    }
+
+    /// A message unrelated to the GPU must not disturb it.
+    #[test]
+    fn unrelated_messages_leave_the_gpu_flag_alone() {
+        let mut st = PillarState::default();
+        st.gpu_available = false;
+        apply(&mut st, IpcMessage::AppsList(monitorapi::AppsList { instances: Vec::new() }));
+        assert!(!st.gpu_available);
+        assert!(st.pending_gpu_ack.is_none());
     }
 }
