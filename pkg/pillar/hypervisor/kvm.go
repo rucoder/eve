@@ -958,7 +958,8 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 	dmArgs := append([]string{}, ctx.dmArgs...)
 	// The display must match the video device the domain config just asked
 	// for, so both come from the same call.
-	dmArgs = append(dmArgs, displayArgs(ctx.virtualGPUFor(config, status))...)
+	hasIntelIGPU := detectIntelIGPU(config.IoAdapterList, aa)
+	dmArgs = append(dmArgs, displayArgs(ctx.virtualGPUFor(config, hasIntelIGPU))...)
 	if config.VirtualizationMode == types.FML {
 		dmArgs = append(dmArgs, ctx.dmFmlCPUArgs...)
 	} else {
@@ -1788,6 +1789,13 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	// By the time we get here, config.BootOrder has the final resolved value.
 	bootOrder := bootOrderToFwCfgString(config.BootOrder)
 	hasIntelIGPU := detectIntelIGPU(config.IoAdapterList, aa)
+	virtualGPU := ctx.virtualGPUFor(config, hasIntelIGPU)
+	// A domain in virtual-GPU mode keeps the iGPU with the host driver -
+	// domainmgr never reserves or binds it for such a domain - so none of
+	// the passthrough plumbing hasIntelIGPU otherwise drives (the LPC ID
+	// spoof below, the vfio-pci device args, the USB root port move / IOMMU
+	// suppression in the template) may be emitted for it either.
+	passthroughIGPU := hasIntelIGPU && !virtualGPU
 
 	var efiDebug, dumpGuestCore, igpuNoMmap bool
 	var gopRomFilename string
@@ -1804,7 +1812,7 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	// whitelist to fool, and applying the spoof has been observed to
 	// break the Windows display driver on RPL-P.
 	var igpuLpcID string
-	if hasIntelIGPU && gopRomFilename != "" {
+	if passthroughIGPU && gopRomFilename != "" {
 		if _, missing := gopRomPath(gopRomFilename); !missing {
 			igpuLpcID = loadIgpuIDs()
 			if igpuLpcID != "" {
@@ -1823,8 +1831,8 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		BootOrder:              bootOrder,
 		EFIDebug:               efiDebug,
 		DumpGuestCore:          dumpGuestCore,
-		HasIntelIGPU:           hasIntelIGPU,
-		VirtualGPU:             ctx.virtualGPUFor(config, status),
+		HasIntelIGPU:           passthroughIGPU,
+		VirtualGPU:             virtualGPU,
 		IgpuLpcDeviceID:        igpuLpcID,
 		DomainConfig:           config,
 		DomainStatus:           status,
@@ -2303,39 +2311,41 @@ func usbBusPort(USBAddr string) (string, string) {
 	return "", ""
 }
 
-// hasGPUAdapter reports whether config assigns this domain the iGPU -
-// the same types.IoHDMI marker domainmgr uses to identify the boot VGA.
-func hasGPUAdapter(adapters []types.IoAdapter) bool {
-	for _, a := range adapters {
-		if a.Type == types.IoHDMI {
-			return true
-		}
+// gpuModeFor is types.GPUModeFor honoring ctx.gpuModeDir when a test has set
+// it. It only reads - never creates the default file - so hypervisor stays
+// a pure consumer of the operator's choice; domainmgr is the one that calls
+// types.GPUModeEnsureDefault explicitly.
+func (ctx KvmContext) gpuModeFor(key string) string {
+	if ctx.gpuModeDir != "" {
+		return types.GPUModeRead(ctx.gpuModeDir, key)
 	}
-	return false
+	return types.GPUModeFor(key)
 }
 
 // virtualGPUFor reports whether this domain gets a GL-backed virtual GPU
-// instead of a real passthrough of the host's iGPU.
+// instead of a real passthrough of the host's iGPU. hasIntelIGPU is
+// detectIntelIGPU's result for this domain - the same hardware fact that
+// gates the passthrough plumbing, reused here rather than re-derived from a
+// weaker check (an IoHDMI adapter alone says nothing about VGA class or
+// vendor, so a discrete AMD/NVIDIA card typed IoHDMI would otherwise also
+// qualify for the Intel-render-node-backed virtio-vga-gl).
 //
-// Only a domain that was actually assigned the iGPU faces that choice at
+// Only a domain that was actually assigned the iGPU faces this choice at
 // all - every other app (including a shim VM running an OCI container,
 // which never holds it) keeps "-display none" as before, so it never holds
 // a virgl context. For the one app that was assigned the iGPU, the choice
 // is per-app and operator controlled (types.GPUModeFor), defaulting to
 // passthrough so existing behaviour - real hardware passthrough, no
 // QEMU-side display - is unchanged until an operator opts that domain into
-// a virtual GPU.
-func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, status types.DomainStatus) bool {
-	if !ctx.virtualGPU || !hasGPUAdapter(config.IoAdapterList) {
+// a virtual GPU. The key is the app's UUID, not its domain name: the
+// domain name changes across a controller version bump
+// (config.GetTaskName() folds in AppNum), which would otherwise silently
+// revert an operator's choice on the next restart.
+func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, hasIntelIGPU bool) bool {
+	if !ctx.virtualGPU || !hasIntelIGPU {
 		return false
 	}
-	var mode string
-	if ctx.gpuModeDir != "" {
-		mode = types.GPUModeAt(ctx.gpuModeDir, status.DomainName)
-	} else {
-		mode = types.GPUModeFor(status.DomainName)
-	}
-	return mode == types.GPUModeVirtual
+	return ctx.gpuModeFor(config.UUIDandVersion.UUID.String()) == types.GPUModeVirtual
 }
 
 // renderNode is the DRM render node QEMU uses to back a guest's virtual GPU

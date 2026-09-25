@@ -5,11 +5,14 @@ package domainmgr
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	uuid "github.com/satori/go.uuid"
 )
 
 // errStartFailed is a placeholder error used to exercise the failure path of
@@ -229,4 +232,46 @@ func TestReleaseIgnoresAStaleStatusFromAPreviousCycle(t *testing.T) {
 	if time.Since(start) < 150*time.Millisecond {
 		t.Error("expected the wait to actually time out, not return early on stale data")
 	}
+}
+
+// skipForVirtualGPU is the pure decision behind doAssignIoAdaptersToDomain's
+// choice to reserve the boot VGA adapter for passthrough or leave it with
+// the host driver. isBootVGA's own hardware check (real sysfs boot_vga) is
+// exercised elsewhere; this only covers the mode decision once isBoot is
+// known, via an injected gpuModeDir so it never touches /persist/gpu.
+func TestSkipForVirtualGPU(t *testing.T) {
+	appUUID, err := uuid.FromString("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := types.DomainConfig{UUIDandVersion: types.UUIDandVersion{UUID: appUUID}}
+
+	t.Run("boot VGA, operator opted into a virtual GPU", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, appUUID.String()+".json"), []byte(`{"mode":"virtual"}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		ctx := &domainContext{gpuModeDir: dir}
+		if !skipForVirtualGPU(ctx, config, true) {
+			t.Error("boot VGA in virtual mode must be skipped (left with the host driver)")
+		}
+	})
+
+	t.Run("boot VGA, operator has not opted in (default passthrough)", func(t *testing.T) {
+		ctx := &domainContext{gpuModeDir: t.TempDir()}
+		if skipForVirtualGPU(ctx, config, true) {
+			t.Error("boot VGA defaulting to passthrough must not be skipped")
+		}
+	})
+
+	t.Run("non-boot-VGA adapter is never skipped, even in virtual mode", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, appUUID.String()+".json"), []byte(`{"mode":"virtual"}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		ctx := &domainContext{gpuModeDir: dir}
+		if skipForVirtualGPU(ctx, config, false) {
+			t.Error("an adapter that is not the boot VGA must never be skipped")
+		}
+	})
 }

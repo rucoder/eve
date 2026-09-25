@@ -140,6 +140,28 @@ func isBootVGA(ib *types.IoBundle) bool {
 	return keep
 }
 
+// skipForVirtualGPU reports whether an adapter must stay with the host
+// because the operator put this app in virtual-GPU mode. isBoot is whether
+// this adapter is the boot VGA device (isBootVGA) - only that one is ever
+// affected, since the console needs exactly it to render this guest's
+// framebuffer; any other adapter always returns false regardless of mode.
+//
+// This is the one place that decides whether to reserve the GPU, so it also
+// ensures the operator-editable mode file exists (types.GPUModeEnsureDefault)
+// rather than leaving that to a reader that must stay side-effect-free.
+func skipForVirtualGPU(ctx *domainContext, config types.DomainConfig, isBoot bool) bool {
+	if !isBoot {
+		return false
+	}
+	key := config.UUIDandVersion.UUID.String()
+	if ctx.gpuModeDir != "" {
+		types.GPUModeEnsureDefaultAt(ctx.gpuModeDir, key)
+		return types.GPUModeRead(ctx.gpuModeDir, key) == types.GPUModeVirtual
+	}
+	types.GPUModeEnsureDefault(key)
+	return types.GPUModeFor(key) == types.GPUModeVirtual
+}
+
 // assignWithGPU releases the GPU, starts the domain, and hands the GPU back if
 // the start failed. Split out from doAssignIoAdaptersToDomain so the failure
 // path is testable without a running hypervisor: a failed start must not

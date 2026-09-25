@@ -3480,12 +3480,13 @@ func TestQemuGlobalConfIntelIGPUSuppressesVirtualIOMMU(t *testing.T) {
 func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
 	t.Parallel()
 
-	render := func(virtualGPU bool, machine string) string {
+	render := func(virtualGPU, enableVnc bool, machine string) string {
 		var buf bytes.Buffer
 		ctx := tQemuGlobalConfContext{
 			Machine:            machine,
 			VirtualizationMode: "HVM",
 			VirtualGPU:         virtualGPU,
+			DomainConfig:       types.DomainConfig{VmConfig: types.VmConfig{EnableVnc: enableVnc}},
 		}
 		if err := tQemuGlobalConf.Execute(&buf, ctx); err != nil {
 			t.Fatalf("rendering the global config failed: %v", err)
@@ -3493,20 +3494,33 @@ func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
 		return buf.String()
 	}
 
-	q35GL := render(true, "q35")
+	q35GL := render(true, false, "q35")
 	if !strings.Contains(q35GL, `driver = "virtio-vga-gl"`) {
 		t.Errorf("q35 with a render node should use virtio-vga-gl, got:\n%s", q35GL)
 	}
 
-	virtGL := render(true, "virt")
+	virtGL := render(true, false, "virt")
 	if !strings.Contains(virtGL, `driver = "virtio-gpu-gl-pci"`) {
 		t.Errorf("virt with a render node should use virtio-gpu-gl-pci, got:\n%s", virtGL)
 	}
 
 	// Without one, and with VNC off, no video device is emitted at all.
-	none := render(false, "q35")
+	none := render(false, false, "q35")
 	if strings.Contains(none, `[device "video0"]`) {
 		t.Errorf("no render node and no VNC should emit no video device, got:\n%s", none)
+	}
+
+	// A VNC app without a virtual GPU is the normal case on every device,
+	// GL-capable or not, now that VirtualGPU is gated by GPUModeFor rather
+	// than following the render node alone: it gets the plain video device
+	// and its VNC server, byte-for-byte the same as upstream EVE before this
+	// branch touched displayArgs/virtualGPUFor.
+	vnc := render(false, true, "q35")
+	if !strings.Contains(vnc, `driver = "virtio-vga"`) || strings.Contains(vnc, "virtio-vga-gl") {
+		t.Errorf("VNC without a virtual GPU should use plain virtio-vga, got:\n%s", vnc)
+	}
+	if !strings.Contains(vnc, `[vnc "default"]`) {
+		t.Errorf("VNC app should still get its VNC server, got:\n%s", vnc)
 	}
 }
 
@@ -3520,47 +3534,47 @@ func TestQemuGlobalConfVirtualGPUSelectsGLDevice(t *testing.T) {
 func TestVirtualGPUAgreesWithTheDisplay(t *testing.T) {
 	t.Parallel()
 
-	gpuAdapters := []types.IoAdapter{{Type: types.IoHDMI, Name: "hdmi0"}}
-
 	cases := []struct {
-		name        string
-		ctxGPU      bool
-		adapters    []types.IoAdapter
-		gpuModeBody string // written to <tempdir>/<domain>.json first; "" writes nothing
-		wantGPU     bool
-		wantDisplay string
+		name         string
+		ctxGPU       bool
+		hasIntelIGPU bool
+		gpuModeBody  string // written to <tempdir>/<uuid>.json first; "" writes nothing
+		wantGPU      bool
+		wantDisplay  string
 	}{
-		{"vm on a device with a render node but no GPU assigned", true, nil, "", false, "none"},
-		{"vm on a device without one", false, nil, "", false, "none"},
+		{"vm on a device with a render node but no GPU assigned", true, false, "", false, "none"},
+		{"vm on a device without one", false, false, "", false, "none"},
 		// A container's shim VM never holds the iGPU adapter either, so it
 		// falls into the no-GPU-assigned case above: giving every one of
 		// twenty container apps a virgl context against one iGPU never
 		// happens because none of them are ever assigned it.
-		{"container shim vm", true, nil, "", false, "none"},
+		{"container shim vm", true, false, "", false, "none"},
 		// The one app that was assigned the iGPU still defaults to real
 		// passthrough - no QEMU-side display - until an operator opts it
 		// into a virtual GPU.
-		{"GPU assigned, operator has not opted into a virtual GPU", true, gpuAdapters, "", false, "none"},
+		{"GPU assigned, operator has not opted into a virtual GPU", true, true, "", false, "none"},
 		// The operator flipped this one domain: it gets the GL-backed
 		// display instead of real passthrough.
-		{"GPU assigned, operator opted into a virtual GPU", true, gpuAdapters, `{"mode":"virtual"}`, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
+		{"GPU assigned, operator opted into a virtual GPU", true, true, `{"mode":"virtual"}`, true, "dbus,p2p=on,gl=on,rendernode=" + renderNode},
 	}
 
-	for i, c := range cases {
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
-			domain := fmt.Sprintf("vm%d.1.1", i)
+			id, err := uuid.NewV4()
+			if err != nil {
+				t.Fatalf("uuid.NewV4: %v", err)
+			}
 			if c.gpuModeBody != "" {
-				if err := os.WriteFile(filepath.Join(dir, domain+".json"), []byte(c.gpuModeBody), 0644); err != nil {
+				if err := os.WriteFile(filepath.Join(dir, id.String()+".json"), []byte(c.gpuModeBody), 0644); err != nil {
 					t.Fatalf("WriteFile: %v", err)
 				}
 			}
 
 			ctx := KvmContext{virtualGPU: c.ctxGPU, gpuModeDir: dir}
-			config := types.DomainConfig{IoAdapterList: c.adapters}
-			status := types.DomainStatus{DomainName: domain}
+			config := types.DomainConfig{UUIDandVersion: types.UUIDandVersion{UUID: id}}
 
-			gotGPU := ctx.virtualGPUFor(config, status)
+			gotGPU := ctx.virtualGPUFor(config, c.hasIntelIGPU)
 			if gotGPU != c.wantGPU {
 				t.Errorf("virtualGPUFor = %v, want %v", gotGPU, c.wantGPU)
 			}
@@ -3584,7 +3598,7 @@ func TestArm64ContextClaimsNoVirtualGPU(t *testing.T) {
 		t.Skip("newKvm's arm64 arm is only reachable on arm64")
 	}
 	ctx := KvmContext{} // the arm64 arm sets virtualGPU: false
-	if ctx.virtualGPUFor(types.DomainConfig{}, types.DomainStatus{}) {
+	if ctx.virtualGPUFor(types.DomainConfig{}, true) {
 		t.Error("arm64 must not claim a virtual GPU while its display is none")
 	}
 }

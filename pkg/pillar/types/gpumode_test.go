@@ -43,3 +43,43 @@ func TestGPUModeFallsBackOnGarbage(t *testing.T) {
 		}
 	}
 }
+
+// GPUModeRead is the read-only half cmd/monitor's status-reporting path
+// calls on every refresh for every app. It must never create anything -
+// that write belongs solely to GPUModeEnsureDefault, which domainmgr calls
+// explicitly - or a read-only reporting path would litter /persist/gpu as a
+// side effect of being asked a question.
+func TestGPUModeReadDoesNotCreateAFile(t *testing.T) {
+	dir := t.TempDir()
+	if got := GPUModeRead(dir, "vm1.1.1"); got != GPUModePassthrough {
+		t.Errorf("got %q, want passthrough", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("GPUModeRead must not create anything, found %v", entries)
+	}
+}
+
+// GPUModeEnsureDefaultAt is the write domainmgr calls explicitly. It must
+// create an absent file, and must never touch one that already carries an
+// operator's choice - self-healing a hand-edited file could destroy intent.
+func TestGPUModeEnsureDefaultAtCreatesButNeverOverwrites(t *testing.T) {
+	dir := t.TempDir()
+
+	GPUModeEnsureDefaultAt(dir, "vm1.1.1")
+	if got := GPUModeRead(dir, "vm1.1.1"); got != GPUModePassthrough {
+		t.Errorf("absent file: got %q, want passthrough", got)
+	}
+
+	path := filepath.Join(dir, "vm2.1.1.json")
+	if err := os.WriteFile(path, []byte(`{"mode":"virtual"}`), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	GPUModeEnsureDefaultAt(dir, "vm2.1.1")
+	if got := GPUModeRead(dir, "vm2.1.1"); got != GPUModeVirtual {
+		t.Errorf("existing virtual file was overwritten: got %q, want virtual", got)
+	}
+}
