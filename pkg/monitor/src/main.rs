@@ -208,11 +208,10 @@ async fn main() -> Result<()> {
     // and `client` is kept alive for the rest of main() so its `outbox`
     // sender never closes early and triggers a reconnect.
     let client = ipc::spawn(&get_ipc_socket_path());
-    let pillar = client.state.clone();
 
     match frontend::choose(&frontend::probe_drm) {
         frontend::Frontend::Gui => {
-            if let Err(e) = gui::run(pillar) {
+            if let Err(e) = gui::run(client.state.clone()) {
                 log::error!("Gui error: {e}");
             }
         }

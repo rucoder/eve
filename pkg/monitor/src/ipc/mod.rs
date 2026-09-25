@@ -23,9 +23,15 @@ mod monitorapi_tests;
 // called from the `spawn` below - main.rs calls it exactly once at startup
 // and hands the pieces out to whichever frontend(s) it runs. See
 // crate::frontend for the startup choice.
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use message::IpcMessage;
 use monitorapi::{AppInstance, DeviceStatus, NetworkStatus};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+
+/// Capacity of the `events` channel (see `Client::events`). Deliberately
+/// small: it exists to hand a frontend a live feed, not to buffer history.
+const EVENTS_CAPACITY: usize = 256;
 
 /// The default socket pillar serves the monitor contract on.
 pub const MONITOR_SOCKET: &str = "/run/monitor.sock";
@@ -53,12 +59,14 @@ pub type Shared = std::sync::Arc<std::sync::Mutex<PillarState>>;
 /// driven by) in place of owning the socket, and writes requests to `outbox`
 /// in place of a sink it would otherwise own.
 ///
-/// Keep this value alive for as long as its `outbox` should stay open: once
-/// every sender is dropped, the background thread treats that as shutdown
-/// and stops reconnecting.
+/// `events` is bounded and lossy by design - see `send_event`. `outbox` is
+/// the shutdown handle: keep it (or `Client` as a whole) alive for as long
+/// as this client should keep running. Once every `outbox` sender is
+/// dropped, the background thread finishes pumping the current connection
+/// (if any), then stops instead of reconnecting.
 pub struct Client {
     pub state: Shared,
-    pub events: UnboundedReceiver<IpcMessage>,
+    pub events: Receiver<IpcMessage>,
     pub outbox: UnboundedSender<IpcMessage>,
 }
 
@@ -67,7 +75,7 @@ pub struct Client {
 /// pillar restarting is normal, not an error.
 pub fn spawn(socket: &str) -> Client {
     let state: Shared = Default::default();
-    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENTS_CAPACITY);
     let (outbox_tx, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let (out, path) = (state.clone(), socket.to_string());
@@ -87,33 +95,71 @@ pub fn spawn(socket: &str) -> Client {
     Client { state, events: events_rx, outbox: outbox_tx }
 }
 
-/// Connect, pump frames until disconnected, wait, and try again - forever.
-/// Only returns (early) once every `outbox` sender has been dropped, which
-/// main.rs treats as "process is shutting down" and never happens in
-/// practice, since it holds `Client` for the life of the process.
+/// How many events `send_event` has dropped because `events` was full (or,
+/// on the GUI path, never drained at all). Logged at a low rate - this sits
+/// on the connection's read path and must not turn into a log line per
+/// message.
+static EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Hand `msg` to whichever frontend is reading `events`, without blocking.
+///
+/// Every `IpcMessage` pillar sends is a full snapshot, not a delta (see
+/// `PillarState`), so a frontend that is not currently reading - the GUI
+/// never reads `events` at all; the TUI might be slow for a moment - loses
+/// nothing but staleness: the next message it does read is current. Nothing
+/// here needs to be replayed, so dropping on a full queue is correct, and
+/// blocking would be worse than wrong - it would stall this connection's
+/// read loop (and therefore `PillarState`) for as long as nobody drains
+/// `events`, which for the GUI path is the entire run.
+fn send_event(events: &Sender<IpcMessage>, msg: IpcMessage) {
+    if events.try_send(msg).is_err() {
+        let n = EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            log::warn!("pillar: dropped {n} events so far (no reader, or reader too slow)");
+        }
+    }
+}
+
+/// Why `pump` returned.
+enum PumpExit {
+    /// The connection itself went away; reconnect.
+    Disconnected,
+    /// Every `outbox` sender was dropped: no frontend can send requests or
+    /// wants events any more. Stop instead of reconnecting.
+    ShuttingDown,
+}
+
+/// Connect, pump frames until disconnected, wait, and try again - until
+/// `outbox` closes, which main.rs treats as "process is shutting down" and
+/// which does not happen in practice, since it holds `Client` for the life
+/// of the process.
 async fn run_forever(
     path: &str,
     out: &Shared,
-    events: UnboundedSender<IpcMessage>,
+    events: Sender<IpcMessage>,
     mut outbox: UnboundedReceiver<IpcMessage>,
 ) {
     let mut has_connected = false;
     loop {
-        let _ = events.send(IpcMessage::Connecting);
+        send_event(&events, IpcMessage::Connecting);
         match ipc_client::IpcClient::connect(path).await {
             Ok(stream) => {
                 log::info!("pillar: connected on {path}");
                 has_connected = true;
                 out.lock().unwrap().connected = true;
-                let _ = events.send(IpcMessage::Ready);
-                pump(stream, out, &events, &mut outbox).await;
+                send_event(&events, IpcMessage::Ready);
+                let exit = pump(stream, out, &events, &mut outbox).await;
                 out.lock().unwrap().connected = false;
-                let _ = events.send(IpcMessage::ConnectionLost);
+                if matches!(exit, PumpExit::ShuttingDown) {
+                    log::info!("pillar: outbox closed; stopping client");
+                    return;
+                }
+                send_event(&events, IpcMessage::ConnectionLost);
             }
             Err(e) => {
                 log::warn!("pillar: connect {path}: {e}");
                 out.lock().unwrap().connected = false;
-                let _ = events.send(if has_connected {
+                send_event(&events, if has_connected {
                     IpcMessage::ConnectionLost
                 } else {
                     IpcMessage::ConnectionFailed
@@ -130,9 +176,9 @@ async fn run_forever(
 async fn pump(
     stream: tokio_util::codec::Framed<tokio::net::UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     out: &Shared,
-    events: &UnboundedSender<IpcMessage>,
+    events: &Sender<IpcMessage>,
     outbox: &mut UnboundedReceiver<IpcMessage>,
-) {
+) -> PumpExit {
     use futures::{SinkExt, StreamExt};
     let (mut sink, mut stream) = stream.split();
     // Anything queued while disconnected is stale by now.
@@ -145,10 +191,10 @@ async fn pump(
                     Some(msg) => {
                         if let Err(e) = sink.send(msg.into()).await {
                             log::warn!("pillar: send: {e}");
-                            return;
+                            return PumpExit::Disconnected;
                         }
                     }
-                    None => return,
+                    None => return PumpExit::ShuttingDown,
                 }
             }
             frame = stream.next() => {
@@ -156,15 +202,15 @@ async fn pump(
                     Some(Ok(bytes)) => {
                         let msg = IpcMessage::from(bytes);
                         update_state(out, &msg);
-                        let _ = events.send(msg);
+                        send_event(events, msg);
                     }
                     Some(Err(e)) => {
                         log::warn!("pillar: read: {e}");
-                        return;
+                        return PumpExit::Disconnected;
                     }
                     None => {
                         log::warn!("pillar: connection closed by peer");
-                        return;
+                        return PumpExit::Disconnected;
                     }
                 }
             }

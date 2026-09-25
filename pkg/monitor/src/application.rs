@@ -24,6 +24,7 @@ use log::LevelFilter;
 use log::{debug, info, trace, warn};
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -94,7 +95,7 @@ pub struct Application {
     action_tx: UnboundedSender<Action>,
     // The single pillar connection is owned by main.rs (see crate::ipc);
     // this is this frontend's end of it, not a connection of its own.
-    ipc_rx: UnboundedReceiver<IpcMessage>,
+    ipc_rx: Receiver<IpcMessage>,
     ipc_tx: UnboundedSender<IpcMessage>,
     ui: Ui,
     // this is our model :)
@@ -108,7 +109,7 @@ pub struct Application {
 impl Application {
     pub fn new(
         config: AppConfig,
-        ipc_rx: UnboundedReceiver<IpcMessage>,
+        ipc_rx: Receiver<IpcMessage>,
         ipc_tx: UnboundedSender<IpcMessage>,
     ) -> Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
