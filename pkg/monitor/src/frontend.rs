@@ -30,6 +30,35 @@ pub fn choose(probe: &dyn Fn() -> Option<String>) -> Frontend {
     }
 }
 
+/// Tracks which console should be showing. `capable` is fixed at startup: a
+/// device with no GPU never switches, whatever pillar reports.
+pub struct Console {
+    capable: bool,
+    gpu_available: bool,
+}
+
+impl Console {
+    pub fn new(initial: Frontend) -> Self {
+        Self {
+            capable: initial == Frontend::Gui,
+            gpu_available: true,
+        }
+    }
+
+    /// Pillar has taken the GPU for an app, or given it back.
+    pub fn set_gpu_available(&mut self, yes: bool) {
+        self.gpu_available = yes;
+    }
+
+    pub fn want(&self) -> Frontend {
+        if self.capable && self.gpu_available {
+            Frontend::Gui
+        } else {
+            Frontend::Tui
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +77,32 @@ mod tests {
     #[test]
     fn a_usable_card_means_gui() {
         assert_eq!(choose(&|| Some("/dev/dri/card0".into())), Frontend::Gui);
+    }
+
+    /// An app taking the iGPU, then giving it back, must not strand the
+    /// console in text mode - and repeating that must be stable, because an
+    /// app that crashloops will do it many times.
+    #[test]
+    fn gpu_taken_and_returned_round_trips() {
+        let mut c = Console::new(Frontend::Gui);
+        assert_eq!(c.want(), Frontend::Gui);
+        c.set_gpu_available(false);
+        assert_eq!(c.want(), Frontend::Tui);
+        c.set_gpu_available(true);
+        assert_eq!(c.want(), Frontend::Gui);
+        for _ in 0..100 {
+            c.set_gpu_available(false);
+            c.set_gpu_available(true);
+        }
+        assert_eq!(c.want(), Frontend::Gui);
+    }
+
+    /// A device that never had a GPU stays on the TUI whatever pillar says
+    /// about GPU availability - there is nothing to switch to.
+    #[test]
+    fn a_tui_only_device_ignores_gpu_messages() {
+        let mut c = Console::new(Frontend::Tui);
+        c.set_gpu_available(true);
+        assert_eq!(c.want(), Frontend::Tui);
     }
 }

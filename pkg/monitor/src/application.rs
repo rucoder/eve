@@ -38,7 +38,7 @@ use crate::ipc::monitorapi::{IpMode, SetInterfaceConfig, StaticIpConfig, RevertM
 use crate::terminal::TerminalWrapper;
 use crate::ui::action::{Action, UiActions};
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
     #[serde(skip)]
     config_path: PathBuf,
@@ -88,14 +88,16 @@ impl AppConfig {
     }
 }
 
-pub struct Application {
+pub struct Application<'a> {
     terminal_rx: UnboundedReceiver<Event>,
     terminal_tx: UnboundedSender<Event>,
     action_rx: UnboundedReceiver<Action>,
     action_tx: UnboundedSender<Action>,
-    // The single pillar connection is owned by main.rs (see crate::ipc);
-    // this is this frontend's end of it, not a connection of its own.
-    ipc_rx: Receiver<IpcMessage>,
+    // The single pillar connection is owned by main.rs (see crate::ipc) and
+    // survives a switch to the GUI and back; this frontend only borrows its
+    // receiving end for as long as it is the one running, so main.rs gets it
+    // back - unbroken, not re-created - the next time the TUI runs.
+    ipc_rx: &'a mut Receiver<IpcMessage>,
     ipc_tx: UnboundedSender<IpcMessage>,
     ui: Ui,
     // this is our model :)
@@ -106,10 +108,10 @@ pub struct Application {
     config: AppConfig,
 }
 
-impl Application {
+impl<'a> Application<'a> {
     pub fn new(
         config: AppConfig,
-        ipc_rx: Receiver<IpcMessage>,
+        ipc_rx: &'a mut Receiver<IpcMessage>,
         ipc_tx: UnboundedSender<IpcMessage>,
     ) -> Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
@@ -325,7 +327,7 @@ impl Application {
         let cancel_token = CancellationToken::new();
         let cancel_token_child = cancel_token.clone();
         let (dmesg_tx, dmesg_rx) = mpsc::unbounded_channel::<rmesg::entry::Entry>();
-        let is_desktop = Application::is_desktop();
+        let is_desktop = Self::is_desktop();
 
         let kmsg_task: JoinHandle<Result<()>> = tokio::spawn(async move {
             if is_desktop {
@@ -423,10 +425,15 @@ impl Application {
                     event = terminal_event => {
                         match event {
                             Some(Ok(crossterm::event::Event::Key(key))) => {
-                                terminal_tx_clone.send(Event::Key(key)).unwrap();
+                                // The receiver (owned by `Application`) outlives this
+                                // task in the ordinary shutdown path (cancel, then
+                                // join, then drop `self`), but this task must never
+                                // panic a switch on a race instead of just dropping
+                                // one stale event.
+                                let _ = terminal_tx_clone.send(Event::Key(key));
                             }
                             Some(Ok(crossterm::event::Event::Resize(w, h))) => {
-                                terminal_tx_clone.send(Event::TerminalResize(w,h)).unwrap();
+                                let _ = terminal_tx_clone.send(Event::TerminalResize(w,h));
                             }
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
@@ -444,12 +451,15 @@ impl Application {
         (terminal_task, terminal_cancel_token)
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    /// Run until the user quits or `switch` fires - e.g. pillar has given the
+    /// GPU back to the console and `main` wants this to hand off to the GUI.
+    /// `switch` drives the same `app_cancel_token` the Quit action already
+    /// uses, so a switch tears everything down exactly like a normal quit:
+    /// this is the suspend/resume this loop used to have no answer for when
+    /// the GPU was passed through to a guest.
+    pub async fn run(&mut self, switch: CancellationToken) -> Result<()> {
         // The pillar connection itself is owned by main.rs (see crate::ipc);
         // self.ipc_rx/self.ipc_tx are just this frontend's ends of it.
-
-        // TODO: handle suspend/resume for the case when we give away /dev/tty
-        // because we passed through the GPU to a guest VM
         let (terminal_task, terminal_cancel_token) = self.create_terminal_task();
 
         // spawn a timer to send tick events
@@ -475,6 +485,10 @@ impl Application {
                 _ = app_cancel_token.cancelled() => {
                     info!("Application cancelled");
                     break;
+                }
+                _ = switch.cancelled() => {
+                    info!("Switch requested; handing the console back");
+                    app_cancel_token.cancel();
                 }
                 tick = timer_rx.recv() => {
                     match tick {

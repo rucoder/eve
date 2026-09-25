@@ -205,26 +205,55 @@ async fn main() -> Result<()> {
     // Pillar's monitor agent accepts exactly one client connection per
     // process (see crate::ipc's module doc). This is the only client for the
     // whole process: it is created once here, before either frontend starts,
-    // and `client` is kept alive for the rest of main() so its `outbox`
-    // sender never closes early and triggers a reconnect.
-    let client = ipc::spawn(&get_ipc_socket_path());
+    // and `client` is kept alive for the rest of main() - across every
+    // frontend switch below, not just the first frontend - so its `outbox`
+    // sender never closes early and triggers a reconnect, and `spawn()` is
+    // never called a second time.
+    let mut client = ipc::spawn(&get_ipc_socket_path());
 
-    match frontend::choose(&frontend::probe_drm) {
-        frontend::Frontend::Gui => {
-            if let Err(e) = gui::run(client.state.clone()) {
-                log::error!("Gui error: {e}");
+    // `mut` once something drives `set_gpu_available` (pillar's GPU-request
+    // messages; not wired up yet - nothing in this process calls it today).
+    let console = frontend::Console::new(frontend::choose(&frontend::probe_drm));
+
+    // Which frontend is showing changes only at the top of this loop, so
+    // asking for the one already running is a no-op: the match below simply
+    // is not re-entered until the running one returns control.
+    loop {
+        match console.want() {
+            frontend::Frontend::Gui => {
+                // Fresh per session: a CancellationToken cannot be
+                // un-cancelled, and each GUI run needs its own "please stop"
+                // signal. `gui::run` always tears down DRM/GL/input state
+                // before returning, however it returns.
+                let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Err(e) = gui::run(client.state.clone(), switch.clone()) {
+                    log::error!("Gui error: {e}");
+                }
+                // `switch` set means main asked the GUI to hand back control
+                // (console.want() no longer wants it); anything else - the VT
+                // going away, an unrecoverable error - is a real shutdown.
+                if !switch.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
             }
-        }
-        frontend::Frontend::Tui => {
-            let mut app = Application::new(config, client.events, client.outbox)?;
-            let result = app.run().await;
-            if let Err(e) = &result {
-                log::error!("Application error: {}", e);
+            frontend::Frontend::Tui => {
+                let switch = tokio_util::sync::CancellationToken::new();
+                // Borrows client.events/outbox for this session only, so
+                // main.rs still owns them - unconsumed - the moment this
+                // returns and can lend them again next time the TUI runs.
+                let mut app = Application::new(config.clone(), &mut client.events, client.outbox.clone())?;
+                let result = app.run(switch.clone()).await;
+                if let Err(e) = &result {
+                    log::error!("Application error: {}", e);
+                }
+                // FIXME: this is a workaround for malfunctioning terminal event stream
+                // Terminal must be dropped and restored automatically but one of the threads doesn't exit
+                // and await? on a main function never finishes. Drops are executed later.
+                TerminalWrapper::close_terminal()?;
+                if !switch.is_cancelled() {
+                    break;
+                }
             }
-            // FIXME: this is a workaround for malfunctioning terminal event stream
-            // Terminal must be dropped and restored automatically but one of the threads doesn't exit
-            // and await? on a main function never finishes. Drops are executed later.
-            TerminalWrapper::close_terminal()?;
         }
     }
     std::process::exit(EXIT_SUCCESS);

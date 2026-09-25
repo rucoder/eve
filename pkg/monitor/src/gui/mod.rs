@@ -73,10 +73,14 @@ fn spawn_vms(spec: &str) -> Vec<Vm> {
     vms
 }
 
-/// Run the graphical console until it is asked to stop or the VT goes away.
-/// `pillar` is the shared state the IPC client fills; this frontend only reads
-/// it.
-pub fn run(pillar: crate::ipc::Shared) -> anyhow::Result<()> {
+/// Run the graphical console until it is asked to stop, the VT goes away, or
+/// `switch` is set. `pillar` is the shared state the IPC client fills; this
+/// frontend only reads it. `switch` lets `main` ask this to hand back the
+/// console (e.g. pillar took the GPU for an app) without a real process
+/// shutdown - checked once per frame, next to `vt::running()`, which keeps
+/// meaning "the process itself is shutting down" and is untouched by a
+/// switch request.
+pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     let cfg = Config::from_env();
     // Held for the whole run; Drop puts the VT keyboard back.
     let _cad = vt::CtrlAltDelGuard::take();
@@ -128,6 +132,10 @@ pub fn run(pillar: crate::ipc::Shared) -> anyhow::Result<()> {
         for n in 0..limit {
             if !vt::running() {
                 log::info!("signal received at frame {n}, shutting down cleanly");
+                break;
+            }
+            if switch.load(std::sync::atomic::Ordering::SeqCst) {
+                log::info!("switch requested at frame {n}, handing back the console");
                 break;
             }
 
@@ -397,7 +405,7 @@ pub fn run(pillar: crate::ipc::Shared) -> anyhow::Result<()> {
         el,
         n_done as f64 / el.as_secs_f64()
     );
-    shutdown(gpu, heads, vms, painter);
+    shutdown(gpu, heads, vms, painter, inp);
     loop_result
 }
 
@@ -550,7 +558,13 @@ fn shutdown(
     mut heads: Vec<drm::Head>,
     mut vms: Vec<Vm>,
     mut painter: egui_glow::Painter,
+    inp: input::Handle,
 ) {
+    log::info!("cleanup: stopping input thread");
+    // Independent of DRM/GL; do it first so a slow join doesn't sit between
+    // the frame loop stopping and the GL/DRM cleanup below.
+    inp.shutdown();
+
     log::info!("cleanup: draining in-flight page flips");
     for head in heads.iter_mut() {
         let _ = head.surface.frame_submitted();

@@ -103,6 +103,10 @@ pub struct Handle {
     pub stats: std::sync::Arc<Stats>,
     pub state: std::sync::Arc<std::sync::Mutex<State>>,
     pub active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>>,
+    /// Write side of the eventfd that wakes the thread's `poll()` for
+    /// shutdown; see `shutdown()`.
+    shutdown_fd: std::os::unix::io::RawFd,
+    join: std::thread::JoinHandle<()>,
 }
 
 impl Handle {
@@ -115,9 +119,27 @@ impl Handle {
     pub fn clear_active(&self) {
         *self.active_tx.lock().unwrap() = None;
     }
+
+    /// Stop the input thread and wait for it, so libinput's context - and
+    /// every `/dev/input/event*` fd it opened directly, with no udev to do it
+    /// for us - is closed before this returns. Must run before the process
+    /// calls `spawn` again (e.g. switching back to the GUI after a stint in
+    /// text mode), or the same devices get opened a second time.
+    pub fn shutdown(self) {
+        let one: u64 = 1;
+        let ptr = &one as *const u64 as *const libc::c_void;
+        if unsafe { libc::write(self.shutdown_fd, ptr, 8) } < 0 {
+            log::warn!("input: shutdown signal: {}", std::io::Error::last_os_error());
+        }
+        if self.join.join().is_err() {
+            log::warn!("input: thread panicked while shutting down");
+        }
+        unsafe { libc::close(self.shutdown_fd) };
+    }
 }
 
-/// Start the input thread. It owns libinput and never returns.
+/// Start the input thread. It owns libinput until `Handle::shutdown` is
+/// called.
 pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
     let state = std::sync::Arc::new(std::sync::Mutex::new(State {
         x: w as f64 / 2.0, y: h as f64 / 2.0,
@@ -130,7 +152,14 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
     let st = state.clone();
     let tx = active_tx.clone();
     let sts = stats.clone();
-    std::thread::Builder::new().name("input".into()).spawn(move || {
+    // Wakes the poll() below on shutdown; libinput's own fd carries the real
+    // events and an infinite poll timeout otherwise never notices a request
+    // to stop.
+    let shutdown_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if shutdown_fd < 0 {
+        return Err(anyhow::anyhow!("input: eventfd: {}", std::io::Error::last_os_error()));
+    }
+    let join = std::thread::Builder::new().name("input".into()).spawn(move || {
         // libinput's context holds raw pointers and an Rc, so it is not Send:
         // it must be CREATED on this thread, not moved in.
         let mut inp = match Input::new(w, h) {
@@ -141,16 +170,24 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
         inp.stats = sts;
         let fd = inp.fd();
         loop {
-            // BLOCK until the kernel has something. No timeout, no polling:
-            // the thread sleeps and wakes on the event itself.
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
+            // BLOCK until the kernel has something, or a shutdown is
+            // requested. No timeout, no polling: the thread sleeps and wakes
+            // on the event itself.
+            let mut pfds = [
+                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: shutdown_fd, events: libc::POLLIN, revents: 0 },
+            ];
+            if unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) } < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted { continue; }
                 // Anything else is permanent (a bad fd after device teardown);
                 // retrying would spin a core for the life of the process.
                 log::error!("input: poll failed: {e}; input thread stopping");
                 return;
+            }
+            if pfds[1].revents & libc::POLLIN != 0 {
+                log::info!("input: shutdown requested; closing libinput");
+                return; // drops `inp` here, closing every device fd it opened
             }
             inp.pump(crate::gui::POINTS_PER_PIXEL);
             // forward to the guest IMMEDIATELY, at device rate
@@ -175,7 +212,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             inp.guest_size = s.guest_size;
         }
     })?;
-    Ok(Handle { stats, state, active_tx })
+    Ok(Handle { stats, state, active_tx, shutdown_fd, join })
 }
 
 pub struct Input {
