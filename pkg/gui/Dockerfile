@@ -63,6 +63,18 @@ FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runtime
 ENV PKGS="kbd mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs libxkbcommon musl"
 RUN eve-alpine-deploy.sh
 
+# Drop every gallium pipe driver except iris. EVE's graphical console targets
+# Gen12+ Intel graphics; the other eight (crocus, nouveau, r300, r600,
+# radeonsi, swrast, vmwgfx, i915) are 83MB of drivers for hardware this image
+# will never see, and the rootfs partition has a size budget. A host with no
+# supported GPU has no render node either, so it gets no display at all and
+# never reaches a driver.
+#
+# libLLVM stays: libgallium.so lists it as NEEDED, so removing it stops the
+# loader dead even for iris, which does not itself use it. Getting rid of it
+# means building mesa with -Dllvm=disabled -Dgallium-drivers=iris.
+RUN find /out/usr/lib/gallium-pipe -name 'pipe_*.so' ! -name 'pipe_iris.so' -delete
+
 COPY --from=builder /app/gui-version.txt /tmp/gui-version
 RUN register-sbom-pkg.sh -n eve-gui -v "$(cat /tmp/gui-version)" -l Apache-2.0 -u https://github.com/lf-edge/eve/tree/master/pkg/gui
 

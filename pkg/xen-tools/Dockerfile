@@ -37,6 +37,19 @@ ENV PKGS_arm64=libfdt
 
 RUN eve-alpine-deploy.sh
 
+# Drop every gallium pipe driver except iris. QEMU only needs host GL here to
+# back a guest's virtual GPU, and EVE's graphical console targets Gen12+ Intel
+# graphics; the other eight (crocus, nouveau, r300, r600, radeonsi, swrast,
+# vmwgfx, i915) are 83MB of drivers for hardware this image will never see, and
+# the rootfs partition has a size budget. A host with no supported GPU has no
+# render node either, so domainmgr gives its guests no display at all and QEMU
+# never reaches a driver.
+#
+# libLLVM stays: libgallium.so lists it as NEEDED, so removing it stops the
+# loader dead even for iris, which does not itself use it. Getting rid of it
+# means building mesa with -Dllvm=disabled -Dgallium-drivers=iris.
+RUN find /out/usr/lib/gallium-pipe -name 'pipe_*.so' ! -name 'pipe_iris.so' -delete
+
 # Alpine linux defines all 64bit integer types as long. Patch
 # /usr/include/bits/alltypes.h to fix compilation with -m32
 WORKDIR /
