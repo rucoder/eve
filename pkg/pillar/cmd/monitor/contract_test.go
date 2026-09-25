@@ -107,11 +107,15 @@ func TestProxyToContract_ManualByScheme(t *testing.T) {
 // A name is not a monitor. Under Xen, or for an instance that never got a
 // QEMU, the reconstructed path does not exist; reporting it anyway has the
 // console dial a socket that can never answer, once per app, forever.
-func TestQmpSocketForOnlyReportsAPathThatExists(t *testing.T) {
-	if got := qmpSocketFor("", true); got != "" {
+//
+// These call qmpSocketAt against qmpKvmStateDir - the production constant -
+// rather than the deleted qmpSocketFor wrapper, so they exercise the same
+// path appsListToContract actually runs.
+func TestQmpSocketAtOnlyReportsAPathThatExists(t *testing.T) {
+	if got := qmpSocketAt(qmpKvmStateDir, "", true); got != "" {
 		t.Errorf("no domain name should report no socket, got %q", got)
 	}
-	if got := qmpSocketFor("6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1", true); got != "" {
+	if got := qmpSocketAt(qmpKvmStateDir, "6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1", true); got != "" {
 		t.Errorf("a domain with no socket on disk should report none, got %q", got)
 	}
 }
@@ -119,7 +123,7 @@ func TestQmpSocketForOnlyReportsAPathThatExists(t *testing.T) {
 // An app with no virtual GPU has no display behind its QMP socket, so the
 // console must not be told to dial it.
 func TestQMPSocketOnlyForVirtualGPUApps(t *testing.T) {
-	if got := qmpSocketFor("vm1.1.1", false); got != "" {
+	if got := qmpSocketAt(qmpKvmStateDir, "vm1.1.1", false); got != "" {
 		t.Errorf("an app without a virtual GPU must report no socket, got %q", got)
 	}
 }
@@ -144,12 +148,12 @@ func TestQMPSocketReportedForVirtualGPUAppWithSocket(t *testing.T) {
 	}
 }
 
-// appsListToContract itself - not just qmpSocketFor - must key the GPU-mode
+// appsListToContract itself - not just qmpSocketAt - must key the GPU-mode
 // lookup by UUID, never by DomainName (Task 7's settled decision:
 // DomainName is "" until an app activates, and it changes across a
 // controller version bump). A regression to
-// types.GPUModeFor(a.DomainName) would still pass every qmpSocketFor test
-// in this file, since those pass hasVirtualGPU in by hand; only a test that
+// types.GPUModeFor(a.DomainName) would still pass every qmpSocketAt test
+// above, since those pass hasVirtualGPU in by hand; only a test that
 // drives the lookup through appsListToContract itself exercises the key.
 func appInstanceWithDomain(uuidStr, domainName string) types.AppInstanceStatus {
 	appUUID, err := uuid.FromString(uuidStr)

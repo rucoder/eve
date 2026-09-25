@@ -56,13 +56,9 @@ func deviceStatusToContract(server string, ob types.OnboardingStatus, enInfo typ
 // with kvmStateDir in hypervisor/kvm.go.
 const qmpKvmStateDir = "/run/hypervisor/kvm"
 
-// qmpSocketFor is qmpSocketAt against the production kvm state directory.
-func qmpSocketFor(domainName string, hasVirtualGPU bool) string {
-	return qmpSocketAt(qmpKvmStateDir, domainName, hasVirtualGPU)
-}
-
-// qmpSocketAt is qmpSocketFor with the kvm state directory overridable for
-// tests.
+// qmpSocketAt has the kvm state directory as a parameter so tests can point
+// it elsewhere; appsListToContract (the only production caller, via
+// appsListToContractAt) always passes qmpKvmStateDir.
 //
 // The path is reported only if the app has a virtual GPU behind it and the
 // socket exists. A name alone says nothing about whether the instance has a
@@ -97,9 +93,11 @@ func appsListToContractAt(apps []types.AppInstanceStatus, gpuModeDir, qmpDir str
 	out := monitorapi.AppsList{Instances: make([]monitorapi.AppInstance, 0, len(apps))}
 	for _, a := range apps {
 		key := a.UUIDandVersion.UUID.String()
-		mode := types.GPUModeFor(key)
+		var mode string
 		if gpuModeDir != "" {
 			mode = types.GPUModeRead(gpuModeDir, key)
+		} else {
+			mode = types.GPUModeFor(key)
 		}
 		// hasVirtualGPU is the operator's persisted mode-file choice, keyed
 		// by UUID - never DomainName, which is "" until the app activates -
