@@ -354,11 +354,24 @@ resolve_disk() {
 
    case "$WANT" in
       serial:*)
-         # awk, not `while read`: lsblk pads its columns, and the padding
-         # defeats a shell read that compares the trailing field. awk splits
-         # on whitespace, so the comparison is against the value itself.
+         # Straight out of sysfs, deliberately: no lsblk (which pads its
+         # columns), no awk (busybox's treats a numeric-looking -v value as a
+         # number, and these serials exceed 2^31), and no udev. Just files.
          SERIAL="${WANT#serial:}"
-         lsblk -dn -o NAME,SERIAL 2>/dev/null | awk -v s="$SERIAL" '$2 == s { print $1; exit }'
+         for D in /sys/block/*; do
+            N="${D##*/}"
+            [ -b "/dev/$N" ] || continue
+            S=""
+            [ -r "$D/serial" ] && S=$(cat "$D/serial" 2>/dev/null)
+            # NVMe hangs the serial off the controller, not the namespace.
+            [ -z "$S" ] && [ -r "$D/device/serial" ] && S=$(cat "$D/device/serial" 2>/dev/null)
+            # SATA and USB pad theirs.
+            S=$(printf '%s' "$S" | tr -d ' \t\r\n')
+            if [ "$S" = "$SERIAL" ]; then
+               echo "$N"
+               return 0
+            fi
+         done
          return 0
          ;;
    esac
