@@ -30,6 +30,9 @@ inherits = "release"
 lto = false
 opt-level = 2
 codegen-units = 16
+# Release profiles disable incremental compilation, which is right for what
+# ships and wrong here: without it every edit recompiles the whole crate.
+incremental = true
 
 [dependencies]
 crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", rev = "69249c88fed67ee917218dc7ccb8a866f391beed", version = "0.28.1", default-features = false, features = [
