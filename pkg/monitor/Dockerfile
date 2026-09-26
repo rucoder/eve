@@ -74,7 +74,13 @@ FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runtime
 # libgbm, libinput, libgcc_s and libc, and no shipped library dlopens it. It
 # reads evdev directly and puts the VT keyboard in K_OFF, so there is no
 # keymap to build.
-ENV PKGS="kbd pciutils usbutils mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs eudev-libs"
+# libxkbcommon is pulled in through smithay. The release profile's LTO was
+# eliding the reference, so the runtime got away without it; any build that
+# does not do whole-program LTO - the quick profile, for one - leaves a real
+# DT_NEEDED on libxkbcommon.so.0 and the console dies at startup with a
+# missing shared library. Ship it rather than depend on an optimisation to
+# make the dependency disappear.
+ENV PKGS="kbd pciutils usbutils mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs libxkbcommon eudev-libs"
 RUN eve-alpine-deploy.sh
 
 # The stage below copies /out/usr/lib (and part of /out/usr/share) wholesale,
