@@ -15,6 +15,20 @@ config:
     - /persist:/persist:rshared,rbind
 
   devices:
+    # Input. libinput opens /dev/input/event* directly (path backend, no udev
+    # seat). The /dev bind makes those nodes visible, but opening them is
+    # denied by the device cgroup unless the class is allowed here, and the
+    # failure is EPERM - not ENOENT - so it presents as a console with no
+    # keyboard and no pointer rather than as a missing device.
+    #
+    # linuxkit only understands a single node (path+major+minor) or a whole
+    # type via "all"; there is no "major 13, any minor". Enumerating
+    # event0..eventN would put an arbitrary cap on how many input devices a
+    # box may have, so take the class. This container already runs with 41
+    # capabilities including CAP_SYS_ADMIN, CAP_SYS_RAWIO and CAP_MKNOD, so
+    # the device cgroup is not a boundary that is holding anything back here.
+    - path: "all"
+      type: c
     - path: "/dev/tty"
       type: c
       major: 5
