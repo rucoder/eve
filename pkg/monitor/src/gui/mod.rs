@@ -80,7 +80,7 @@ fn spawn_vms(spec: &str) -> Vec<Vm> {
 /// shutdown - checked once per frame, next to `vt::running()`, which keeps
 /// meaning "the process itself is shutting down" and is untouched by a
 /// switch request.
-pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic::AtomicBool>, mode: Option<&str>) -> anyhow::Result<()> {
     let cfg = Config::from_env();
     // Held for the whole run; Drop puts the VT keyboard back.
     let _cad = vt::CtrlAltDelGuard::take();
@@ -89,7 +89,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
 
     let card = drm::pick_card(cfg.card.as_deref())?;
     let mut gpu = drm::open(&card)?;
-    let mut heads = drm::discover_heads(&mut gpu)?;
+    let mut heads = drm::discover_heads(&mut gpu, mode)?;
 
     // egui_glow painter sharing smithay's GL context.
     let gl: Arc<glow::Context> = gpu.renderer.with_context(|gl| gl.clone())?;

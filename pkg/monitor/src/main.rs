@@ -442,7 +442,7 @@ async fn main() -> Result<()> {
                     stop_watcher.clone(),
                 );
 
-                if let Err(e) = gui::run(client.state.clone(), switch.clone()) {
+                if let Err(e) = gui::run(client.state.clone(), switch.clone(), config.gui.mode.as_deref()) {
                     log::error!("Gui error: {e}");
                 }
                 stop_watcher.store(true, std::sync::atomic::Ordering::SeqCst);

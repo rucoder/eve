@@ -120,8 +120,10 @@ pub fn open(path: &str) -> anyhow::Result<Gpu> {
 
 /// Which mode to drive a connector at.
 ///
-/// `GUI_MODE=WxH` wins outright, so an operator can pin a resolution the
-/// connector offers but does not prefer.
+/// An explicit request wins outright, so an operator can pin a resolution the
+/// connector offers but does not prefer. It comes from `gui.mode` in
+/// /persist/monitor/config/config.json, or from `GUI_MODE=WxH` in the
+/// environment for a one-off run.
 ///
 /// Otherwise PREFERRED, *if* it means anything. A connector with no EDID has
 /// nothing to express a preference with, and the flag then sits on whatever
@@ -130,20 +132,22 @@ pub fn open(path: &str) -> anyhow::Result<Gpu> {
 /// mode in that case is what the user expects; honouring a fabricated
 /// preference is not. With a real EDID the panel's own preferred mode is
 /// authoritative and is used unchanged.
-fn pick_mode(c: &connector::Info, name: &str) -> Option<Mode> {
+fn pick_mode(c: &connector::Info, name: &str, want_mode: Option<&str>) -> Option<Mode> {
     let area = |m: &Mode| m.size().0 as u64 * m.size().1 as u64;
 
-    if let Ok(want) = std::env::var("GUI_MODE") {
+    let requested = want_mode.map(|m| m.to_string())
+        .or_else(|| std::env::var("GUI_MODE").ok());
+    if let Some(want) = requested {
         let want = want.trim().to_lowercase();
         if let Some(m) = c.modes().iter().find(|m| {
             format!("{}x{}", m.size().0, m.size().1) == want
         }) {
-            log::info!("{name}: mode {want} from GUI_MODE");
+            log::info!("{name}: mode {want} as configured");
             return Some(*m);
         }
         let offered: Vec<String> = c.modes().iter()
             .map(|m| format!("{}x{}", m.size().0, m.size().1)).collect();
-        log::warn!("{name}: GUI_MODE={want} is not offered; have {}", offered.join(" "));
+        log::warn!("{name}: configured mode {want} is not offered; have {}", offered.join(" "));
     }
 
     // A real display reports its physical size from EDID; virtio-gpu with no
@@ -165,7 +169,7 @@ fn pick_mode(c: &connector::Info, name: &str) -> Option<Mode> {
 }
 
 /// One head per connected connector.
-pub fn discover_heads(gpu: &mut Gpu) -> anyhow::Result<Vec<Head>> {
+pub fn discover_heads(gpu: &mut Gpu, want_mode: Option<&str>) -> anyhow::Result<Vec<Head>> {
     let res = gpu.drm.resource_handles()?;
     let mut heads = Vec::new();
     let mut used_crtcs: std::collections::HashSet<u32> = Default::default();
@@ -176,7 +180,7 @@ pub fn discover_heads(gpu: &mut Gpu) -> anyhow::Result<Vec<Head>> {
             continue;
         }
         let name = format!("{}-{}", c.interface().as_str(), c.interface_id());
-        let mode = pick_mode(&c, &name).ok_or_else(|| anyhow::anyhow!("{name}: no modes"))?;
+        let mode = pick_mode(&c, &name, want_mode).ok_or_else(|| anyhow::anyhow!("{name}: no modes"))?;
 
         // Prefer the CRTC already wired to this connector, but fall back to any
         // free one the encoder can drive. Requiring a pre-assigned CRTC fails

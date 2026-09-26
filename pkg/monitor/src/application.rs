@@ -38,11 +38,25 @@ use crate::ipc::monitorapi::{IpMode, SetInterfaceConfig, StaticIpConfig, RevertM
 use crate::terminal::TerminalWrapper;
 use crate::ui::action::{Action, UiActions};
 
+/// Graphical-console settings, persisted in the same config.json the TUI
+/// already uses. Everything here is optional so an existing config that
+/// predates the gui frontend still loads unchanged.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct GuiConfig {
+    /// Pin the DRM mode, e.g. "1920x1080". Unset means choose automatically:
+    /// the connector's preferred mode when it has an EDID to express one, and
+    /// the largest mode offered when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
     #[serde(skip)]
     config_path: PathBuf,
     pub log_level: String,
+    #[serde(default)]
+    pub gui: GuiConfig,
 }
 
 impl AppConfig {
@@ -53,6 +67,7 @@ impl AppConfig {
         Self {
             config_path: path.as_ref().to_path_buf(),
             log_level: "info".to_string(),
+            gui: GuiConfig::default(),
         }
     }
 
@@ -685,5 +700,37 @@ impl<'a> Application<'a> {
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// A config.json written before the gui frontend existed has no "gui" key
+    /// at all. It must still load, with the mode unset, or an upgrade would
+    /// drop the operator's log level and start from defaults.
+    #[test]
+    fn a_config_without_the_gui_section_still_loads() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"log_level":"debug"}"#).unwrap();
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.gui.mode, None);
+    }
+
+    /// And one that pins a mode round-trips it.
+    #[test]
+    fn a_pinned_mode_is_read_back() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"log_level":"info","gui":{"mode":"1920x1080"}}"#).unwrap();
+        assert_eq!(cfg.gui.mode.as_deref(), Some("1920x1080"));
+    }
+
+    /// An unset mode is not written back as an explicit null, so the file stays
+    /// readable by a build that predates this field.
+    #[test]
+    fn an_unset_mode_is_not_serialised() {
+        let cfg = AppConfig::new("/tmp/does-not-matter");
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("mode"), "got {json}");
     }
 }
