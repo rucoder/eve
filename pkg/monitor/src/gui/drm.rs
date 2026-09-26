@@ -17,7 +17,7 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, GbmBuffer
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::glow::GlowRenderer;
-use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, ModeTypeFlags};
+use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice, Mode, ModeTypeFlags};
 use smithay::utils::DeviceFd;
 
 pub type HeadSurface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
@@ -118,6 +118,52 @@ pub fn open(path: &str) -> anyhow::Result<Gpu> {
     Ok(Gpu { drm, gbm, renderer, raw_fd, _notifier })
 }
 
+/// Which mode to drive a connector at.
+///
+/// `GUI_MODE=WxH` wins outright, so an operator can pin a resolution the
+/// connector offers but does not prefer.
+///
+/// Otherwise PREFERRED, *if* it means anything. A connector with no EDID has
+/// nothing to express a preference with, and the flag then sits on whatever
+/// fallback the driver invented - virtio-gpu under QEMU advertises 640x480
+/// PREFERRED while also offering modes up to 5120x2160. Taking the largest
+/// mode in that case is what the user expects; honouring a fabricated
+/// preference is not. With a real EDID the panel's own preferred mode is
+/// authoritative and is used unchanged.
+fn pick_mode(c: &connector::Info, name: &str) -> Option<Mode> {
+    let area = |m: &Mode| m.size().0 as u64 * m.size().1 as u64;
+
+    if let Ok(want) = std::env::var("GUI_MODE") {
+        let want = want.trim().to_lowercase();
+        if let Some(m) = c.modes().iter().find(|m| {
+            format!("{}x{}", m.size().0, m.size().1) == want
+        }) {
+            log::info!("{name}: mode {want} from GUI_MODE");
+            return Some(*m);
+        }
+        let offered: Vec<String> = c.modes().iter()
+            .map(|m| format!("{}x{}", m.size().0, m.size().1)).collect();
+        log::warn!("{name}: GUI_MODE={want} is not offered; have {}", offered.join(" "));
+    }
+
+    // A real display reports its physical size from EDID; virtio-gpu with no
+    // EDID reports nothing, which is the signal that PREFERRED is fabricated.
+    let has_edid = c.size().map_or(false, |(w, h)| w > 0 && h > 0);
+    if !has_edid {
+        if let Some(m) = c.modes().iter().max_by_key(|m| area(m)) {
+            log::info!("{name}: no EDID, so PREFERRED is a driver default - taking the largest offered mode {}x{}",
+                       m.size().0, m.size().1);
+            return Some(*m);
+        }
+    }
+
+    c.modes()
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| c.modes().first())
+        .copied()
+}
+
 /// One head per connected connector.
 pub fn discover_heads(gpu: &mut Gpu) -> anyhow::Result<Vec<Head>> {
     let res = gpu.drm.resource_handles()?;
@@ -130,13 +176,7 @@ pub fn discover_heads(gpu: &mut Gpu) -> anyhow::Result<Vec<Head>> {
             continue;
         }
         let name = format!("{}-{}", c.interface().as_str(), c.interface_id());
-        let mode = c
-            .modes()
-            .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| c.modes().first())
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("{name}: no modes"))?;
+        let mode = pick_mode(&c, &name).ok_or_else(|| anyhow::anyhow!("{name}: no modes"))?;
 
         // Prefer the CRTC already wired to this connector, but fall back to any
         // free one the encoder can drive. Requiring a pre-assigned CRTC fails
