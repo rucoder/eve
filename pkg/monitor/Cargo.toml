@@ -20,6 +20,17 @@ lto = true          # Enable link-time optimization.
 # debug = "line-tables-only"
 # debuginfo = "packed"
 
+# Iteration profile. The release profile optimises for size and turns LTO on,
+# which relinks the whole program on every edit - fine for what ships, far too
+# slow for an edit/deploy loop against a device. Same musl target and the same
+# dynamic linking, so the binary is drop-in; it is just bigger and not
+# size-optimised. Do not ship it.
+[profile.quick]
+inherits = "release"
+lto = false
+opt-level = 2
+codegen-units = 16
+
 [dependencies]
 crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", rev = "69249c88fed67ee917218dc7ccb8a866f391beed", version = "0.28.1", default-features = false, features = [
     "event-stream",
