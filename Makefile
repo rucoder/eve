@@ -121,8 +121,11 @@ TAGPLAT=$(if $(filter-out generic,$(PLATFORM)),$(PLATFORM))
 # set this to the current tag only if we are building from a tag
 ROOTFS_VERSION:=$(if $(findstring snapshot,$(REPO_TAG)),$(EVE_SNAPSHOT_VERSION)-$(REPO_BRANCH)-$(REPO_SHA)$(REPO_DIRTY_TAG)$(DEV_TAG),$(REPO_TAG))
 
-#if KERNEL_TAG is set, append it to the ROOTFS_VERSION but replace docker.io/lfedge/eve-kernel:eve-kernel- part with k-
-SHORT_KERNEL_TAG=$(subst docker.io/lfedge/eve-kernel:eve-kernel-,k-,$(KERNEL_TAG))
+#if KERNEL_TAG is set, append it to the ROOTFS_VERSION but replace the
+# <registry>/<org>/eve-kernel:eve-kernel- part with k-. notdir drops the
+# registry and org so a kernel published under any namespace works, not just
+# lfedge; leaving the colon in would break the rule at ROOTFS_IMG_BASE.
+SHORT_KERNEL_TAG=$(subst eve-kernel:eve-kernel-,k-,$(notdir $(KERNEL_TAG)))
 ROOTFS_VERSION:=$(if $(SHORT_KERNEL_TAG),$(ROOTFS_VERSION)-$(SHORT_KERNEL_TAG),$(ROOTFS_VERSION))
 
 # For non-generic platforms, include the variant to the rootfs version
