@@ -251,13 +251,34 @@ impl Input {
     pub fn new(w: i32, h: i32) -> anyhow::Result<Self> {
         let mut li = Libinput::new_from_path(Iface);
         let mut n = 0;
+        let mut seen = 0;
         for e in std::fs::read_dir("/dev/input")? {
             let p = e?.path();
             if p.file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("event")) {
-                if li.path_add_device(p.to_str().unwrap()).is_some() { n += 1; }
+                seen += 1;
+                // libinput hands back a bare None when it refuses a device and
+                // its own diagnostics go nowhere unless a log handler is
+                // installed, so probe the node ourselves first: that separates
+                // "we cannot open it" (namespace, permissions) from "libinput
+                // refused it" (its own device checks), which otherwise look
+                // identical from here.
+                if let Err(err) = std::fs::File::open(&p) {
+                    log::warn!("libinput: {} not openable: {err}", p.display());
+                    continue;
+                }
+                if li.path_add_device(p.to_str().unwrap()).is_some() {
+                    n += 1;
+                } else {
+                    log::warn!("libinput: refused {} (opened fine, libinput said no)", p.display());
+                }
             }
         }
-        log::info!("libinput: {n} device(s) opened directly (no udev/logind/seat)");
+        if n == 0 && seen > 0 {
+            log::error!("libinput: no input devices usable out of {seen} event node(s) - keyboard and pointer will not work");
+        } else if seen == 0 {
+            log::error!("libinput: /dev/input has no event nodes - keyboard and pointer will not work");
+        }
+        log::info!("libinput: {n}/{seen} device(s) opened directly (no udev/logind/seat)");
         log::info!("pointer: raw 1:1, scale {}",
                  std::env::var("GUI_PTR_SCALE").unwrap_or_else(|_| "1.0".into()));
         Ok(Self {
