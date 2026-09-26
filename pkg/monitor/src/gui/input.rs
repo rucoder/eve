@@ -143,7 +143,12 @@ impl Handle {
 pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
     let state = std::sync::Arc::new(std::sync::Mutex::new(State {
         x: w as f64 / 2.0, y: h as f64 / 2.0,
-        view: (0.0, 0.0, w as f32, h as f32),
+        // Empty until the render loop publishes a real guest viewport. Not the
+        // whole screen: in_view() drives click-to-grab, and a full-screen
+        // default means any click grabs into a guest that may not exist - the
+        // pointer then routes nowhere and looks like it vanished, with no way
+        // back except the release chord.
+        view: (0.0, 0.0, 0.0, 0.0),
         ..Default::default()
     }));
     let active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>> =
@@ -289,7 +294,7 @@ impl Input {
             stats: Default::default(),
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
-            view: (0.0, 0.0, w as f32, h as f32), guest_size: (0, 0), abs_n: 0, want_tab: None,
+            view: (0.0, 0.0, 0.0, 0.0), guest_size: (0, 0), abs_n: 0, want_tab: None,
         })
     }
 
@@ -383,8 +388,11 @@ impl Input {
                         // Click inside the guest view GRABS, as in virt-manager
                         // and every other VM viewer. RightCtrl releases. A
                         // hidden-hotkey-only grab is undiscoverable.
+                        // guest_size gates this as well as in_view: a tab can
+                        // exist before its first scanout arrives, and grabbing
+                        // into a guest with no image routes the pointer nowhere.
                         if self.focus == Focus::Gui && down && q == Some(0)
-                            && self.in_view() {
+                            && self.in_view() && self.guest_size != (0, 0) {
                             self.focus = Focus::Guest;
                             self.held.clear();
                             log::debug!("focus -> Guest (clicked in guest view)");
