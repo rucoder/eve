@@ -42,7 +42,7 @@ FROM toolchain AS cacher
 WORKDIR /app
 COPY --from=planer /app/recipe.json recipe.json
 # build the dependencies
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --profile quick --recipe-path recipe.json
 
 # building the final image
 FROM toolchain AS builder
@@ -55,9 +55,12 @@ COPY --from=cacher /app/target /app/target
 COPY --from=cacher $CARGO_HOME $CARGO_HOME
 RUN echo "Cargo target: $CARGO_BUILD_TARGET"
 
-RUN cargo build --release
+# TEMPORARY, for POC iteration: the quick profile drops LTO and size
+# optimisation, which cuts the build substantially. Revert to --release before
+# this ships - see [profile.quick] in Cargo.toml.
+RUN cargo build --profile quick
 RUN cargo sbom > sbom.spdx.json
-RUN cp "/app/target/$CARGO_BUILD_TARGET/release/monitor" /app/target/
+RUN cp "/app/target/$CARGO_BUILD_TARGET/quick/monitor" /app/target/
 # Single source of truth for the version: the crate manifest.
 RUN awk -F'"' '/^version = / {print $2; exit}' Cargo.toml > /app/monitor-version.txt
 
