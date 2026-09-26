@@ -314,8 +314,11 @@ QEMU_OPTS_NO_DISPLAY=-display none
 # gtk,gl=on: the window goes to $DISPLAY, so X11 forwarding over ssh shows it
 # exactly as it does locally. gl=on is what gives the guest virgl.
 QEMU_GUI_DISPLAY?=gtk,gl=on
-QEMU_OPTS_VGA_DISPLAY_amd64=-device virtio-vga-gl -display $(QEMU_GUI_DISPLAY) \
-    -usb -device usb-tablet -device usb-kbd
+# -vga none is load-bearing: q35 adds a default std VGA of its own, so without
+# it the guest gets TWO display devices (and two DRM cards) alongside
+# virtio-vga-gl, which confuses firmware and the guest's card selection.
+QEMU_OPTS_VGA_DISPLAY_amd64=-vga none -device virtio-vga-gl -display $(QEMU_GUI_DISPLAY) \
+    -device qemu-xhci,id=guiusb -device usb-tablet,bus=guiusb.0 -device usb-kbd,bus=guiusb.0
 QEMU_OPTS_VGA_DISPLAY_arm64=-device virtio-gpu-gl-pci -display $(QEMU_GUI_DISPLAY) \
     -usb -device usb-ehci,id=ehci -device usb-kbd,bus=ehci.0 -device usb-tablet,bus=ehci.0
 QEMU_OPTS_VGA_DISPLAY_riscv64=-vga std
