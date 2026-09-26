@@ -62,7 +62,7 @@ RUN cp "/app/target/$CARGO_BUILD_TARGET/release/monitor" /app/target/
 RUN awk -F'"' '/^version = / {print $2; exit}' Cargo.toml > /app/monitor-version.txt
 
 
-FROM lfedge/eve-alpine:ef20bcb617db5545765f4d7486621cf606e5595e AS runtime
+FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runtime
 # mesa-dri-gallium carries the iris driver used by Gen12+ Intel graphics, which
 # is what the gui frontend's EGL/GBM path needs at runtime; without it EGL
 # falls back to software or fails outright.
