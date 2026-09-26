@@ -337,11 +337,23 @@ else
   echo "$SMART_JSON" > $SMART_DETAILS_PREVIOUS_FILE
 fi
 
-# Uncomment the following block if you want storage-init to replace
-# rootfs of service containers with a copy under /persist/services/X
-# each of these is considered to be a proper lowerFS
-# for s in "$PERSISTDIR"/services/* ; do
-#   if [ -d "$s" ]; then
-#      mount --bind "$s" "/containers/services/$(basename "$s")/lower"
-#   fi
-# done
+# A service whose rootfs is staged under /persist/services/<name> runs from
+# there instead of the copy baked into the read-only rootfs. Nothing is staged
+# by default, so this is a no-op on a normal device: the glob matches nothing
+# and the -d test fails.
+#
+# It exists so a service can be iterated on without rebuilding and reflashing
+# the image. Populate it once from the baked copy, e.g.
+#
+#   mkdir -p /persist/services
+#   cp -a /containers/services/monitor/lower /persist/services/monitor
+#
+# then replace files under /persist/services/monitor and restart the service.
+# The bind is established here at boot, so staging a new service needs one
+# reboot; replacing a binary inside an already-bound directory does not.
+for s in "$PERSISTDIR"/services/* ; do
+  if [ -d "$s" ]; then
+     echo "storage-init: running $(basename "$s") from $s"
+     mount --bind "$s" "/containers/services/$(basename "$s")/lower"
+  fi
+done
