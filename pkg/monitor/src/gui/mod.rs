@@ -453,7 +453,12 @@ pub fn run(
                     );
                 }
                 want.previous = None;
-                match interface_request(&want) {
+                let live_ntp = ports
+                    .iter()
+                    .find(|p| p.name == want.iface)
+                    .map(|p| p.ntp.join(", "))
+                    .unwrap_or_default();
+                match interface_request(&want, &live_ntp) {
                     Ok(msg) => {
                         log::info!("net: applying {} ({})", want.iface,
                                    if want.dhcp { "dhcp" } else { "static" });
@@ -663,7 +668,10 @@ fn reconcile_tabs(
 /// Turn a filled-in dialog into the request pillar already understands. Parse
 /// failures are an error rather than a default: a silently-dropped field here
 /// is a node that answers on an address nobody expects.
-fn interface_request(e: &ui::PortEdit) -> anyhow::Result<crate::ipc::message::IpcMessage> {
+fn interface_request(
+    e: &ui::PortEdit,
+    live_ntp: &str,
+) -> anyhow::Result<crate::ipc::message::IpcMessage> {
     use crate::ipc::monitorapi::{IpMode, ProxySettings, SetInterfaceConfig, StaticIpConfig};
     let ip = if e.dhcp {
         IpMode::Dhcp
@@ -688,13 +696,21 @@ fn interface_request(e: &ui::PortEdit) -> anyhow::Result<crate::ipc::message::Ip
             },
         }
     };
-    let ntp = e
-        .ntp
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    // Only send NTP when the operator actually changed it. What the page
+    // shows is what pillar reports, which already includes whatever DHCP
+    // supplied; sending that back makes it a manual override that pillar then
+    // adds to the DHCP list again, so the field grew by one copy of itself on
+    // every apply. Unchanged means "no opinion", which is an empty list.
+    let edited = e.ntp.trim() != live_ntp.trim();
+    let mut ntp: Vec<String> = Vec::new();
+    if edited {
+        for host in e.ntp.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            // Defensive: the operator may paste a list that already repeats.
+            if !ntp.iter().any(|h| h == host) {
+                ntp.push(host.to_string());
+            }
+        }
+    }
     Ok(crate::ipc::message::IpcMessage::new_request(
         crate::ipc::message::Request::SetInterfaceConfig(SetInterfaceConfig {
             iface: e.iface.clone(),
