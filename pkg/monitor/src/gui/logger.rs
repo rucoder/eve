@@ -39,10 +39,47 @@ enum Msg {
     Sync(Sender<()>),
 }
 
+/// Level for our own code, as a `LevelFilter as usize`. Atomic because
+/// pillar changes it at runtime (`TUIConfig`) from the IPC thread while the
+/// render and input threads are logging.
+static OURS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(
+    log::LevelFilter::Info as usize,
+);
+
+/// What `log` calls a record from this crate. `module_path!()` here is
+/// `monitor::gui::logger`, so the crate name is everything before the first
+/// `::` - taking it from the source rather than spelling it out, because
+/// spelling it out is how this came to read "eve_gui" and quietly judge every
+/// one of our own records by the dependency filter.
+fn ours_prefix() -> &'static str {
+    module_path!().split("::").next().unwrap_or("monitor")
+}
+
+/// Set the level for our own code. Dependencies keep whatever they were given
+/// at startup: a request for debug output from us is not a request for every
+/// EGL span from smithay, and at trace those alone fill the log's byte cap in
+/// about two minutes, taking the history with them.
+pub fn set_ours(level: log::LevelFilter) {
+    OURS.store(level as usize, std::sync::atomic::Ordering::Relaxed);
+    let deps = LOGGER.get().map_or(log::LevelFilter::Warn, |l| l.deps);
+    log::set_max_level(level.max(deps));
+}
+
+fn ours_level() -> log::LevelFilter {
+    match OURS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => log::LevelFilter::Off,
+        1 => log::LevelFilter::Error,
+        2 => log::LevelFilter::Warn,
+        3 => log::LevelFilter::Info,
+        4 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    }
+}
+
 struct Async {
     tx: Sender<Msg>,
     start: std::time::Instant,
-    /// Level for our own code.
+    /// Startup level for our own code; the live value is in `OURS`.
     ours: log::LevelFilter,
     /// Level for everything else. smithay and friends log through `tracing`,
     /// which bridges into this logger and is extremely chatty at info - every
@@ -56,7 +93,7 @@ impl log::Log for Async {
     fn enabled(&self, m: &log::Metadata) -> bool {
         // Must be checked here, not left to max_level: the tracing bridge calls
         // enabled() itself, so a permissive answer leaks library TRACE records.
-        let lim = if m.target().starts_with("eve_gui") { self.ours } else { self.deps };
+        let lim = if m.target().starts_with(ours_prefix()) { ours_level() } else { self.deps };
         m.level() <= lim
     }
     fn flush(&self) {}
@@ -179,6 +216,7 @@ pub fn init() {
 
     let me = Async { tx, start: std::time::Instant::now(), ours, deps };
     if LOGGER.set(me).is_err() { return; }
+    OURS.store(ours as usize, std::sync::atomic::Ordering::Relaxed);
     let _ = log::set_logger(LOGGER.get().unwrap());
     // The coarse gate the macros check first; enabled() then splits ours/deps.
     log::set_max_level(ours.max(deps));

@@ -500,6 +500,10 @@ impl Input {
                         if self.focus == Focus::Gui && down && q == Some(0)
                             && self.in_view() && self.guest_size != (0, 0) {
                             self.focus = Focus::Guest;
+                            // Nothing may be held from a previous grab, and
+                            // the guest may still hold keys we never saw
+                            // released. Tell it about both.
+                            self.release_modifiers();
                             self.held.clear();
                             log::debug!("focus -> Guest (clicked in guest view)");
                             self.swallow_release = q;
@@ -555,6 +559,7 @@ impl Input {
                     if down && self.ctrl && self.alt && (2..=10).contains(&code) {
                         self.want_tab = Some((code - 2) as usize);
                         self.release_held();   // no stuck modifiers in the old VM
+                        self.release_modifiers();
                         continue;
                     }
                     if code == 34 && down && self.ctrl && self.alt {
@@ -562,18 +567,46 @@ impl Input {
                         if self.last_toggle.map_or(true, |t| now.duration_since(t).as_millis() > 250) {
                             self.last_toggle = Some(now);
                             if self.focus == Focus::Guest { self.release_held(); }
+                            self.release_modifiers();
                             self.focus = match self.focus { Focus::Gui => Focus::Guest, _ => Focus::Gui };
                             log::debug!("focus -> {:?} (ctrl+alt+g)", self.focus);
                         }
                         continue;   // never forwarded
                     }
                     if self.focus == Focus::Guest {
-                        if down { self.held.insert(code); } else { self.held.remove(&code); }
+                        if down {
+                            // A second press with no release in between means
+                            // the release never reached us - seen with Meta
+                            // from a KVM's HID, where the key-up is simply
+                            // absent. Without this the guest holds the
+                            // modifier for ever and the next letter becomes a
+                            // chord: "powershell" typed after a Meta tap
+                            // fired Win+E, Win+R and finally Win+L, locking
+                            // the box.
+                            if !self.held.insert(code) {
+                                log::debug!("key {code}: pressed while still held; releasing first");
+                                self.guest.push(GuestAct::Key(code, false));
+                            }
+                        } else {
+                            self.held.remove(&code);
+                        }
                         self.guest.push(GuestAct::Key(code, down));
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Send key-up for every modifier, held or not, so the guest cannot be
+    /// left with one latched by a release that never arrived. Cheap: eight
+    /// key-ups, and a key-up for a key that is already up is a no-op in every
+    /// guest OS.
+    fn release_modifiers(&mut self) {
+        // L/R: ctrl, shift, alt, meta.
+        for code in [29u32, 97, 42, 54, 56, 100, 125, 126] {
+            self.held.remove(&code);
+            self.guest.push(GuestAct::Key(code, false));
         }
     }
 
@@ -608,7 +641,7 @@ impl Input {
             Focus::Guest => { if let Some((gx, gy)) = self.to_guest() {
                 self.abs_n += 1;
                 if self.abs_n % 30 == 1 {
-                    log::debug!("ABS host={:.0},{:.0} -> guest={gx},{gy} (view {:.0},{:.0} {:.0}x{:.0} gs={}x{})",
+                    log::trace!("ABS host={:.0},{:.0} -> guest={gx},{gy} (view {:.0},{:.0} {:.0}x{:.0} gs={}x{})",
                              self.x, self.y, self.view.0, self.view.1, self.view.2, self.view.3,
                              self.guest_size.0, self.guest_size.1);
                 }
@@ -648,7 +681,7 @@ impl Input {
             });
             return;
         }
-        log::debug!("scroll v120 dx={dx120} dy={dy120} acc={:?}", self.scroll_acc);
+        log::trace!("scroll v120 dx={dx120} dy={dy120} acc={:?}", self.scroll_acc);
         self.scroll_acc.0 += dx120;
         self.scroll_acc.1 += dy120;
         for _ in 0..(self.scroll_acc.1.abs() / 120.0) as i32 {

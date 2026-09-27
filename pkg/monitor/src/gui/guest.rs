@@ -79,7 +79,7 @@ impl Listener {
         let t0 = *self.t0.get_or_insert_with(std::time::Instant::now);
         if self.n % 120 == 0 {
             let secs = t0.elapsed().as_secs_f64();
-            log::debug!("{} updates in {:.1}s = {:.1}/s (last damage {w}x{h})",
+            log::trace!("{} updates in {:.1}s = {:.1}/s (last damage {w}x{h})",
                       self.n, secs, self.n as f64 / secs);
         }
     }
@@ -185,7 +185,7 @@ impl Listener {
         }
         g.seq += 1;
         if g.seq % 60 == 0 {
-            log::debug!("UpdateDMABUF #{} +{x}+{y} {w}x{h}", g.seq);
+            log::trace!("UpdateDMABUF #{} +{x}+{y} {w}x{h}", g.seq);
         }
     }
     async fn cursor_define(&mut self, width: i32, height: i32, hot_x: i32, hot_y: i32,

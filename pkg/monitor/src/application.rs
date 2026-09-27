@@ -253,7 +253,7 @@ impl<'a> Application<'a> {
                         warn!("Invalid log level: {}", e);
                     },
                     |log_level| {
-                        log::set_max_level(log_level);
+                        crate::gui::logger::set_ours(log_level);
                         info!("Log level set to: {:?}", log::max_level());
                     },
                 );
