@@ -18,11 +18,44 @@ use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::glow::GlowRenderer;
-use smithay::backend::renderer::{Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer};
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer,
+};
 use smithay::utils::{Rectangle, Transform};
 
 use crate::gui::guest;
 use crate::gui::input::GuestAct;
+
+/// The same memory layout, with the fourth byte marked "don't care".
+///
+/// A scanout has nothing behind it: it is what a display controller puts on
+/// its primary plane, and QEMU's own GL path blits it with
+/// `glBlitFramebuffer` (`ui/egl-helpers.c`), which by specification cannot
+/// blend. Its alpha byte is therefore never composited by anyone.
+///
+/// The fourcc QEMU hands us says nothing to the contrary: on the D-Bus path it
+/// comes from `eglExportDMABUFImageQueryMESA`, i.e. Mesa describing the buffer
+/// it allocated, not a claim that the alpha channel carries transparency. A
+/// guest that leaves that byte at zero - Linux fbcon does, and so do most
+/// compositors on their scanout - would otherwise import as fully transparent
+/// and blend away to whatever the blit target already held.
+///
+/// Channel order, bit depth and stride are untouched; only `has_alpha`
+/// changes, which is what decides whether smithay blends the blit or copies
+/// it.
+fn opaque(fc: Fourcc) -> Fourcc {
+    match fc {
+        Fourcc::Argb8888 => Fourcc::Xrgb8888,
+        Fourcc::Abgr8888 => Fourcc::Xbgr8888,
+        Fourcc::Rgba8888 => Fourcc::Rgbx8888,
+        Fourcc::Bgra8888 => Fourcc::Bgrx8888,
+        Fourcc::Argb2101010 => Fourcc::Xrgb2101010,
+        Fourcc::Abgr2101010 => Fourcc::Xbgr2101010,
+        // Anything else is already opaque, or a layout whose alpha we have no
+        // X twin for: leave it exactly as QEMU described it.
+        other => other,
+    }
+}
 
 /// One tab: a guest, its input channel, and its framebuffer state.
 pub struct Vm {
@@ -57,6 +90,18 @@ pub struct Vm {
     pub dma_flip: bool,
     dma_tex: Option<GlesTexture>,
     dma_2d: Option<GlesTexture>,
+    /// The `(fourcc, modifier)` of the last buffer we imported, so a guest
+    /// that switches format mid-session - starting a real GUI on top of
+    /// fbcon, a compositor moving to a tiled modifier - says so in the log
+    /// once, instead of either never or on every frame. A guest that rotates
+    /// buffers imports constantly (see `dma_cache`), so this cannot be logged
+    /// per import.
+    dma_format: Option<(u32, u64)>,
+    /// What QEMU last described, and what the readback last found, for the
+    /// status line. Kept here because a log level is set by pillar at runtime
+    /// (`TUIConfig`) and can hide a `debug!` exactly when it is needed.
+    pub desc: Option<GuestDesc>,
+    pub probe_nonblack: Option<(usize, usize)>,
     /// Imported scanout textures, keyed by dma-buf identity.
     ///
     /// An installed GNOME sends a NEW `ScanoutDMABUF` every frame because it
@@ -74,6 +119,15 @@ pub struct Vm {
     /// stale pixels on screen, nothing logged, and nothing that recovers short
     /// of a resize.
     dma_cache: HashMap<BufferKey, (GlesTexture, Dmabuf)>,
+}
+
+/// What QEMU said the scanout buffer is, for the status line.
+#[derive(Clone, Copy)]
+pub struct GuestDesc {
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub stride: u32,
+    pub y0_top: bool,
 }
 
 /// More buffers than any sane compositor rotates; a resize also clears it.
@@ -113,6 +167,9 @@ impl Vm {
             dma_flip: false,
             dma_tex: None,
             dma_2d: None,
+            dma_format: None,
+            desc: None,
+            probe_nonblack: None,
             dma_cache: HashMap::new(),
         }
     }
@@ -151,6 +208,13 @@ impl Vm {
         let new_size = egui::vec2(d.w as f32, d.h as f32);
         let resized = self.dma_size != new_size;
 
+        self.desc = Some(GuestDesc {
+            fourcc: d.fourcc,
+            modifier: d.modifier,
+            stride: d.stride,
+            y0_top: d.y0_top,
+        });
+
         let key = BufferKey {
             ino: d.ino,
             w: d.w,
@@ -168,7 +232,7 @@ impl Vm {
                 let built = Fourcc::try_from(d.fourcc).ok().and_then(|fc| {
                     let mut b = Dmabuf::builder(
                         (d.w as i32, d.h as i32),
-                        fc,
+                        opaque(fc),
                         Modifier::from(d.modifier),
                         DmabufFlags::empty(),
                     );
@@ -180,6 +244,19 @@ impl Vm {
                 });
                 match imported {
                     Some((t, buf)) => {
+                        let fmt = (d.fourcc, d.modifier);
+                        if self.dma_format != Some(fmt) {
+                            self.dma_format = Some(fmt);
+                            // Both the declared fourcc and what we import it
+                            // as: they differ whenever `opaque` rewrote an
+                            // alpha format, and that rewrite is the whole
+                            // reason a guest's pixels are visible at all.
+                            let as_ = Fourcc::try_from(d.fourcc).map(opaque);
+                            log::info!(
+                                "scanout format {}x{} fourcc=0x{:08x} -> {:?} mod=0x{:x}",
+                                d.w, d.h, d.fourcc, as_, d.modifier
+                            );
+                        }
                         if resized || self.dma_cache.is_empty() {
                             log::info!("imported scanout dmabuf {}x{} zero-copy", d.w, d.h);
                         } else {
@@ -285,8 +362,26 @@ impl Vm {
         if self.dma_2d.is_none() {
             let sz = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((w, h));
             match Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, sz) {
-                Ok(t) => {
+                Ok(mut t) => {
                     set_sampler_params(renderer, t.tex_id());
+                    // A fresh offscreen holds whatever the driver last left in
+                    // that memory. Every pixel the blit below does not write
+                    // stays as it is, so an import that silently contributes
+                    // nothing - which is exactly what an alpha-zero scanout
+                    // used to do - shows that garbage rather than a blank
+                    // screen, and reads as a hardware fault instead of a bug
+                    // in here. Start it opaque black.
+                    let psz = smithay::utils::Size::<i32, smithay::utils::Physical>::from((w, h));
+                    let cleared = (|| -> anyhow::Result<()> {
+                        let mut fb = renderer.bind(&mut t)?;
+                        let mut fr = renderer.render(&mut fb, psz, Transform::Normal)?;
+                        fr.clear(Color32F::BLACK, &[Rectangle::from_size(psz)])?;
+                        let _ = fr.finish()?;
+                        Ok(())
+                    })();
+                    if let Err(e) = cleared {
+                        log::warn!("clearing the blit target failed: {e}");
+                    }
                     self.dma_2d = Some(t);
                 }
                 Err(e) => {
@@ -305,6 +400,17 @@ impl Vm {
         let src = Rectangle::from_size(smithay::utils::Size::<f64, smithay::utils::Buffer>::from(
             (w as f64, h as f64),
         ));
+        // Keep the target's alpha at the opaque value it was cleared to.
+        //
+        // The scanout's fourth byte is an X, not an A: virtio-gpu declares
+        // XBGR8888 and the guest leaves that byte at zero (Linux fbcon paints
+        // 0x01010100 for its background and 0xcccccc00 for its text). This
+        // target has to be Abgr8888 - egui_glow's shader needs a plain
+        // sampler2D, which an external OES texture cannot give it - so a copy
+        // that carries the source's fourth byte lands a zero in the channel
+        // egui blends by, and every guest pixel vanishes. Masking alpha off
+        // for the blit keeps the copy to colour only.
+        alpha_writes(renderer, false);
         let blit = (|| -> anyhow::Result<()> {
             let mut fb = renderer.bind(target)?;
             let mut fr = renderer.render(&mut fb, psz, Transform::Normal)?;
@@ -312,13 +418,16 @@ impl Vm {
             let _ = fr.finish()?;
             Ok(())
         })();
+        // Unconditionally, including on the error path: the mask is global GL
+        // state, and leaving it off would silently break every later draw.
+        alpha_writes(renderer, true);
         if let Err(e) = blit {
             log::error!("blit ext->2d failed: {e}");
             return;
         }
 
         if probe && frame % 120 == 1 {
-            probe_target(renderer, target, w, h);
+            self.probe_nonblack = probe_target(renderer, target, w, h);
         }
         if self.dma_id.is_none() {
             let id = target.tex_id();
@@ -341,6 +450,17 @@ impl Vm {
         self.dma_cache.clear();
         self.dma_id = None;
     }
+}
+
+/// Turn writes to the alpha channel on or off for whatever is drawn next.
+///
+/// Used to protect the blit target's opaque alpha from the scanout's X byte;
+/// see `blit_external`. Colour writes are left enabled either way.
+fn alpha_writes(renderer: &mut GlowRenderer, on: bool) {
+    let _ = renderer.with_context(|gl| unsafe {
+        use glow::HasContext as _;
+        gl.color_mask(true, true, true, on);
+    });
 }
 
 /// A fresh GL texture defaults to `MIN_FILTER = NEAREST_MIPMAP_LINEAR`, which
@@ -368,8 +488,13 @@ fn set_sampler_params(renderer: &mut GlowRenderer, tex_id: u32) {
 /// This exists because QMP `screendump` returns "no surface" once the scanout
 /// is a dmabuf, so it is the only way to answer "is there anything in the
 /// buffer at all" on the GL path. Enable with `GUI_PROBE=1`.
-fn probe_target(renderer: &mut GlowRenderer, target: &mut GlesTexture, w: i32, h: i32) {
-    let Ok(fb) = renderer.bind(target) else { return };
+fn probe_target(
+    renderer: &mut GlowRenderer,
+    target: &mut GlesTexture,
+    w: i32,
+    h: i32,
+) -> Option<(usize, usize)> {
+    let fb = renderer.bind(target).ok()?;
     let rect = Rectangle::from_size(smithay::utils::Size::<i32, smithay::utils::Buffer>::from((w, h)));
     match renderer.copy_framebuffer(&fb, rect, Fourcc::Abgr8888) {
         Ok(map) => match renderer.map_texture(&map) {
@@ -378,10 +503,16 @@ fn probe_target(renderer: &mut GlowRenderer, target: &mut GlesTexture, w: i32, h
                     .chunks(4)
                     .filter(|c| c[0] as u32 + c[1] as u32 + c[2] as u32 > 30)
                     .count();
-                log::debug!("PROBE blit target {w}x{h}: {nz} / {} non-black px", px.len() / 4);
+                let total = px.len() / 4;
+                // info, not debug: pillar sets the level at runtime, and a
+                // probe that only speaks at debug is silent in the one
+                // situation it exists for.
+                log::info!("PROBE blit target {w}x{h}: {nz} / {total} non-black px");
+                return Some((nz, total));
             }
-            Err(e) => log::debug!("PROBE map_texture failed: {e}"),
+            Err(e) => log::info!("PROBE map_texture failed: {e}"),
         },
-        Err(e) => log::debug!("PROBE copy_framebuffer failed: {e}"),
+        Err(e) => log::info!("PROBE copy_framebuffer failed: {e}"),
     }
+    None
 }

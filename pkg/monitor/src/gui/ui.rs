@@ -18,6 +18,35 @@ pub struct GuestView<'a> {
     pub seq: u64,
     /// Updates that arrived with no scanout - the guest's display is asleep.
     pub orphan_updates: u64,
+    /// What QEMU said this buffer is. On screen because a wrong format shows
+    /// up as a blank tab, which looks identical to a guest that is not
+    /// drawing - and the logs that would tell them apart are at whatever
+    /// level pillar last set.
+    pub desc: Option<crate::gui::scanout::GuestDesc>,
+    /// Non-black pixels the readback last found in the blit target, when
+    /// GUI_PROBE is on: the one fact that separates "we sampled nothing" from
+    /// "the guest drew nothing".
+    pub probe_nonblack: Option<(usize, usize)>,
+}
+
+/// The pixel format, tiling and readback of the active guest's buffer, as a
+/// suffix for the status line. Empty when there is nothing to say yet.
+fn guest_detail(g: &GuestView<'_>) -> String {
+    let Some(d) = g.desc else { return String::new() };
+    let fourcc = d.fourcc.to_le_bytes();
+    let name: String = fourcc.iter().map(|&c| c as char).collect();
+    let probe = match g.probe_nonblack {
+        Some((nz, total)) => format!("  ·  {nz}/{total} non-black"),
+        None => String::new(),
+    };
+    format!(
+        "  ·  {name} (0x{:08x}) mod=0x{:x} stride={} y0={}{}",
+        d.fourcc,
+        d.modifier,
+        d.stride,
+        if d.y0_top { "top" } else { "bottom" },
+        probe,
+    )
 }
 
 /// A hardware cursor the guest published, for us to draw locally.
@@ -133,8 +162,11 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
             ui.separator();
             ui.label(match (f.guest.tex, f.guest.dma_id) {
                 (_, Some(_)) => format!(
-                    "guest: {}x{} dmabuf zero-copy (frame {})",
-                    f.guest.dma_size.x, f.guest.dma_size.y, f.guest.seq
+                    "guest: {}x{} dmabuf zero-copy (frame {}){}",
+                    f.guest.dma_size.x,
+                    f.guest.dma_size.y,
+                    f.guest.seq,
+                    guest_detail(&f.guest),
                 ),
                 (Some(t), _) => {
                     format!("guest: {}x{} copy (frame {})", t.size()[0], t.size()[1], f.guest.seq)

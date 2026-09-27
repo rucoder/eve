@@ -314,6 +314,8 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                             tex: vm.tex.as_ref(),
                             seq: vm.seq,
                             orphan_updates: orphans,
+                            desc: vm.desc,
+                            probe_nonblack: vm.probe_nonblack,
                         },
                         None => ui::GuestView {
                             dma_id: None,
@@ -322,6 +324,8 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                             tex: None,
                             seq: 0,
                             orphan_updates: 0,
+                            desc: None,
+                            probe_nonblack: None,
                         },
                     },
                     // Only when the ACTIVE guest published one: a guest that
