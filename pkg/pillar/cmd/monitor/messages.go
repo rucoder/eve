@@ -47,6 +47,24 @@ func (ctx *monitor) sendDeviceStatus() {
 	ctx.IPCServer.sendIpcMessage("DeviceStatus", ds)
 }
 
+// sendNetworkStatus emits the current network snapshot straight from the
+// subscription's cache. handleNetworStatusUpdate only fires on change, so
+// without this a client that connects between changes never learns the
+// network state at all.
+func (ctx *monitor) sendNetworkStatus() {
+	sub, ok := ctx.subscriptions["NetworkStatus"]
+	if !ok || sub == nil {
+		return
+	}
+	for _, item := range sub.GetAll() {
+		status, ok := item.(types.DeviceNetworkStatus)
+		if !ok {
+			continue
+		}
+		ctx.IPCServer.sendIpcMessage("NetworkStatus", deviceNetworkStatusToContract(status))
+	}
+}
+
 func (ctx *monitor) getAppInstancesStatus() []types.AppInstanceStatus {
 	sub := ctx.subscriptions["AppStatus"]
 	items := sub.GetAll()

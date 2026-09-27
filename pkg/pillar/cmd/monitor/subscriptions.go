@@ -435,9 +435,20 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 func (ctx *monitor) handleClientConnected() {
 	log.Noticef("Client connected")
 
-	// A new client needs the current state, every time.
+	// A new client needs the current state, every time. Everything below is
+	// pushed from a pubsub handler the rest of the time, so a console that
+	// connects between changes - which is every console restart on an idle
+	// device - would otherwise show an empty node page until something
+	// upstream happened to change.
+	//
+	// sendDeviceStatus dedups against the last snapshot it sent, and that
+	// dedup is for the change-driven path only: a reconnecting client holds
+	// no state, so the snapshot it needs is by definition "changed" for it.
+	// Clear the dedup first or the resend below is silently dropped.
+	ctx.lastDeviceStatus = nil
 	ctx.sendDeviceStatus()
 	ctx.sendAppsList()
+	ctx.sendNetworkStatus()
 
 	// Activating, on the other hand, happens once for the life of the agent.
 	// Subscription.Activate() ends in Subscriber.Start(), which spawns a fresh
