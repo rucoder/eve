@@ -42,6 +42,17 @@ ssh -o StrictHostKeyChecking=no "$HOST" '
   mountpoint -q /containers/services/monitor/lower || { echo "bind not active - reboot once after staging"; exit 1; }
   cp /tmp/monitor.new /persist/services/monitor/sbin/monitor
   chmod +x /persist/services/monitor/sbin/monitor
+  # Kill the wrapper, not just the binary. monitor-wrapper.sh runs
+  # /sbin/monitor and then blocks on a read so a human can see panic output;
+  # with only the binary killed that read waits forever on an unattended tty2,
+  # openvt never returns, and run-monitor.sh never loops round to restart.
+  pkill -f "/sbin/monitor-wrapper.sh" || true
   pkill -f "^/sbin/monitor$" || true
-  echo "swapped; run-monitor.sh restarts it"
+  i=0
+  while [ $i -lt 20 ]; do
+    sleep 2
+    if pgrep -f "^/sbin/monitor$" >/dev/null; then echo "CONSOLE_BACK_UP"; exit 0; fi
+    i=$((i+1))
+  done
+  echo "CONSOLE_DID_NOT_RESTART - check /persist/monitor/log"; exit 1
 '
