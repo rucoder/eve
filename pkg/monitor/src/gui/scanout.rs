@@ -26,6 +26,18 @@ use smithay::utils::{Rectangle, Transform};
 use crate::gui::guest;
 use crate::gui::input::GuestAct;
 
+/// How `opaque` rewrites a fourcc, as a name for the status page.
+pub fn opaque_name(fourcc: u32) -> String {
+    match Fourcc::try_from(fourcc) {
+        Ok(fc) => {
+            let o = opaque(fc);
+            let n: String = (o as u32).to_le_bytes().iter().map(|&c| c as char).collect();
+            if o == fc { format!("{n} (unchanged)") } else { n }
+        }
+        Err(_) => "unknown to drm-fourcc".to_string(),
+    }
+}
+
 /// The same memory layout, with the fourth byte marked "don't care".
 ///
 /// A scanout has nothing behind it: it is what a display controller puts on

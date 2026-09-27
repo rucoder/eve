@@ -187,7 +187,7 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     if f.node_tab {
-        node_page(ui, &f.node, &f.display, f.fps);
+        node_page(ui, &f.node, &f.display, f.fps, &f.guest);
         return;
     }
     let avail = ui.available_rect_before_wrap();
@@ -253,7 +253,13 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     act.viewport = Some(rect);
 }
 
-fn node_page(ui: &mut egui::Ui, n: &NodeView, d: &DisplayView, fps: f32) {
+fn node_page(
+    ui: &mut egui::Ui,
+    n: &NodeView,
+    d: &DisplayView,
+    fps: f32,
+    g: &GuestView<'_>,
+) {
     if !n.connected {
         ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
         return;
@@ -327,6 +333,61 @@ fn node_page(ui: &mut egui::Ui, n: &NodeView, d: &DisplayView, fps: f32) {
             ui.label(egui::RichText::new("Rendering").strong());
             ui.label(format!("{fps:.0} fps"));
             ui.end_row();
+        });
+
+    // The active guest's buffer, in the same place an operator already looks
+    // for what this console is drawing. A wrong pixel format shows up as a
+    // blank tab, which is indistinguishable from a guest that is not drawing
+    // until you can see the format.
+    ui.add_space(18.0);
+    ui.separator();
+    ui.add_space(12.0);
+    ui.heading("Guest");
+    ui.add_space(8.0);
+    egui::Grid::new("guest")
+        .num_columns(2)
+        .spacing([28.0, 10.0])
+        .show(ui, |ui| {
+            let path = match (g.tex, g.dma_id) {
+                (_, Some(_)) => "dmabuf, zero-copy",
+                (Some(_), _) => "copy, through host memory",
+                _ => "—",
+            };
+            let size = match (g.dma_id, g.tex) {
+                (Some(_), _) => format!("{}x{}", g.dma_size.x, g.dma_size.y),
+                (None, Some(t)) => format!("{}x{}", t.size()[0], t.size()[1]),
+                _ => "—".to_string(),
+            };
+            let mut rows = vec![
+                ("Scanout".to_string(), path.to_string()),
+                ("Size".to_string(), size),
+                ("Frames".to_string(), g.seq.to_string()),
+            ];
+            if let Some(desc) = g.desc {
+                let name: String = desc.fourcc.to_le_bytes().iter().map(|&c| c as char).collect();
+                // What QEMU declared and what we import it as: they differ
+                // whenever the declared format claimed an alpha channel a
+                // scanout does not have.
+                let mapped = crate::gui::scanout::opaque_name(desc.fourcc);
+                rows.push((
+                    "Format".to_string(),
+                    format!("{name} (0x{:08x}) -> {mapped}", desc.fourcc),
+                ));
+                rows.push(("Modifier".to_string(), format!("0x{:x}", desc.modifier)));
+                rows.push(("Stride".to_string(), format!("{} bytes", desc.stride)));
+                rows.push((
+                    "Origin".to_string(),
+                    if desc.y0_top { "top-left" } else { "bottom-left" }.to_string(),
+                ));
+            }
+            if let Some((nz, total)) = g.probe_nonblack {
+                rows.push(("Readback".to_string(), format!("{nz} / {total} non-black px")));
+            }
+            for (k, v) in rows {
+                ui.label(egui::RichText::new(k).strong());
+                ui.label(v);
+                ui.end_row();
+            }
         });
 }
 
