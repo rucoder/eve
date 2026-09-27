@@ -194,7 +194,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
                 log::info!("input: shutdown requested; closing libinput");
                 return; // drops `inp` here, closing every device fd it opened
             }
-            inp.pump(crate::gui::POINTS_PER_PIXEL);
+            inp.pump(crate::gui::points_per_pixel());
             // forward to the guest IMMEDIATELY, at device rate
             if !inp.guest.is_empty() {
                 if let Some(t) = tx.lock().unwrap().as_ref() {

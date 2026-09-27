@@ -281,7 +281,11 @@ IPS_NET1_FIRST_IP=192.168.1.10
 IPS_NET2=192.168.2.0/24
 IPS_NET2_FIRST_IP=192.168.2.10
 
-QEMU_MEMORY?=8192
+# Headroom for dev pushes: a service swapped in live copies up into its
+# overlay's tmpfs upper layer, and zedbox alone is ~100MB. Override on the
+# command line on a smaller host.
+QEMU_MEMORY?=16384
+QEMU_SMP?=12
 QEMU_EVE_SERIAL?=31415926
 QEMU_PID_FILE?=$(CURDIR)/qemu.pid
 
@@ -333,7 +337,7 @@ QEMU_OPTS_VGA_DISPLAY_amd64=-vga none \
 QEMU_OPTS_VGA_DISPLAY_arm64=-device virtio-gpu-gl-pci -display $(QEMU_GUI_DISPLAY) \
     -usb -device usb-ehci,id=ehci -device usb-kbd,bus=ehci.0 -device usb-tablet,bus=ehci.0
 QEMU_OPTS_VGA_DISPLAY_riscv64=-vga std
-QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp 8  $(QEMU_OPTS_BIOS) \
+QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp $(QEMU_SMP)  $(QEMU_OPTS_BIOS) \
         -pidfile $(QEMU_PID_FILE) \
         -serial mon:stdio      \
         -global ICH9-LPC.noreboot=false -watchdog-action reset \

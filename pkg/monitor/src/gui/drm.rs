@@ -29,6 +29,15 @@ pub struct Head {
     pub surface: HeadSurface,
     pub w: i32,
     pub h: i32,
+    /// Vertical refresh of the mode actually set, for the Node page.
+    pub refresh: u32,
+    /// Whether the connector supplied an EDID. Without one the preferred mode
+    /// is the driver's invention, which is worth seeing when a resolution
+    /// looks wrong.
+    pub edid: bool,
+    /// Physical size in millimetres, from EDID. None when the connector does
+    /// not report one, which is also what `edid` reflects.
+    pub mm: Option<(u32, u32)>,
 }
 
 /// The card, plus everything layered on it. `renderer` and the heads are kept
@@ -217,8 +226,13 @@ pub fn discover_heads(gpu: &mut Gpu, want_mode: Option<&str>) -> anyhow::Result<
         let surface: HeadSurface =
             GbmBufferedSurface::new(ds, alloc, &[Fourcc::Xrgb8888, Fourcc::Argb8888], fmts)?;
         let (w, h) = mode.size();
-        log::info!("  head {name}: crtc={crtc:?} {w}x{h}");
-        heads.push(Head { name, crtc, surface, w: w as i32, h: h as i32 });
+        let refresh = mode.vrefresh();
+        let mm = c.size().filter(|(mw, mh)| *mw > 0 && *mh > 0);
+        let edid = mm.is_some();
+        log::info!("  head {name}: crtc={crtc:?} {w}x{h}@{refresh} edid={edid} mm={mm:?}");
+        heads.push(Head {
+            name, crtc, surface, w: w as i32, h: h as i32, refresh, edid, mm,
+        });
     }
 
     anyhow::ensure!(!heads.is_empty(), "no connected heads");

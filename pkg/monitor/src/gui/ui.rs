@@ -37,6 +37,21 @@ pub struct NodeView<'a> {
     pub connected: bool,
 }
 
+/// What the Node tab shows about the console's own display. Worth surfacing:
+/// a resolution that looks wrong is usually explained by the EDID column -
+/// without one the driver invents a preferred mode, and under QEMU it tracks
+/// the window rather than anything the operator chose.
+pub struct DisplayView<'a> {
+    pub card: &'a str,
+    pub connector: &'a str,
+    pub w: i32,
+    pub h: i32,
+    pub refresh: u32,
+    pub edid: bool,
+    pub pinned: Option<&'a str>,
+    pub scale: f32,
+}
+
 pub struct Frame<'a> {
     pub head: &'a str,
     pub fps: f32,
@@ -51,6 +66,7 @@ pub struct Frame<'a> {
     pub guest: GuestView<'a>,
     pub cursor: Option<CursorView<'a>>,
     pub node: NodeView<'a>,
+    pub display: DisplayView<'a>,
     /// Tab 0 is the node page; guests follow.
     pub node_tab: bool,
 }
@@ -139,7 +155,7 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     if f.node_tab {
-        node_page(ui, &f.node);
+        node_page(ui, &f.node, &f.display, f.fps);
         return;
     }
     let avail = ui.available_rect_before_wrap();
@@ -205,7 +221,7 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     act.viewport = Some(rect);
 }
 
-fn node_page(ui: &mut egui::Ui, n: &NodeView) {
+fn node_page(ui: &mut egui::Ui, n: &NodeView, d: &DisplayView, fps: f32) {
     if !n.connected {
         ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
         return;
@@ -248,6 +264,38 @@ fn node_page(ui: &mut egui::Ui, n: &NodeView) {
                 }
             });
     });
+
+    ui.add_space(18.0);
+    ui.separator();
+    ui.add_space(12.0);
+    ui.heading("Display");
+    ui.add_space(8.0);
+    let mode = format!("{}x{} @ {}Hz", d.w, d.h, d.refresh);
+    let scale = format!("{:.2}x", d.scale);
+    let source = match (d.pinned, d.edid) {
+        (Some(p), _) => format!("pinned to {p} in config.json"),
+        (None, true) => "preferred mode from the display's EDID".to_string(),
+        (None, false) => "largest mode offered - no EDID, so nothing states a preference".to_string(),
+    };
+    egui::Grid::new("display")
+        .num_columns(2)
+        .spacing([28.0, 10.0])
+        .show(ui, |ui| {
+            for (k, v) in [
+                ("Resolution", mode.as_str()),
+                ("Chosen", source.as_str()),
+                ("UI scale", scale.as_str()),
+                ("Card", d.card),
+                ("Connector", d.connector),
+            ] {
+                ui.label(egui::RichText::new(k).strong());
+                ui.label(if v.is_empty() { "—" } else { v });
+                ui.end_row();
+            }
+            ui.label(egui::RichText::new("Rendering").strong());
+            ui.label(format!("{fps:.0} fps"));
+            ui.end_row();
+        });
 }
 
 /// A standard arrow, as an explicit triangle mesh: the shape is concave, so

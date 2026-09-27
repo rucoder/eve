@@ -27,9 +27,38 @@ use smithay::utils::{Rectangle, Transform};
 
 use scanout::Vm;
 
-/// egui points-per-pixel. The console is small and far away; 1.0 is unreadable.
-/// Shared with the input thread, which converts the same coordinates.
-pub const POINTS_PER_PIXEL: f32 = 2.0;
+/// egui points-per-pixel, shared with the input thread so both convert
+/// coordinates the same way.
+///
+/// This was a hardcoded 2.0, which is right for a dense panel and badly wrong
+/// anywhere else: at 2.0 a 1188x765 display gives egui 594x382 points to work
+/// with and every widget is drawn at double size, which looks like a tiny
+/// resolution rather than a magnified one. Derive it from the display's real
+/// DPI instead, and fall back to 1.0 - not 2.0 - when the display does not say.
+static PPP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+pub fn points_per_pixel() -> f32 {
+    *PPP.get().unwrap_or(&1.0)
+}
+
+/// Pick a scale from the panel's physical size. 96 DPI is the 1.0 reference;
+/// the result is clamped and rounded to quarter steps so the UI lands on a
+/// predictable size rather than an arbitrary fraction.
+fn scale_for(w: i32, mm: Option<(u32, u32)>, override_: Option<f32>) -> f32 {
+    if let Some(s) = override_ {
+        log::info!("ui scale {s} (configured)");
+        return s;
+    }
+    let Some((mm_w, _)) = mm.filter(|(mw, _)| *mw > 0) else {
+        log::info!("ui scale 1.0 (no EDID, so no physical size to derive DPI from)");
+        return 1.0;
+    };
+    let dpi = w as f32 / (mm_w as f32 / 25.4);
+    let s = ((dpi / 96.0) * 4.0).round() / 4.0;
+    let s = s.clamp(1.0, 3.0);
+    log::info!("ui scale {s} ({dpi:.0} dpi from {w}px / {mm_w}mm)");
+    s
+}
 
 struct Config {
     card: Option<String>,
@@ -37,6 +66,9 @@ struct Config {
     frames: u32,
     orient: u8,
     ptr_scale: f64,
+    /// Override the DPI-derived ui scale; GUI_SCALE, or gui.scale in
+    /// config.json.
+    scale: Option<f32>,
     probe: bool,
     vms: String,
 }
@@ -51,6 +83,7 @@ impl Config {
             frames: env("GUI_FRAMES").and_then(|v| v.parse().ok()).unwrap_or(0),
             orient: env("GUI_ORIENT").and_then(|v| v.parse().ok()).unwrap_or(1),
             ptr_scale: env("GUI_PTR_SCALE").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            scale: env("GUI_SCALE").and_then(|v| v.parse().ok()),
             probe: env("GUI_PROBE").is_some(),
             vms: env("GUI_VMS").unwrap_or_default(),
         }
@@ -104,6 +137,8 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
     // Tab 0 is the node page; guests are tabs 1..n.
     let mut show_node = true;
 
+    // Before anything converts coordinates or lays out a frame.
+    let _ = PPP.set(scale_for(heads[0].w, heads[0].mm, cfg.scale));
     let inp = input::spawn(heads[0].w, heads[0].h, cfg.ptr_scale)?;
     if let Some(vm) = vms.get(active) {
         inp.set_active(vm.tx.clone());
@@ -216,7 +251,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                     events: ui_events.clone(),
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::pos2(0.0, 0.0),
-                        egui::vec2(head.w as f32 / POINTS_PER_PIXEL, head.h as f32 / POINTS_PER_PIXEL),
+                        egui::vec2(head.w as f32 / points_per_pixel(), head.h as f32 / points_per_pixel()),
                     )),
                     ..Default::default()
                 };
@@ -252,6 +287,16 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                         interfaces: &node.4,
                         connected: node.5,
                     },
+                    display: ui::DisplayView {
+                        card: &card,
+                        connector: &head_name,
+                        w: head.w,
+                        h: head.h,
+                        refresh: head.refresh,
+                        edid: head.edid,
+                        pinned: mode,
+                        scale: points_per_pixel(),
+                    },
                     head: &head_name,
                     fps: fps_now,
                     guest_fps: gfps_now,
@@ -260,7 +305,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                     tabs: &tabs,
                     active: if show_node { 0 } else { active + 1 },
                     focus,
-                    pointer: egui::pos2(cx / POINTS_PER_PIXEL, cy / POINTS_PER_PIXEL),
+                    pointer: egui::pos2(cx / points_per_pixel(), cy / points_per_pixel()),
                     guest: match vms.get(active) {
                         Some(vm) => ui::GuestView {
                             dma_id: vm.dma_id,
@@ -292,8 +337,8 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                 let mut prims = egui_ctx.tessellate(out.shapes, out.pixels_per_point);
                 ui::fix_orientation(
                     &mut prims,
-                    head.w as f32 / POINTS_PER_PIXEL,
-                    head.h as f32 / POINTS_PER_PIXEL,
+                    head.w as f32 / points_per_pixel(),
+                    head.h as f32 / points_per_pixel(),
                     cfg.orient,
                 );
 
@@ -305,7 +350,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                     frame.with_context(|_gl| {
                         painter.paint_and_update_textures(
                             [head.w as u32, head.h as u32],
-                            POINTS_PER_PIXEL,
+                            points_per_pixel(),
                             &prims,
                             &out.textures_delta,
                         );
@@ -358,10 +403,10 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
             if let Some(r) = act.viewport {
                 let mut st = inp.state.lock().unwrap();
                 st.view = (
-                    r.min.x * POINTS_PER_PIXEL,
-                    r.min.y * POINTS_PER_PIXEL,
-                    r.width() * POINTS_PER_PIXEL,
-                    r.height() * POINTS_PER_PIXEL,
+                    r.min.x * points_per_pixel(),
+                    r.min.y * points_per_pixel(),
+                    r.width() * points_per_pixel(),
+                    r.height() * points_per_pixel(),
                 );
                 // Every frame, from the VM that owns it - never inferred from
                 // whether a scanout message happened to arrive.
