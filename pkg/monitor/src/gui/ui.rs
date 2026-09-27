@@ -49,6 +49,54 @@ fn guest_detail(g: &GuestView<'_>) -> String {
     )
 }
 
+/// Which page of the node tab is showing. Mirrors the TUI's tabs, minus the
+/// two it has that we have no data for over IPC (Vault, Dmesg).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NodePage {
+    Summary,
+    Network,
+    Apps,
+}
+
+impl NodePage {
+    pub const ALL: [NodePage; 3] = [NodePage::Summary, NodePage::Network, NodePage::Apps];
+    fn title(self) -> &'static str {
+        match self {
+            NodePage::Summary => "Summary",
+            NodePage::Network => "Network",
+            NodePage::Apps => "Applications",
+        }
+    }
+}
+
+/// One network port, as the Network page shows it.
+pub struct PortView {
+    pub name: String,
+    pub label: String,
+    pub mac: String,
+    pub up: bool,
+    pub mgmt: bool,
+    pub cost: u8,
+    pub media: String,
+    pub dhcp: bool,
+    pub ipv4: Vec<String>,
+    pub subnet: String,
+    pub routes: Vec<String>,
+    pub dns: Vec<String>,
+    pub ntp: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// One app instance, as the Applications page shows it.
+pub struct AppView {
+    pub name: String,
+    pub uuid: String,
+    pub version: String,
+    pub state: String,
+    pub error: String,
+    pub has_console: bool,
+}
+
 /// A hardware cursor the guest published, for us to draw locally.
 pub struct CursorView<'a> {
     pub tex: &'a egui::TextureHandle,
@@ -101,12 +149,18 @@ pub struct Frame<'a> {
     /// Chrome hidden, guest filling the head. The bar comes back as an
     /// overlay while the pointer is at the top edge.
     pub fullscreen: bool,
+    /// Which page the node tab is showing.
+    pub page: NodePage,
+    pub ports: &'a [PortView],
+    pub apps: &'a [AppView],
 }
 
 #[derive(Default)]
 pub struct Actions {
     /// A tab the user clicked.
     pub tab: Option<usize>,
+    /// A node-page the user clicked in the side nav.
+    pub page: Option<NodePage>,
     pub send_cad: bool,
     pub send_wake: bool,
     /// Where the guest image landed, in points. Input maps through this.
@@ -234,7 +288,30 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     if f.node_tab {
-        node_page(ui, &f.node, &f.display, f.fps, &f.guest);
+        // Vertical nav on the left, like the TUI's tab strip but down the
+        // side: the pages are few and their names are words, so a column
+        // costs less width than a row costs height on a 4:3 guest head.
+        egui::SidePanel::left("node_nav")
+            .resizable(false)
+            .exact_width(170.0)
+            .show_inside(ui, |ui| {
+                ui.add_space(12.0);
+                for p in NodePage::ALL {
+                    let hit = ui.add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::SelectableLabel::new(p == f.page, p.title()),
+                    );
+                    if hit.clicked() {
+                        act.page = Some(p);
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+        match f.page {
+            NodePage::Summary => node_page(ui, &f.node, &f.display, f.fps, &f.guest),
+            NodePage::Network => network_page(ui, f.ports),
+            NodePage::Apps => apps_page(ui, f.apps),
+        }
         return;
     }
     let avail = ui.available_rect_before_wrap();
@@ -298,6 +375,94 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
         }
     }
     act.viewport = Some(rect);
+}
+
+/// Every port pillar reports, with the detail the summary has no room for.
+fn network_page(ui: &mut egui::Ui, ports: &[PortView]) {
+    ui.add_space(12.0);
+    ui.heading("Network");
+    ui.add_space(8.0);
+    if ports.is_empty() {
+        ui.label("no ports reported yet");
+        return;
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for p in ports {
+            let title = format!(
+                "{}{}  ·  {}  ·  {}{}",
+                p.name,
+                if p.label.is_empty() || p.label == p.name { String::new() } else { format!(" ({})", p.label) },
+                if p.up { "up" } else { "down" },
+                if p.mgmt { "management" } else { "app-only" },
+                if p.cost > 0 { format!("  ·  cost {}", p.cost) } else { String::new() },
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(title).strong());
+            egui::Grid::new(format!("port_{}", p.name))
+                .num_columns(2)
+                .spacing([24.0, 6.0])
+                .show(ui, |ui| {
+                    let join = |v: &Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
+                    for (k, v) in [
+                        ("MAC", p.mac.clone()),
+                        ("Media", p.media.clone()),
+                        ("Address", format!("{}{}", join(&p.ipv4),
+                            if p.dhcp { "  (DHCP)" } else { "  (static)" })),
+                        ("Subnet", if p.subnet.is_empty() { "—".into() } else { p.subnet.clone() }),
+                        ("Gateway", join(&p.routes)),
+                        ("DNS", join(&p.dns)),
+                        ("NTP", join(&p.ntp)),
+                    ] {
+                        ui.label(egui::RichText::new(k).weak());
+                        ui.label(v);
+                        ui.end_row();
+                    }
+                    if !p.errors.is_empty() {
+                        ui.label(egui::RichText::new("Errors").weak());
+                        ui.colored_label(egui::Color32::LIGHT_RED, p.errors.join("; "));
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(6.0);
+            ui.separator();
+        }
+    });
+}
+
+/// What pillar says is deployed here, and which of them this console can show.
+fn apps_page(ui: &mut egui::Ui, apps: &[AppView]) {
+    ui.add_space(12.0);
+    ui.heading("Applications");
+    ui.add_space(8.0);
+    if apps.is_empty() {
+        ui.label("no app instances on this node");
+        return;
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("apps")
+            .num_columns(5)
+            .spacing([24.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for h in ["Name", "State", "Version", "Console", "UUID"] {
+                    ui.label(egui::RichText::new(h).strong());
+                }
+                ui.end_row();
+                for a in apps {
+                    ui.label(&a.name);
+                    // An app in error says so where it is read, not in a log.
+                    if a.error.is_empty() {
+                        ui.label(&a.state);
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("{} — {}", a.state, a.error));
+                    }
+                    ui.label(if a.version.is_empty() { "—" } else { a.version.as_str() });
+                    ui.label(if a.has_console { "yes" } else { "—" });
+                    ui.label(egui::RichText::new(&a.uuid).weak());
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 fn node_page(

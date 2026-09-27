@@ -46,6 +46,10 @@ pub struct PillarState {
     /// False until a message has arrived, so the UI can say so rather than
     /// showing empty fields as though they were facts.
     pub connected: bool,
+    /// Bumped by every message pillar sends. The GUI rebuilds its derived
+    /// views only when this moves, so the node pages cost nothing per frame
+    /// while nothing is changing - which is almost always.
+    pub rev: u64,
     /// Whether the console frontend loop may put the GUI on screen right
     /// now. main.rs's frontend loop reads this (via `Console::set_gpu_available`)
     /// to decide GUI vs TUI, both at the top of a session and, through a
@@ -68,6 +72,7 @@ impl Default for PillarState {
             network: None,
             apps: Vec::new(),
             connected: false,
+            rev: 0,
             // Nobody has taken the GPU until pillar says so.
             gpu_available: true,
             pending_gpu_ack: None,
@@ -259,6 +264,7 @@ async fn pump(
 /// arbitrarily large variants like `TpmLogs` - passes straight through with
 /// no copy at all.
 pub fn apply(state: &mut PillarState, msg: IpcMessage) -> IpcMessage {
+    state.rev = state.rev.wrapping_add(1);
     match msg {
         IpcMessage::DeviceStatus(d) => {
             state.device = Some(d.clone());

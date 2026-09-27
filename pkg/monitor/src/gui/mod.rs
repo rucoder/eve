@@ -138,6 +138,14 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
     let mut show_node = true;
     // Chrome hidden, guest filling the head; Ctrl+Alt+F toggles it.
     let mut fullscreen = false;
+    // Which page of the node tab is showing.
+    let mut node_page = ui::NodePage::Summary;
+    // Derived node-page data, rebuilt only when pillar's state moves. The
+    // strings cannot be borrowed from PillarState: it lives behind a mutex the
+    // IPC thread writes to, and holding that across a frame would stall it.
+    let mut node_rev = u64::MAX;
+    let mut ports: Vec<ui::PortView> = Vec::new();
+    let mut apps: Vec<ui::AppView> = Vec::new();
 
     // Before anything converts coordinates or lays out a frame.
     let _ = PPP.set(scale_for(heads[0].w, heads[0].mm, cfg.scale));
@@ -278,11 +286,21 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                         d.as_ref().map_or(String::new(), |d| d.hardware_model.clone()),
                         interfaces_of(&p),
                         p.connected,
+                        p.rev,
                     )
                 };
+                if show_node && node_rev != node.6 {
+                    let p = pillar.lock().unwrap();
+                    ports = ports_of(&p);
+                    apps = apps_of(&p);
+                    node_rev = node.6;
+                }
                 let view = ui::Frame {
                     node_tab: show_node,
                     fullscreen,
+                    page: node_page,
+                    ports: &ports,
+                    apps: &apps,
                     node: ui::NodeView {
                         name: &node.0,
                         serial: &node.1,
@@ -380,6 +398,9 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
             if hot_fs {
                 fullscreen = !fullscreen;
                 log::info!("fullscreen -> {fullscreen}");
+            }
+            if let Some(p) = act.page {
+                node_page = p;
             }
             let want = hot_tab.filter(|t| *t <= vms.len()).or(act.tab);
             if let Some(t) = want {
@@ -574,6 +595,45 @@ fn reconcile_tabs(
     }
     let now: Option<(String, u64)> = vms.get(*active).map(|v| (v.source.clone(), v.id));
     was != now
+}
+
+/// Every port, with the detail the Network page shows.
+fn ports_of(p: &crate::ipc::PillarState) -> Vec<ui::PortView> {
+    let Some(n) = p.network.as_ref() else { return Vec::new() };
+    n.interfaces
+        .iter()
+        .map(|i| ui::PortView {
+            name: i.name.clone(),
+            label: i.label.clone(),
+            mac: i.mac.clone(),
+            up: i.up,
+            mgmt: i.is_mgmt,
+            cost: i.cost,
+            media: format!("{:?}", i.media),
+            dhcp: i.network.is_dhcp,
+            ipv4: i.network.ipv4.iter().map(|a| a.to_string()).collect(),
+            subnet: i.network.subnet.map(|s| s.to_string()).unwrap_or_default(),
+            routes: i.network.routes.iter().map(|a| a.to_string()).collect(),
+            dns: i.network.dns_servers.iter().map(|a| a.to_string()).collect(),
+            ntp: i.network.ntp_servers.clone(),
+            errors: i.network.errors.clone(),
+        })
+        .collect()
+}
+
+/// App instances, with whether this console can show one.
+fn apps_of(p: &crate::ipc::PillarState) -> Vec<ui::AppView> {
+    p.apps
+        .iter()
+        .map(|a| ui::AppView {
+            name: a.name.clone(),
+            uuid: a.uuid.to_string(),
+            version: a.version.clone(),
+            state: format!("{:?}", a.state),
+            error: a.error.clone(),
+            has_console: !a.qmp_socket.is_empty(),
+        })
+        .collect()
 }
 
 /// Flatten pillar's network status into (interface, address) rows.
