@@ -317,8 +317,17 @@ fi
 ROOT_DEV=$(root_dev)
 
 # lets see if we're told on which disk to install from boot cmdline options
+#
+# tail -1 because the option can legitimately appear more than once and the
+# kernel's own rule is last-one-wins. GRUB's rootfs.cfg is evaluated in two
+# contexts (its own GRUB, and as an outer GRUB's configfile argument), so every
+# `set_global dom0_extra_args "$dom0_extra_args ..."` in a CONFIG/grub.cfg
+# override is applied twice. Without tail -1 this sed prints one line per match
+# and INSTALL_DEV becomes "serial:NNN\nserial:NNN", which matches no disk - the
+# install then aborts with "is not a block device" while the sysfs scan right
+# below it plainly shows the disk.
 # shellcheck disable=SC2002
-INSTALL_DEV=$(cat "$CMDLINEFILE" | tr ' ' '\012' | sed -ne '/^eve_install_disk=/s#^.*=##p')
+INSTALL_DEV=$(cat "$CMDLINEFILE" | tr ' ' '\012' | sed -ne '/^eve_install_disk=/s#^.*=##p' | tail -1)
 
 # ...if not we will try to guess, and...
 if [ -z "$INSTALL_DEV" ] ; then
