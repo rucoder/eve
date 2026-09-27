@@ -87,6 +87,49 @@ pub struct PortView {
     pub errors: Vec<String>,
 }
 
+/// A port being edited. Owned copies, taken from the cached PortView when the
+/// dialog opens: pillar keeps updating underneath, and fields must not change
+/// under the operator mid-edit.
+#[derive(Clone)]
+pub struct PortEdit {
+    pub iface: String,
+    pub dhcp: bool,
+    pub addr: String,
+    pub subnet: String,
+    pub gateway: String,
+    pub dns: String,
+    pub ntp: String,
+    /// What the port looked like before Apply, kept so Undo can put it back
+    /// without asking pillar to remember anything.
+    pub previous: Option<Box<PortEdit>>,
+}
+
+impl PortEdit {
+    /// Every field parses, so Apply is safe to offer. DHCP needs nothing.
+    pub fn valid(&self) -> bool {
+        if self.dhcp {
+            return true;
+        }
+        self.addr.trim().parse::<std::net::IpAddr>().is_ok()
+            && subnet_ok(&self.subnet)
+            && (self.gateway.trim().is_empty()
+                || self.gateway.trim().parse::<std::net::IpAddr>().is_ok())
+            && list_ok(&self.dns)
+    }
+}
+
+fn subnet_ok(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.parse::<ipnet::IpNet>().is_ok()
+}
+
+fn list_ok(s: &str) -> bool {
+    s.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .all(|x| x.parse::<std::net::IpAddr>().is_ok())
+}
+
 /// One app instance, as the Applications page shows it.
 pub struct AppView {
     pub name: String,
@@ -153,6 +196,8 @@ pub struct Frame<'a> {
     pub page: NodePage,
     pub ports: &'a [PortView],
     pub apps: &'a [AppView],
+    /// The port editor, when one is open.
+    pub edit: Option<&'a PortEdit>,
 }
 
 #[derive(Default)]
@@ -161,6 +206,14 @@ pub struct Actions {
     pub tab: Option<usize>,
     /// A node-page the user clicked in the side nav.
     pub page: Option<NodePage>,
+    /// Open the editor for this port.
+    pub edit_port: Option<String>,
+    /// The dialog's state changed; the render loop keeps it.
+    pub edit_update: Option<PortEdit>,
+    /// Send this configuration to pillar.
+    pub apply_port: Option<PortEdit>,
+    /// Close without sending.
+    pub edit_cancel: bool,
     pub send_cad: bool,
     pub send_wake: bool,
     /// Where the guest image landed, in points. Input maps through this.
@@ -206,6 +259,9 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
     // Our own pointer goes on a foreground layer so no panel can clip it, and
     // only over OUR chrome: inside the guest view either the guest composites
     // its cursor or we drew it above, and a second arrow looks broken.
+    if let Some(e) = f.edit {
+        port_dialog(ctx, e, &mut act);
+    }
     let over_guest = act.viewport.is_some_and(|r| r.contains(f.pointer));
     if f.focus == Focus::Gui && !over_guest {
         draw_arrow(ctx, f.pointer);
@@ -309,7 +365,7 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             });
         match f.page {
             NodePage::Summary => node_page(ui, &f.node, &f.display, f.fps, &f.guest),
-            NodePage::Network => network_page(ui, f.ports),
+            NodePage::Network => network_page(ui, f.ports, act),
             NodePage::Apps => apps_page(ui, f.apps),
         }
         return;
@@ -377,8 +433,104 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     act.viewport = Some(rect);
 }
 
+/// The port editor. Modal on purpose: changing the address of the port you
+/// are reaching the node through is not something to do while half-reading
+/// another page.
+fn port_dialog(ctx: &egui::Context, e: &PortEdit, act: &mut Actions) {
+    let mut ed = e.clone();
+    let mut close = false;
+    egui::Modal::new(egui::Id::new("port_edit")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        ui.heading(format!("Configure {}", ed.iface));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut ed.dhcp, true, "DHCP");
+            ui.radio_value(&mut ed.dhcp, false, "Static");
+        });
+        ui.add_space(8.0);
+        ui.add_enabled_ui(!ed.dhcp, |ui| {
+            egui::Grid::new("port_edit_grid")
+                .num_columns(2)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    // Each field says whether it parses, as it is typed: a
+                    // static address that does not is how a node is lost.
+                    field(ui, "Address", &mut ed.addr, |v| {
+                        v.trim().parse::<std::net::IpAddr>().is_ok()
+                    });
+                    field(ui, "Subnet", &mut ed.subnet, |v| subnet_ok(v));
+                    field(ui, "Gateway", &mut ed.gateway, |v| {
+                        v.trim().is_empty() || v.trim().parse::<std::net::IpAddr>().is_ok()
+                    });
+                    field(ui, "DNS", &mut ed.dns, |v| list_ok(v));
+                });
+        });
+        ui.add_space(6.0);
+        egui::Grid::new("port_edit_common")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                field(ui, "NTP", &mut ed.ntp, |_| true);
+            });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ed.valid(), egui::Button::new("Apply")).clicked() {
+                act.apply_port = Some(ed.clone());
+                close = true;
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+            // Undo re-sends what the port had before the last Apply. Nothing
+            // on the pillar side has to remember it - the previous values
+            // travel with the dialog.
+            if let Some(prev) = ed.previous.clone() {
+                ui.separator();
+                if ui
+                    .button("Undo last change")
+                    .on_hover_text(format!(
+                        "put {} back to {}",
+                        prev.iface,
+                        if prev.dhcp { "DHCP".to_string() } else { prev.addr.clone() }
+                    ))
+                    .clicked()
+                {
+                    act.apply_port = Some((*prev).clone());
+                    close = true;
+                }
+            }
+        });
+        if !ed.dhcp && !ed.valid() {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::LIGHT_RED, "address, subnet and DNS must parse");
+        }
+    });
+    if close {
+        act.edit_cancel = true;
+    } else {
+        act.edit_update = Some(ed);
+    }
+}
+
+/// One labelled text field that colours itself when it does not parse.
+fn field(ui: &mut egui::Ui, label: &str, value: &mut String, ok: impl Fn(&str) -> bool) {
+    ui.label(egui::RichText::new(label).weak());
+    let good = ok(value);
+    let edit = egui::TextEdit::singleline(value).desired_width(300.0);
+    let r = ui.add(edit);
+    if !good && !value.trim().is_empty() {
+        ui.painter().rect_stroke(
+            r.rect.expand(1.0),
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::LIGHT_RED),
+            egui::StrokeKind::Outside,
+        );
+    }
+    ui.end_row();
+}
+
 /// Every port pillar reports, with the detail the summary has no room for.
-fn network_page(ui: &mut egui::Ui, ports: &[PortView]) {
+fn network_page(ui: &mut egui::Ui, ports: &[PortView], act: &mut Actions) {
     ui.add_space(12.0);
     ui.heading("Network");
     ui.add_space(8.0);
@@ -397,7 +549,12 @@ fn network_page(ui: &mut egui::Ui, ports: &[PortView]) {
                 if p.cost > 0 { format!("  ·  cost {}", p.cost) } else { String::new() },
             );
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(title).strong());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).strong());
+                if ui.small_button("Edit").clicked() {
+                    act.edit_port = Some(p.name.clone());
+                }
+            });
             egui::Grid::new(format!("port_{}", p.name))
                 .num_columns(2)
                 .spacing([24.0, 6.0])

@@ -113,7 +113,12 @@ fn spawn_vms(spec: &str) -> Vec<Vm> {
 /// shutdown - checked once per frame, next to `vt::running()`, which keeps
 /// meaning "the process itself is shutting down" and is untouched by a
 /// switch request.
-pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic::AtomicBool>, mode: Option<&str>) -> anyhow::Result<()> {
+pub fn run(
+    pillar: crate::ipc::Shared,
+    outbox: tokio::sync::mpsc::UnboundedSender<crate::ipc::message::IpcMessage>,
+    switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mode: Option<&str>,
+) -> anyhow::Result<()> {
     let cfg = Config::from_env();
     // Held for the whole run; Drop puts the VT keyboard back.
     let _cad = vt::CtrlAltDelGuard::take();
@@ -140,6 +145,10 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
     let mut fullscreen = false;
     // Which page of the node tab is showing.
     let mut node_page = ui::NodePage::Summary;
+    // The open port editor, if any, and what each port looked like before the
+    // last Apply so Undo has somewhere to go.
+    let mut edit: Option<ui::PortEdit> = None;
+    let mut previous: std::collections::HashMap<String, ui::PortEdit> = Default::default();
     // Derived node-page data, rebuilt only when pillar's state moves. The
     // strings cannot be borrowed from PillarState: it lives behind a mutex the
     // IPC thread writes to, and holding that across a frame would stall it.
@@ -301,6 +310,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                     page: node_page,
                     ports: &ports,
                     apps: &apps,
+                    edit: edit.as_ref(),
                     node: ui::NodeView {
                         name: &node.0,
                         serial: &node.1,
@@ -401,6 +411,59 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
             }
             if let Some(p) = act.page {
                 node_page = p;
+            }
+            if let Some(name) = act.edit_port.take() {
+                // Copy the port's current values into the dialog, and carry
+                // whatever it looked like before its last Apply so Undo works
+                // even across a reopen.
+                if let Some(p) = ports.iter().find(|p| p.name == name) {
+                    edit = Some(ui::PortEdit {
+                        iface: p.name.clone(),
+                        dhcp: p.dhcp,
+                        addr: p.ipv4.first().cloned().unwrap_or_default(),
+                        subnet: p.subnet.clone(),
+                        gateway: p.routes.first().cloned().unwrap_or_default(),
+                        dns: p.dns.join(", "),
+                        ntp: p.ntp.join(", "),
+                        previous: previous.get(&name).cloned().map(Box::new),
+                    });
+                }
+            } else if let Some(e) = act.edit_update.take() {
+                edit = Some(e);
+            }
+            if act.edit_cancel {
+                edit = None;
+            }
+            if let Some(mut want) = act.apply_port.take() {
+                // What it was, for Undo, taken from the live port rather than
+                // from the dialog - the dialog already holds the new values.
+                if let Some(p) = ports.iter().find(|p| p.name == want.iface) {
+                    previous.insert(
+                        want.iface.clone(),
+                        ui::PortEdit {
+                            iface: p.name.clone(),
+                            dhcp: p.dhcp,
+                            addr: p.ipv4.first().cloned().unwrap_or_default(),
+                            subnet: p.subnet.clone(),
+                            gateway: p.routes.first().cloned().unwrap_or_default(),
+                            dns: p.dns.join(", "),
+                            ntp: p.ntp.join(", "),
+                            previous: None,
+                        },
+                    );
+                }
+                want.previous = None;
+                match interface_request(&want) {
+                    Ok(msg) => {
+                        log::info!("net: applying {} ({})", want.iface,
+                                   if want.dhcp { "dhcp" } else { "static" });
+                        if outbox.send(msg).is_err() {
+                            log::error!("net: pillar connection is gone; {} unchanged", want.iface);
+                        }
+                    }
+                    Err(e) => log::error!("net: refusing to send {}: {e}", want.iface),
+                }
+                edit = None;
             }
             let want = hot_tab.filter(|t| *t <= vms.len()).or(act.tab);
             if let Some(t) = want {
@@ -595,6 +658,54 @@ fn reconcile_tabs(
     }
     let now: Option<(String, u64)> = vms.get(*active).map(|v| (v.source.clone(), v.id));
     was != now
+}
+
+/// Turn a filled-in dialog into the request pillar already understands. Parse
+/// failures are an error rather than a default: a silently-dropped field here
+/// is a node that answers on an address nobody expects.
+fn interface_request(e: &ui::PortEdit) -> anyhow::Result<crate::ipc::message::IpcMessage> {
+    use crate::ipc::monitorapi::{IpMode, ProxySettings, SetInterfaceConfig, StaticIpConfig};
+    let ip = if e.dhcp {
+        IpMode::Dhcp
+    } else {
+        let dns = e
+            .dns
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<std::net::IpAddr>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let gateway = match e.gateway.trim() {
+            "" => None,
+            g => Some(g.parse::<std::net::IpAddr>()?),
+        };
+        IpMode::Static {
+            config: StaticIpConfig {
+                ip: e.addr.trim().parse()?,
+                subnet: e.subnet.trim().parse()?,
+                gateway,
+                dns_servers: dns,
+            },
+        }
+    };
+    let ntp = e
+        .ntp
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(crate::ipc::message::IpcMessage::new_request(
+        crate::ipc::message::Request::SetInterfaceConfig(SetInterfaceConfig {
+            iface: e.iface.clone(),
+            ip,
+            // The dialog does not touch proxy settings; None is the contract's
+            // "no proxy", not a placeholder.
+            proxy: ProxySettings::None,
+            ntp,
+            domain: String::new(),
+        }),
+    ))
 }
 
 /// Every port, with the detail the Network page shows.
