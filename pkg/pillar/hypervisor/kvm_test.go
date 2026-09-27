@@ -3769,9 +3769,15 @@ func TestVirtualGPUWithVncGetsASecondPlainHead(t *testing.T) {
 	if strings.Index(both, `[device "video1"]`) < strings.Index(both, `[device "video0"]`) {
 		t.Errorf("video1 must be emitted after video0, got:\n%s", both)
 	}
-	// 0x1 is video0 and 0x2 is the iGPU's reserved guest BDF.
-	if !strings.Contains(both, `addr = "0x3"`) {
-		t.Errorf("the second head must not land on a reserved slot, got:\n%s", both)
+	// Slot 0x3 held the unnamed virtio-serial device and QEMU refused the
+	// domain with "slot 3 function 0 not available for virtio-vga, in use by
+	// virtio-serial-pci". 0x1 is video0, 0x2 is the iGPU's guest BDF, and the
+	// root ports run from 4 up, so the second head has to sit above them.
+	if !strings.Contains(both, `addr = "0x1c"`) {
+		t.Errorf("the second head must not land on an occupied slot, got:\n%s", both)
+	}
+	if strings.Contains(both, `addr = "0x3"`) {
+		t.Errorf("0x3 belongs to virtio-serial, got:\n%s", both)
 	}
 
 	// Neither existing case changes: VNC alone keeps exactly one plain head
