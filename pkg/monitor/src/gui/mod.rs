@@ -136,6 +136,8 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
     let mut backoff = Backoff::default();
     // Tab 0 is the node page; guests are tabs 1..n.
     let mut show_node = true;
+    // Chrome hidden, guest filling the head; Ctrl+Alt+F toggles it.
+    let mut fullscreen = false;
 
     // Before anything converts coordinates or lays out a frame.
     let _ = PPP.set(scale_for(heads[0].w, heads[0].mm, cfg.scale));
@@ -220,7 +222,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
 
             // What the input thread has published. It forwards to the guest itself,
             // so guest latency does not depend on our frame rate.
-            let (ui_events, focus, cx, cy, hot_tab) = {
+            let (ui_events, focus, cx, cy, hot_tab, hot_fs) = {
                 let mut s = inp.state.lock().unwrap();
                 (
                     std::mem::take(&mut s.egui_events),
@@ -228,6 +230,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                     s.x as f32,
                     s.y as f32,
                     s.want_tab.take(),
+                    std::mem::take(&mut s.want_fullscreen),
                 )
             };
 
@@ -279,6 +282,7 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
                 };
                 let view = ui::Frame {
                     node_tab: show_node,
+                    fullscreen,
                     node: ui::NodeView {
                         name: &node.0,
                         serial: &node.1,
@@ -373,6 +377,10 @@ pub fn run(pillar: crate::ipc::Shared, switch: std::sync::Arc<std::sync::atomic:
             // The hotkey wins over a tab-bar click.
             // Tab 0 is the node page, so Ctrl+Alt+1 and a click on the first
             // tab mean the same thing.
+            if hot_fs {
+                fullscreen = !fullscreen;
+                log::info!("fullscreen -> {fullscreen}");
+            }
             let want = hot_tab.filter(|t| *t <= vms.len()).or(act.tab);
             if let Some(t) = want {
                 let (node, idx) = if t == 0 { (true, active) } else { (false, t - 1) };

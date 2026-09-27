@@ -101,6 +101,8 @@ pub struct State {
     pub guest_size: (u32, u32),
     pub egui_events: Vec<egui::Event>,
     pub want_tab: Option<usize>,
+    /// Ctrl+Alt+F was pressed; the render loop toggles fullscreen and clears it.
+    pub want_fullscreen: bool,
 }
 
 /// Handle held by the render loop. The input thread blocks on the libinput fd
@@ -225,6 +227,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             s.focus_guest = inp.focus == Focus::Guest;
             s.egui_events.append(&mut inp.egui_events);
             if let Some(t) = inp.want_tab.take() { s.want_tab = Some(t); }
+            if std::mem::take(&mut inp.want_fullscreen) { s.want_fullscreen = true; }
             inp.view = s.view;            // render loop publishes these back
             inp.guest_size = s.guest_size;
         }
@@ -261,6 +264,8 @@ pub struct Input {
     pub guest_size: (u32, u32),
     /// Tab the user asked for via Ctrl+Alt+N; consumed by the caller.
     pub want_tab: Option<usize>,
+    /// Ctrl+Alt+F, consumed by the caller.
+    pub want_fullscreen: bool,
     abs_n: u64,
     /// inotify on /dev/input. usbhid is a module (CONFIG_USB_HID=m) and lands
     /// ~24s into boot, long after this process starts, so a one-shot scan of
@@ -313,6 +318,7 @@ impl Input {
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
             view: (0.0, 0.0, 0.0, 0.0), guest_size: (0, 0), abs_n: 0, want_tab: None,
+            want_fullscreen: false,
             inotify_fd, devices: HashMap::new(),
         };
 
@@ -559,6 +565,12 @@ impl Input {
                     if down && self.ctrl && self.alt && (2..=10).contains(&code) {
                         self.want_tab = Some((code - 2) as usize);
                         self.release_held();   // no stuck modifiers in the old VM
+                        self.release_modifiers();
+                        continue;
+                    }
+                    if code == 33 && down && self.ctrl && self.alt {
+                        self.want_fullscreen = true;
+                        self.release_held();
                         self.release_modifiers();
                         continue;
                     }

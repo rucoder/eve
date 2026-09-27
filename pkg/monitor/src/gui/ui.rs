@@ -98,6 +98,9 @@ pub struct Frame<'a> {
     pub display: DisplayView<'a>,
     /// Tab 0 is the node page; guests follow.
     pub node_tab: bool,
+    /// Chrome hidden, guest filling the head. The bar comes back as an
+    /// overlay while the pointer is at the top edge.
+    pub fullscreen: bool,
 }
 
 #[derive(Default)]
@@ -110,10 +113,42 @@ pub struct Actions {
     pub viewport: Option<egui::Rect>,
 }
 
+/// How close to the top edge, in points, reveals the chrome in fullscreen.
+/// Deliberately generous: a pointer that is being *thrown* at the edge
+/// overshoots by a few pixels and then sits exactly at 0, but one moved by
+/// hand stops short, and a 2px strip is unhittable on a 1080p panel.
+const REVEAL_BAND: f32 = 48.0;
+
 pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
     let mut act = Actions::default();
-    top_bar(ctx, f, &mut act);
-    egui::CentralPanel::default().show(ctx, |ui| central(ui, f, &mut act));
+    // In fullscreen the bar is drawn last, as an overlay, so it sits above
+    // the guest image instead of taking space from it.
+    let reveal = f.pointer.y <= REVEAL_BAND;
+    if !f.fullscreen {
+        top_bar(ctx, f, &mut act);
+    }
+    let frame = if f.fullscreen {
+        // No margins and no rounding: every point belongs to the guest.
+        egui::Frame::NONE.fill(ctx.style().visuals.panel_fill)
+    } else {
+        egui::Frame::central_panel(&ctx.style())
+    };
+    egui::CentralPanel::default().frame(frame).show(ctx, |ui| central(ui, f, &mut act));
+    if f.fullscreen && reveal {
+        egui::Area::new(egui::Id::new("fs_bar"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let w = ctx.screen_rect().width();
+                egui::Frame::NONE
+                    .fill(ui.visuals().panel_fill.gamma_multiply(0.94))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.set_width(w - 16.0);
+                        bar_contents(ui, f, &mut act);
+                    });
+            });
+    }
     // Our own pointer goes on a foreground layer so no panel can clip it, and
     // only over OUR chrome: inside the guest view either the guest composites
     // its cursor or we drew it above, and a second arrow looks broken.
@@ -125,7 +160,13 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
 }
 
 fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
-    egui::TopBottomPanel::top("bar").show(ctx, |ui| {
+    egui::TopBottomPanel::top("bar").show(ctx, |ui| bar_contents(ui, f, act));
+}
+
+/// The chrome itself, so the panel and the fullscreen overlay draw the same
+/// thing rather than drifting apart.
+fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
+    {
         ui.horizontal(|ui| {
             ui.heading("EVE GUI");
             ui.separator();
@@ -181,8 +222,14 @@ fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
             ui.colored_label(colour, text);
             ui.separator();
             ui.weak("Ctrl+Alt+1/2 = tab");
+            ui.separator();
+            ui.weak(if f.fullscreen {
+                "Ctrl+Alt+F = leave fullscreen"
+            } else {
+                "Ctrl+Alt+F = fullscreen"
+            });
         });
-    });
+    }
 }
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
