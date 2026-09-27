@@ -4,11 +4,12 @@
 //! THROWAWAY SPIKE — libinput capture and routing (GUI <-> guest).
 //! Opens /dev/input/event* directly as root: no udev, no logind, no seat.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 
 use smithay::reexports::input as li;
 use li::event::keyboard::{KeyState, KeyboardEventTrait};
@@ -22,6 +23,12 @@ fn now_usec() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+}
+
+/// /dev/input also holds mice, mouseN and jsN aliases of the same hardware.
+/// Only the evdev nodes are libinput's business.
+fn is_event_node(p: &Path) -> bool {
+    p.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("event"))
 }
 
 fn dev_id(d: &li::Device) -> String {
@@ -174,6 +181,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
         inp.scale = scale;
         inp.stats = sts;
         let fd = inp.fd();
+        let hotplug_fd = inp.hotplug_fd();
         loop {
             // BLOCK until the kernel has something, or a shutdown is
             // requested. No timeout, no polling: the thread sleeps and wakes
@@ -181,8 +189,9 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             let mut pfds = [
                 libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: shutdown_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: hotplug_fd, events: libc::POLLIN, revents: 0 },
             ];
-            if unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) } < 0 {
+            if unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) } < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted { continue; }
                 // Anything else is permanent (a bad fd after device teardown);
@@ -193,6 +202,9 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             if pfds[1].revents & libc::POLLIN != 0 {
                 log::info!("input: shutdown requested; closing libinput");
                 return; // drops `inp` here, closing every device fd it opened
+            }
+            if pfds[2].revents & libc::POLLIN != 0 {
+                inp.handle_hotplug();
             }
             inp.pump(crate::gui::points_per_pixel());
             // forward to the guest IMMEDIATELY, at device rate
@@ -250,43 +262,49 @@ pub struct Input {
     /// Tab the user asked for via Ctrl+Alt+N; consumed by the caller.
     pub want_tab: Option<usize>,
     abs_n: u64,
+    /// inotify on /dev/input. usbhid is a module (CONFIG_USB_HID=m) and lands
+    /// ~24s into boot, long after this process starts, so a one-shot scan of
+    /// /dev/input finds the ACPI buttons and nothing else - no keyboard, no
+    /// mouse, forever, because the path backend has no udev to tell it about
+    /// devices that appear later.
+    inotify_fd: RawFd,
+    /// Every node we handed to libinput, so a node that goes away can be
+    /// handed back. path_remove_device needs the Device, not the path.
+    devices: HashMap<PathBuf, li::Device>,
+}
+
+/// inotify_event has 4-byte alignment; a bare [u8; N] on the stack does not
+/// promise that, and we cast straight into it.
+#[repr(C, align(8))]
+struct InotifyBuf([u8; 4096]);
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        // The libinput context closes the device fds itself; the watch is ours.
+        unsafe { libc::close(self.inotify_fd) };
+    }
 }
 
 impl Input {
     pub fn new(w: i32, h: i32) -> anyhow::Result<Self> {
-        let mut li = Libinput::new_from_path(Iface);
-        let mut n = 0;
-        let mut seen = 0;
-        for e in std::fs::read_dir("/dev/input")? {
-            let p = e?.path();
-            if p.file_name().and_then(|s| s.to_str()).map_or(false, |s| s.starts_with("event")) {
-                seen += 1;
-                // libinput hands back a bare None when it refuses a device and
-                // its own diagnostics go nowhere unless a log handler is
-                // installed, so probe the node ourselves first: that separates
-                // "we cannot open it" (namespace, permissions) from "libinput
-                // refused it" (its own device checks), which otherwise look
-                // identical from here.
-                if let Err(err) = std::fs::File::open(&p) {
-                    log::warn!("libinput: {} not openable: {err}", p.display());
-                    continue;
-                }
-                if li.path_add_device(p.to_str().unwrap()).is_some() {
-                    n += 1;
-                } else {
-                    log::warn!("libinput: refused {} (opened fine, libinput said no)", p.display());
-                }
-            }
+        let li = Libinput::new_from_path(Iface);
+
+        // Watch BEFORE the initial scan. The other order has a hole: a node
+        // created between the scan and the watch is in neither, and stays
+        // invisible until the process restarts.
+        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if inotify_fd < 0 {
+            return Err(anyhow::anyhow!("input: inotify_init1: {}", std::io::Error::last_os_error()));
         }
-        if n == 0 && seen > 0 {
-            log::error!("libinput: no input devices usable out of {seen} event node(s) - keyboard and pointer will not work");
-        } else if seen == 0 {
-            log::error!("libinput: /dev/input has no event nodes - keyboard and pointer will not work");
+        let dir = std::ffi::CString::new("/dev/input").unwrap();
+        let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM;
+        if unsafe { libc::inotify_add_watch(inotify_fd, dir.as_ptr(), mask) } < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(inotify_fd) };
+            return Err(anyhow::anyhow!("input: watching /dev/input: {e}"));
         }
-        log::info!("libinput: {n}/{seen} device(s) opened directly (no udev/logind/seat)");
-        log::info!("pointer: raw 1:1, scale {}",
-                 std::env::var("GUI_PTR_SCALE").unwrap_or_else(|_| "1.0".into()));
-        Ok(Self {
+
+        let mut me = Self {
             li, focus: Focus::Gui, x: w as f64 / 2.0, y: h as f64 / 2.0,
             w: w as f64, h: h as f64, ctrl: false, alt: false, last_toggle: None, swallow_release: None, scroll_acc: (0.0, 0.0), abs_devices: Default::default(),
             scale: std::env::var("GUI_PTR_SCALE").ok()
@@ -295,7 +313,95 @@ impl Input {
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
             view: (0.0, 0.0, 0.0, 0.0), guest_size: (0, 0), abs_n: 0, want_tab: None,
-        })
+            inotify_fd, devices: HashMap::new(),
+        };
+
+        let mut seen = 0;
+        for e in std::fs::read_dir("/dev/input")? {
+            let p = e?.path();
+            if is_event_node(&p) {
+                seen += 1;
+                me.try_add(&p);
+            }
+        }
+        let n = me.devices.len();
+        if n == 0 && seen > 0 {
+            log::error!("libinput: no input devices usable out of {seen} event node(s) - waiting for hotplug");
+        } else if seen == 0 {
+            log::error!("libinput: /dev/input has no event nodes - waiting for hotplug");
+        }
+        log::info!("libinput: {n}/{seen} device(s) opened directly (no udev/logind/seat)");
+        log::info!("pointer: raw 1:1, scale {}",
+                 std::env::var("GUI_PTR_SCALE").unwrap_or_else(|_| "1.0".into()));
+        Ok(me)
+    }
+
+    /// The fd to poll for device arrivals and departures.
+    pub fn hotplug_fd(&self) -> RawFd { self.inotify_fd }
+
+    /// Hand one node to libinput. Quiet about nodes we already hold, so a
+    /// duplicate inotify event is harmless.
+    fn try_add(&mut self, p: &Path) {
+        if self.devices.contains_key(p) { return; }
+        // libinput hands back a bare None when it refuses a device and its own
+        // diagnostics go nowhere unless a log handler is installed, so probe
+        // the node ourselves first: that separates "we cannot open it"
+        // (namespace, permissions) from "libinput refused it" (its own device
+        // checks), which otherwise look identical from here.
+        if let Err(err) = std::fs::File::open(p) {
+            log::warn!("libinput: {} not openable: {err}", p.display());
+            return;
+        }
+        match self.li.path_add_device(&p.to_string_lossy()) {
+            Some(d) => { self.devices.insert(p.to_path_buf(), d); }
+            None => log::warn!("libinput: refused {} (opened fine, libinput said no)", p.display()),
+        }
+    }
+
+    fn try_remove(&mut self, p: &Path) {
+        if let Some(d) = self.devices.remove(p) {
+            log::info!("libinput: {} went away", p.display());
+            self.li.path_remove_device(d);
+        }
+    }
+
+    /// Drain inotify and add or drop devices. Called when `hotplug_fd` polls
+    /// readable; the fd is non-blocking, so this returns once drained.
+    pub fn handle_hotplug(&mut self) {
+        const HDR: usize = std::mem::size_of::<libc::inotify_event>();
+        let mut buf = InotifyBuf([0u8; 4096]);
+        loop {
+            let got = unsafe {
+                libc::read(self.inotify_fd, buf.0.as_mut_ptr() as *mut libc::c_void, buf.0.len())
+            };
+            if got <= 0 { return; }          // EAGAIN once drained
+            let got = got as usize;
+            let mut off = 0usize;
+            while off + HDR <= got {
+                // SAFETY: the kernel writes whole inotify_event records, and
+                // InotifyBuf is aligned for them.
+                let ev = unsafe { &*(buf.0.as_ptr().add(off) as *const libc::inotify_event) };
+                let (mask, len) = (ev.mask, ev.len as usize);
+                let name = buf.0.get(off + HDR..off + HDR + len).and_then(|nb| {
+                    let end = nb.iter().position(|&c| c == 0).unwrap_or(nb.len());
+                    std::str::from_utf8(&nb[..end]).ok().map(str::to_owned)
+                });
+                off += HDR + len;
+                let Some(name) = name else { continue };
+                let path = PathBuf::from("/dev/input").join(&name);
+                if !is_event_node(&path) { continue; }
+                if mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                    let before = self.devices.len();
+                    self.try_add(&path);
+                    if self.devices.len() > before {
+                        log::info!("libinput: {} appeared, now {} device(s)",
+                                   path.display(), self.devices.len());
+                    }
+                } else if mask & (libc::IN_DELETE | libc::IN_MOVED_FROM) != 0 {
+                    self.try_remove(&path);
+                }
+            }
+        }
     }
 
     pub fn fd(&self) -> i32 { self.li.as_raw_fd() }
