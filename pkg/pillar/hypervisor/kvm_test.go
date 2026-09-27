@@ -3724,3 +3724,64 @@ func TestVirtualGPUModeOmitsPassthroughDevice(t *testing.T) {
 		t.Errorf("passthrough mode must not emit virtio-vga-gl, got:\n%s", passthrough)
 	}
 }
+
+// VNC and a virtual GPU have to coexist: an operator who turns on the
+// graphical console should not lose the remote console they already had.
+//
+// QEMU rejects a VNC server on a console that carries a GL context, and the
+// domain fails to start with "Display vnc is incompatible with the GL
+// context" - observed on a BX-39A the first time an app was switched to
+// virtual-GPU mode with VNC still enabled. The rejection is per console
+// (ui/console.c, console_compatible_with), so the fix is a second plain head
+// for VNC, leaving console 0 for the GL device the graphical console imports
+// from.
+func TestVirtualGPUWithVncGetsASecondPlainHead(t *testing.T) {
+	t.Parallel()
+
+	render := func(virtualGPU, enableVnc bool) string {
+		var buf bytes.Buffer
+		ctx := tQemuGlobalConfContext{
+			Machine:            "q35",
+			VirtualizationMode: "HVM",
+			VirtualGPU:         virtualGPU,
+			DomainConfig:       types.DomainConfig{VmConfig: types.VmConfig{EnableVnc: enableVnc}},
+		}
+		if err := tQemuGlobalConf.Execute(&buf, ctx); err != nil {
+			t.Fatalf("rendering the global config failed: %v", err)
+		}
+		return buf.String()
+	}
+
+	both := render(true, true)
+	if !strings.Contains(both, `[device "video0"]`) ||
+		!strings.Contains(both, `driver = "virtio-vga-gl"`) {
+		t.Errorf("the console's head must stay GL, got:\n%s", both)
+	}
+	if !strings.Contains(both, `[device "video1"]`) {
+		t.Errorf("VNC plus a virtual GPU needs a second head, got:\n%s", both)
+	}
+	if !strings.Contains(both, `display = "video1"`) {
+		t.Errorf("VNC must be bound to the plain head or the domain will not start, got:\n%s", both)
+	}
+	// Device order is what assigns console indices, and the graphical console
+	// hardcodes Console_0. video1 before video0 would silently hand the GL
+	// scanout to VNC and the plain head to the console.
+	if strings.Index(both, `[device "video1"]`) < strings.Index(both, `[device "video0"]`) {
+		t.Errorf("video1 must be emitted after video0, got:\n%s", both)
+	}
+	// 0x1 is video0 and 0x2 is the iGPU's reserved guest BDF.
+	if !strings.Contains(both, `addr = "0x3"`) {
+		t.Errorf("the second head must not land on a reserved slot, got:\n%s", both)
+	}
+
+	// Neither existing case changes: VNC alone keeps exactly one plain head
+	// and no display binding, and a virtual GPU alone emits no VNC at all.
+	vncOnly := render(false, true)
+	if strings.Contains(vncOnly, `[device "video1"]`) || strings.Contains(vncOnly, "display =") {
+		t.Errorf("a VNC app without a virtual GPU must be unchanged, got:\n%s", vncOnly)
+	}
+	glOnly := render(true, false)
+	if strings.Contains(glOnly, `[device "video1"]`) || strings.Contains(glOnly, `[vnc "default"]`) {
+		t.Errorf("a virtual GPU without VNC needs only its GL head, got:\n%s", glOnly)
+	}
+}
