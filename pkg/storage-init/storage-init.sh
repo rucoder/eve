@@ -351,9 +351,27 @@ fi
 # then replace files under /persist/services/monitor and restart the service.
 # The bind is established here at boot, so staging a new service needs one
 # reboot; replacing a binary inside an already-bound directory does not.
+#
+# Most services own their lower layer at /containers/services/<name>/lower.
+# pillar does not: its service overlay takes the lower layer from the
+# pillar-onboot container, so that path does not exist and the bind has to go
+# to the onboot copy. That directory is also what pillar-onboot itself runs
+# from, so both end up on the staged rootfs, which is what we want.
 for s in "$PERSISTDIR"/services/* ; do
   if [ -d "$s" ]; then
-     echo "storage-init: running $(basename "$s") from $s"
-     mount --bind "$s" "/containers/services/$(basename "$s")/lower"
+     n=$(basename "$s")
+     target="/containers/services/$n/lower"
+     if [ ! -d "$target" ]; then
+        target=""
+        for d in /containers/onboot/*-"$n"-onboot/lower ; do
+           if [ -d "$d" ]; then target="$d"; break; fi
+        done
+     fi
+     if [ -n "$target" ]; then
+        echo "storage-init: running $n from $s over $target"
+        mount --bind "$s" "$target"
+     else
+        echo "storage-init: $s is staged but $n has no lower dir; ignoring"
+     fi
   fi
 done
