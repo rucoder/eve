@@ -80,7 +80,7 @@ FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runtime
 # DT_NEEDED on libxkbcommon.so.0 and the console dies at startup with a
 # missing shared library. Ship it rather than depend on an optimisation to
 # make the dependency disappear.
-ENV PKGS="kbd pciutils usbutils mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs libxkbcommon eudev-libs"
+ENV PKGS="kbd pciutils usbutils mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libdrm libinput-libs libinput libxkbcommon eudev-libs"
 RUN eve-alpine-deploy.sh
 
 # The stage below copies /out/usr/lib (and part of /out/usr/share) wholesale,
@@ -131,6 +131,10 @@ COPY --from=runtime /out/usr/bin/lspci /usr/bin/lspci
 COPY --from=runtime /out/usr/share/keymaps/xkb/us.map.gz /usr/share/keymaps/xkb/us.map.gz
 # libpciaccess (mesa) reads this at run time; see the prune block above.
 COPY --from=runtime /out/usr/share/hwdata /usr/share/hwdata
+# libinput reads its device-quirks data at runtime and complains loudly
+# ("failed to find data files") without it. libinput-libs ships only the
+# shared library; the quirks come from the libinput package.
+COPY --from=runtime /out/usr/share/libinput /usr/share/libinput
 COPY --from=runtime /out/lib /lib
 COPY --from=runtime /out/usr/lib /usr/lib
 

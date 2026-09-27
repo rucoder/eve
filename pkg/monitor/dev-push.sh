@@ -36,17 +36,24 @@ docker run --rm -v eve-monitor-target:/target -v /tmp:/out alpine \
   cp /target/x86_64-unknown-linux-musl/quick/monitor /out/monitor.new
 
 scp -o StrictHostKeyChecking=no /tmp/monitor.new "$HOST:/tmp/monitor.new"
+# The remote block below carries no prose on purpose. pkill -f matches whole
+# command lines, and this ssh invocation's argv is itself a command line on
+# the target: any comment mentioning the wrapper by name makes pkill match
+# our own shell, drop the connection, and return 255 - while the console
+# restarts regardless, so a working push reports failure. The [m] bracket
+# keeps the pattern from matching itself; keeping the name out of the block
+# entirely is what makes that hold.
+#
+# Killing only the binary is not enough: the wrapper runs it and then blocks
+# on a read so a human can see panic output, and on an unattended tty2 that
+# read never returns, so openvt never exits and run-monitor.sh never restarts.
 ssh -o StrictHostKeyChecking=no "$HOST" '
   set -e
-  test -d /persist/services/monitor || { echo "not staged: see header of dev-push.sh"; exit 1; }
-  mountpoint -q /containers/services/monitor/lower || { echo "bind not active - reboot once after staging"; exit 1; }
+  test -d /persist/services/monitor || { echo "NOT_STAGED - see header"; exit 1; }
+  mountpoint -q /containers/services/monitor/lower || { echo "NO_BIND - reboot once after staging"; exit 1; }
   cp /tmp/monitor.new /persist/services/monitor/sbin/monitor
   chmod +x /persist/services/monitor/sbin/monitor
-  # Kill the wrapper, not just the binary. monitor-wrapper.sh runs
-  # /sbin/monitor and then blocks on a read so a human can see panic output;
-  # with only the binary killed that read waits forever on an unattended tty2,
-  # openvt never returns, and run-monitor.sh never loops round to restart.
-  pkill -f "/sbin/monitor-wrapper.sh" || true
+  pkill -f "[m]onitor-wrapper" || true
   pkill -f "^/sbin/monitor$" || true
   i=0
   while [ $i -lt 20 ]; do
