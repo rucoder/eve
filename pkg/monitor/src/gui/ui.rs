@@ -198,6 +198,8 @@ pub struct Frame<'a> {
     pub apps: &'a [AppView],
     /// The port editor, when one is open.
     pub edit: Option<&'a PortEdit>,
+    /// Whether the readback probe is running, for the checkbox that owns it.
+    pub probe: bool,
 }
 
 #[derive(Default)]
@@ -218,6 +220,8 @@ pub struct Actions {
     pub send_wake: bool,
     /// Leave fullscreen; the overlay's button, equivalent to Ctrl+Alt+F.
     pub toggle_fullscreen: bool,
+    /// Turn the readback probe on or off; persisted to config.json.
+    pub set_probe: Option<bool>,
     /// Chrome drawn over the guest, in points. Input must reach US here even
     /// while the guest holds the pointer, or the way out is unclickable
     /// exactly when it is needed.
@@ -433,7 +437,7 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
                 }
             });
         match f.page {
-            NodePage::Summary => node_page(ui, &f.node, &f.display, f.fps, &f.guest),
+            NodePage::Summary => node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, act),
             NodePage::Network => network_page(ui, f.ports, act),
             NodePage::Apps => apps_page(ui, f.apps),
         }
@@ -697,6 +701,8 @@ fn node_page(
     d: &DisplayView,
     fps: f32,
     g: &GuestView<'_>,
+    probe: bool,
+    act: &mut Actions,
 ) {
     if !n.connected {
         ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
@@ -826,6 +832,20 @@ fn node_page(
                 ui.label(v);
                 ui.end_row();
             }
+            ui.label(egui::RichText::new("Probe").strong());
+            let mut on = probe;
+            let c = ui.checkbox(&mut on, "count non-black pixels every 10s");
+            if c.changed() {
+                act.set_probe = Some(on);
+            }
+            c.on_hover_text(
+                "Reads the blitted guest image back off the GPU. The only way \
+                 to tell a guest that is drawing nothing from pixels this \
+                 console is losing, because screendump cannot see a dmabuf \
+                 scanout. Costs a pipeline stall each time, so leave it off \
+                 unless a tab is blank.",
+            );
+            ui.end_row();
         });
 }
 

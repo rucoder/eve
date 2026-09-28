@@ -119,8 +119,13 @@ pub fn run(
     outbox: tokio::sync::mpsc::UnboundedSender<crate::ipc::message::IpcMessage>,
     switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mode: Option<&str>,
+    gui_cfg: crate::application::GuiConfig,
+    config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let cfg = Config::from_env();
+    // The env var forces it on for a one-off run; otherwise the checkbox on
+    // the Node page owns it, and that choice is persisted.
+    let mut probe = cfg.probe || gui_cfg.probe;
     // Held for the whole run; Drop puts the VT keyboard back.
     let _cad = vt::CtrlAltDelGuard::take();
     vt::install_signal_handlers();
@@ -233,7 +238,7 @@ pub fn run(
 
             // Guest framebuffer: once per frame, not once per head.
             if let Some(vm) = vms.get_mut(active) {
-                vm.update(&mut gpu.renderer, &mut painter, &egui_ctx, cfg.probe, n);
+                vm.update(&mut gpu.renderer, &mut painter, &egui_ctx, probe, n);
             }
 
             // Guest hardware cursor.
@@ -333,6 +338,7 @@ pub fn run(
                     ports: &ports,
                     apps: &apps,
                     edit: edit.as_ref(),
+                    probe,
                     node: ui::NodeView {
                         name: &node.0,
                         serial: &node.1,
@@ -557,6 +563,11 @@ pub fn run(
                     xoff += want.0 as i32;
                 }
             }
+            if let Some(on) = act.set_probe {
+                probe = on;
+                log::info!("readback probe {}", if on { "on" } else { "off" });
+                save_gui_probe(&config_path, on);
+            }
             if let Some(p) = act.page {
                 node_page = p;
             }
@@ -695,7 +706,10 @@ pub fn run(
             }
             n_done = n + 1;
 
-            if n > 0 && n % 120 == 0 {
+            // Every 30s, not every 2s. At 60fps a two-second heartbeat is
+            // 43k lines a day, which pushed anything worth reading out of the
+            // rotation long before anyone came to look for it.
+            if n > 0 && n % 1800 == 0 {
                 // Report input latency from here, where a syscall is free.
                 let (sum, cnt, mx) = inp.stats.take();
                 let lat = if cnt > 0 {
@@ -917,6 +931,37 @@ fn head_geometry(heads: &[drm::Head], idx: usize) -> Option<guest::HeadGeometry>
         xoff: heads[..idx].iter().map(|p| p.w).sum(),
         yoff: 0,
     })
+}
+
+/// Persist one gui setting without disturbing the rest of config.json.
+///
+/// Read-modify-write of the raw JSON rather than serialising our own struct:
+/// the file is shared with the TUI frontend and with pillar's log-level
+/// handling, and rewriting it wholesale would drop any key this build does
+/// not know about.
+fn save_gui_probe(path: &std::path::Path, on: bool) {
+    let write = || -> anyhow::Result<()> {
+        let mut v: serde_json::Value = match std::fs::read_to_string(path) {
+            Ok(s) => serde_json::from_str(&s)?,
+            Err(_) => serde_json::json!({}),
+        };
+        v.as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config.json is not an object"))?
+            .entry("gui")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config.json \"gui\" is not an object"))?
+            .insert("probe".into(), serde_json::Value::Bool(on));
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
+        // Rename, so a crash mid-write cannot leave a config that will not
+        // parse and take the console down on its next boot.
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        log::error!("saving the probe setting to {}: {e}", path.display());
+    }
 }
 
 /// The geometry last asked of one head's guest, and how hard we have pushed.

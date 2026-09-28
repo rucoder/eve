@@ -48,6 +48,14 @@ pub struct GuiConfig {
     /// the largest mode offered when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+
+    /// Read the blitted guest image back each probe interval and count its
+    /// non-black pixels. The only way to tell "the guest sent us nothing"
+    /// from "we lost the pixels" once the scanout is a dmabuf, because QMP
+    /// `screendump` answers "no surface" on that path. Off by default: it is
+    /// a full GPU readback and it stalls the pipeline.
+    #[serde(default)]
+    pub probe: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

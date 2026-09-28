@@ -103,8 +103,11 @@ fn init_logging(log_level: &str) -> log2::Handle {
     let log_file = log_dir.join("monitor.log").to_string_lossy().to_string();
 
     let handle = log2::open(&log_file)
-        .size(1024 * 1024)
-        .rotate(10)
+        // 4MB x 5 rather than 1MB x 10. The window matters more than the
+        // total: at debug the old ring held about three minutes, so a fault
+        // had always scrolled away by the time anyone looked at it.
+        .size(4 * 1024 * 1024)
+        .rotate(5)
         .tee(false) // no console output
         .module(true)
         .level(log_level)
@@ -442,7 +445,15 @@ async fn main() -> Result<()> {
                     stop_watcher.clone(),
                 );
 
-                if let Err(e) = gui::run(client.state.clone(), client.outbox.clone(), switch.clone(), config.gui.mode.as_deref()) {
+                let cfg_path = get_base_dir().join("config").join("config.json");
+                if let Err(e) = gui::run(
+                    client.state.clone(),
+                    client.outbox.clone(),
+                    switch.clone(),
+                    config.gui.mode.as_deref(),
+                    config.gui.clone(),
+                    cfg_path,
+                ) {
                     log::error!("Gui error: {e}");
                 }
                 stop_watcher.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -492,7 +492,7 @@ impl Scanout {
             return;
         }
 
-        if probe && frame % 120 == 1 {
+        if probe && frame % 600 == 1 {
             self.probe_nonblack = probe_target(renderer, target, w, h);
         }
         if self.dma_id.is_none() {
