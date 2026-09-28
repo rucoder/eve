@@ -64,6 +64,10 @@ pub const CTRL_ALT_DEL: &[(u32, bool)] = &[
 /// Something to do to the guest, drained by the caller each frame.
 #[derive(Debug)]
 pub enum GuestAct {
+    /// The area we will draw this guest in changed - fullscreen toggled, a
+    /// head changed mode. Tell it, so it renders at exactly that size and we
+    /// blit one pixel to one pixel instead of scaling.
+    Ui(usize, crate::gui::guest::HeadGeometry),
     AbsPos(u32, u32),
     Btn(u32, bool),
     Key(u32, bool),

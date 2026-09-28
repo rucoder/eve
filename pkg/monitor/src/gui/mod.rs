@@ -94,12 +94,13 @@ impl Config {
 ///
 /// Semicolon separated, because a D-Bus address itself contains a comma
 /// (`unix:path=...,guid=...`).
-fn spawn_vms(spec: &str) -> Vec<Vm> {
+fn spawn_vms(spec: &str, heads: &[drm::Head]) -> Vec<Vm> {
     let mut vms = Vec::new();
     for entry in spec.split(';').filter(|e| !e.trim().is_empty()) {
         let Some((name, bus)) = entry.split_once('=') else { continue };
         let (name, bus) = (name.trim().to_string(), bus.trim().to_string());
-        let (shared, tx) = guest::spawn(&name, guest::Transport::Address(bus), 0);
+        let (shared, tx) =
+            guest::spawn(&name, guest::Transport::Address(bus), head_geometries(heads));
         log::info!("tab {}: {}", vms.len(), name);
         vms.push(Vm::new(name, shared, tx));
     }
@@ -128,6 +129,15 @@ pub fn run(
     let card = drm::pick_card(cfg.card.as_deref())?;
     let mut gpu = drm::open(&card)?;
     let mut heads = drm::discover_heads(&mut gpu, mode)?;
+    // Monitors come and go while this runs; without this the head set is
+    // whatever was plugged in at startup, for ever.
+    let hotplug = match drm::HotplugWatch::new() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("no hotplug watch ({e}); the head set is fixed for this run");
+            None
+        }
+    };
 
     // egui_glow painter sharing smithay's GL context.
     let gl: Arc<glow::Context> = gpu.renderer.with_context(|gl| gl.clone())?;
@@ -136,7 +146,10 @@ pub fn run(
     let egui_ctx = egui::Context::default();
     log::info!("egui_glow painter created on smithay's GL context");
 
-    let mut vms = spawn_vms(&cfg.vms);
+    // What we tell guests about the monitors, rebuilt whenever the head set
+    // changes. Cached because it is handed to every attach.
+    let mut head_geoms = head_geometries(&heads);
+    let mut vms = spawn_vms(&cfg.vms, &heads);
     let mut active = 0usize;
     let mut backoff = Backoff::default();
     // Tab 0 is the node page; guests are tabs 1..n.
@@ -145,6 +158,11 @@ pub fn run(
     let mut fullscreen = false;
     // Which page of the node tab is showing.
     let mut node_page = ui::NodePage::Summary;
+    // The viewport size last reported to the active guest. A guest renders at
+    // the size we tell it, so this is what keeps the blit 1:1 rather than
+    // scaled - and it changes when fullscreen is toggled.
+    // Per head, because each one shows a different scanout at its own size.
+    let mut told_viewport: Vec<Option<(u32, u32)>> = vec![None; heads.len()];
     // The open port editor, if any, and what each port looked like before the
     // last Apply so Undo has somewhere to go.
     let mut edit: Option<ui::PortEdit> = None;
@@ -197,11 +215,11 @@ pub fn run(
             // holds the active slot - an app removed, a guest that died and
             // came back - it has to be re-pointed in the same breath, or
             // every keystroke goes to a channel nobody is reading.
-            if reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff) {
+            if reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff, &head_geoms) {
                 match vms.get(active) {
                     Some(vm) => {
                         inp.set_active(vm.tx.clone());
-                        win_gseq = vm.seq;
+                        win_gseq = vm.head(0).seq;
                         log::info!("active tab is now {}", vm.name);
                     }
                     None => {
@@ -219,7 +237,7 @@ pub fn run(
 
             // Guest hardware cursor.
             if let Some(vm) = vms.get(active) {
-                let g = guest::frame(&vm.shared);
+                let g = guest::frame(&vm.head(0).shared);
                 if g.cursor_seq != cur_seq {
                     if let Some(c) = &g.cursor {
                         cur_seq = g.cursor_seq;
@@ -255,7 +273,7 @@ pub fn run(
             let wdt = win_t.elapsed().as_secs_f32();
             if wdt >= 0.5 {
                 fps_now = win_frames as f32 / wdt;
-                let seq = vms.get(active).map_or(0, |v| v.seq);
+                let seq = vms.get(active).map_or(0, |v| v.head(0).seq);
                 gfps_now = seq.saturating_sub(win_gseq) as f32 / wdt;
                 win_t = std::time::Instant::now();
                 win_frames = 0;
@@ -263,7 +281,10 @@ pub fn run(
             }
 
             let mut act = ui::Actions::default();
-            for head in heads.iter_mut() {
+            // Where each head wants the guest drawn, collected here because
+            // `act` is overwritten by the next head's frame.
+            let mut viewports: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
+            for (hi, head) in heads.iter_mut().enumerate() {
                 let head_name = head.name.clone();
                 let (mut dmabuf, _age) = head.surface.next_buffer()?;
                 let size = (head.w, head.h).into();
@@ -280,7 +301,7 @@ pub fn run(
                 tabs.extend(vms.iter().map(|v| v.name.clone()));
                 let (orphans, cursor_visible, has_cursor) = match vms.get(active) {
                     Some(vm) => {
-                        let g = guest::frame(&vm.shared);
+                        let g = guest::frame(&vm.head(hi).shared);
                         (g.orphan_updates, g.cursor_visible, g.cursor.is_some())
                     }
                     None => (0, false, false),
@@ -338,16 +359,16 @@ pub fn run(
                     active: if show_node { 0 } else { active + 1 },
                     focus,
                     pointer: egui::pos2(cx / points_per_pixel(), cy / points_per_pixel()),
-                    guest: match vms.get(active) {
-                        Some(vm) => ui::GuestView {
-                            dma_id: vm.dma_id,
-                            dma_size: vm.dma_size,
-                            dma_flip: vm.dma_flip,
-                            tex: vm.tex.as_ref(),
-                            seq: vm.seq,
+                    guest: match vms.get(active).map(|vm| vm.head(hi)) {
+                        Some(s) => ui::GuestView {
+                            dma_id: s.dma_id,
+                            dma_size: s.dma_size,
+                            dma_flip: s.dma_flip,
+                            tex: s.tex.as_ref(),
+                            seq: s.seq,
                             orphan_updates: orphans,
-                            desc: vm.desc,
-                            probe_nonblack: vm.probe_nonblack,
+                            desc: s.desc,
+                            probe_nonblack: s.probe_nonblack,
                         },
                         None => ui::GuestView {
                             dma_id: None,
@@ -369,6 +390,7 @@ pub fn run(
                 };
 
                 let out = egui_ctx.run(raw_input, |ctx| act = ui::draw(ctx, &view));
+                viewports.push(act.viewport);
 
                 let mut prims = egui_ctx.tessellate(out.shapes, out.pixels_per_point);
                 ui::fix_orientation(
@@ -405,9 +427,94 @@ pub fn run(
             // The hotkey wins over a tab-bar click.
             // Tab 0 is the node page, so Ctrl+Alt+1 and a click on the first
             // tab mean the same thing.
+            // Cheap: one non-blocking recv that almost always says EAGAIN.
+            if hotplug.as_ref().is_some_and(|w| w.drained_hotplug()) {
+                match drm::discover_heads(&mut gpu, mode) {
+                    Ok(found) => {
+                        let before: Vec<&str> = heads.iter().map(|h| h.name.as_str()).collect();
+                        let after: Vec<&str> = found.iter().map(|h| h.name.as_str()).collect();
+                        if before != after {
+                            log::info!("heads changed: {before:?} -> {after:?}");
+                            let recount = found.len() != heads.len();
+                            // Dropping the old heads releases their GBM
+                            // buffers and DRM framebuffers.
+                            heads = found;
+                            head_geoms = head_geometries(&heads);
+                            // Each guest must be told its new geometry, and it
+                            // only speaks when the viewport moves.
+                            told_viewport = vec![None; heads.len()];
+                            // A guest's scanout count is fixed when its listeners
+                            // are registered, so a head appearing or going away
+                            // needs the whole attach redone. reconcile_tabs
+                            // rebuilds every tab it finds an app for.
+                            if recount {
+                                log::info!("head count changed; re-attaching guests");
+                                for vm in vms.iter_mut() {
+                                    vm.release_gl();
+                                }
+                                vms.clear();
+                                inp.clear_active();
+                                show_node = true;
+                            }
+                        }
+                    }
+                    Err(e) => log::error!("re-discovering heads after hotplug failed: {e}"),
+                }
+            }
             if hot_fs {
                 fullscreen = !fullscreen;
                 log::info!("fullscreen -> {fullscreen}");
+            }
+            // The guest should render at exactly the size it is shown at.
+            // The viewports are in points; the guest wants pixels. One per
+            // head: the guest's scanout for head N renders at exactly the
+            // area head N gives it, so nothing is ever scaled.
+            if !show_node {
+                if let Some(vm) = vms.get(active) {
+                    let ppp = points_per_pixel();
+                    let mut xoff = 0i32;
+                    for (hi, head) in heads.iter().enumerate() {
+                        let Some(r) = viewports.get(hi).copied().flatten() else { continue };
+                        let want = (
+                            (r.width() * ppp).round().max(64.0) as u32,
+                            (r.height() * ppp).round().max(64.0) as u32,
+                        );
+                        // Hysteresis: egui's layout wobbles by a point during
+                        // a transition, and a resolution change per frame
+                        // would have the guest re-allocating for ever.
+                        let moved = told_viewport.get(hi).copied().flatten().map_or(true, |(w, h)| {
+                            (w as i64 - want.0 as i64).abs() > 8
+                                || (h as i64 - want.1 as i64).abs() > 8
+                        });
+                        if moved {
+                            let (mm_w, mm_h) = head.mm.unwrap_or((0, 0));
+                            // Scale the millimetres with the area, so the DPI
+                            // the guest computes stays the panel's real one.
+                            let mm = |full_mm: u32, part: u32, full: u32| -> u16 {
+                                if full == 0 { 0 } else { ((full_mm * part) / full) as u16 }
+                            };
+                            let g = guest::HeadGeometry {
+                                w: want.0,
+                                h: want.1,
+                                mm_w: mm(mm_w as u32, want.0, head.w as u32),
+                                mm_h: mm(mm_h as u32, want.1, head.h as u32),
+                                // Side by side in head order, using the area
+                                // the guest actually gets rather than the
+                                // panel width: a guest laying its desktop out
+                                // across two heads must not leave a gap where
+                                // our chrome is.
+                                xoff,
+                                yoff: 0,
+                            };
+                            if vm.tx.try_send(input::GuestAct::Ui(hi, g)).is_ok() {
+                                if let Some(slot) = told_viewport.get_mut(hi) {
+                                    *slot = Some(want);
+                                }
+                            }
+                        }
+                        xoff += want.0 as i32;
+                    }
+                }
             }
             if let Some(p) = act.page {
                 node_page = p;
@@ -479,7 +586,7 @@ pub fn run(
                         active = idx;
                         if let Some(vm) = vms.get(active) {
                             inp.set_active(vm.tx.clone());
-                            win_gseq = vm.seq; // not a real rate jump
+                            win_gseq = vm.head(0).seq; // not a real rate jump
                         }
                         cur_seq = u64::MAX; // reload this guest's cursor
                     }
@@ -511,7 +618,7 @@ pub fn run(
                 );
                 // Every frame, from the VM that owns it - never inferred from
                 // whether a scanout message happened to arrive.
-                st.guest_size = vms.get(active).map_or((0, 0), |v| v.size);
+                st.guest_size = vms.get(active).map_or((0, 0), |v| v.head(0).size);
             }
 
             drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &heads, n)?;
@@ -602,6 +709,7 @@ fn reconcile_tabs(
     pillar: &crate::ipc::Shared,
     active: &mut usize,
     backoff: &mut Backoff,
+    geom: &[Option<guest::HeadGeometry>],
 ) -> bool {
     let wanted: Vec<(String, String)> = {
         let p = pillar.lock().unwrap();
@@ -631,7 +739,7 @@ fn reconcile_tabs(
         // re-attaches when the guest comes back. A hand-configured tab is
         // exempt: nothing would ever re-create it, so dropping it would strip
         // the rig of its only tab permanently rather than for one reconnect.
-        let alive = vm.source.is_empty() || !guest::frame(&vm.shared).gone;
+        let alive = vm.source.is_empty() || !guest::frame(&vm.head(0).shared).gone;
         let keep = listed && alive;
         if !keep {
             log::info!("tab gone: {} ({})", vm.name, if listed { "guest died" } else { "app removed" });
@@ -646,7 +754,7 @@ fn reconcile_tabs(
         }
         match qmp::connect_display(std::path::Path::new(sock)) {
             Ok(fd) => {
-                let (shared, tx) = guest::spawn(name, guest::Transport::Fd(fd), 0);
+                let (shared, tx) = guest::spawn(name, guest::Transport::Fd(fd), geom.to_vec());
                 log::info!("tab added: {name} via {sock}");
                 backoff.succeeded(sock);
                 vms.push(Vm::new(name.clone(), shared, tx).with_source(sock.clone()));
@@ -722,6 +830,30 @@ fn interface_request(
             domain: String::new(),
         }),
     ))
+}
+
+/// The physical monitor a guest scanout is shown on, as the guest should see
+/// it. Index is the scanout: scanout 0 goes on the first head, and so on, so
+/// the guest's displays line up with the operator's.
+fn head_geometry(heads: &[drm::Head], idx: usize) -> Option<guest::HeadGeometry> {
+    let h = heads.get(idx)?;
+    let (mm_w, mm_h) = h.mm.unwrap_or((0, 0));
+    Some(guest::HeadGeometry {
+        w: h.w as u32,
+        h: h.h as u32,
+        mm_w: mm_w as u16,
+        mm_h: mm_h as u16,
+        // Left to right in head order. The physical arrangement on the desk
+        // is not knowable from DRM - only a human knows that - so this is a
+        // default, not a discovery.
+        xoff: heads[..idx].iter().map(|p| p.w).sum(),
+        yoff: 0,
+    })
+}
+
+/// The geometry of every head, in the order the guest's scanouts map onto them.
+fn head_geometries(heads: &[drm::Head]) -> Vec<Option<guest::HeadGeometry>> {
+    (0..heads.len()).map(|i| head_geometry(heads, i)).collect()
 }
 
 /// Every port, with the detail the Network page shows.
@@ -845,7 +977,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(guest::GuestFrame::default())),
             std::sync::mpsc::sync_channel(1).0,
         );
-        let vm = Vm::new(name.into(), shared, tx);
+        let vm = Vm::new(name.into(), vec![shared], tx);
         if source.is_empty() { vm } else { vm.with_source(source.into()) }
     }
 
@@ -881,16 +1013,16 @@ mod tests {
     #[test]
     fn a_poisoned_guest_mutex_does_not_kill_the_render_thread() {
         let vm = a_vm("vm1", "/nonexistent/eve-gui-test/qmp");
-        let shared = vm.shared.clone();
+        let shared = vm.head(0).shared.clone();
         let _ = std::thread::spawn(move || {
             let _g = shared.lock().unwrap();
             panic!("a guest listener died");
         })
         .join();
-        assert!(vm.shared.is_poisoned(), "the test needs a poisoned mutex");
+        assert!(vm.head(0).shared.is_poisoned(), "the test needs a poisoned mutex");
 
         // The render thread's accessor must still hand back the frame.
-        let f = guest::frame(&vm.shared);
+        let f = guest::frame(&vm.head(0).shared);
         assert!(!f.gone);
     }
 
@@ -905,11 +1037,11 @@ mod tests {
         let mut backoff = Backoff::default();
 
         // Still alive: kept.
-        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff, &[]));
         assert_eq!(vms.len(), 1);
 
-        vms[0].shared.lock().unwrap().gone = true;
-        let changed = reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff);
+        vms[0].head(0).shared.lock().unwrap().gone = true;
+        let changed = reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff, &[]);
         assert!(vms.is_empty(), "a dead guest must not keep its tab");
         assert!(changed, "the active slot changed hands and input must be re-pointed");
     }
@@ -920,11 +1052,11 @@ mod tests {
     fn keeps_a_hand_configured_tab_whose_guest_died() {
         let pillar = pillar_listing(&[]);
         let mut vms = vec![a_vm("manual", "")];
-        vms[0].shared.lock().unwrap().gone = true;
+        vms[0].head(0).shared.lock().unwrap().gone = true;
         let mut active = 0usize;
         let mut backoff = Backoff::default();
 
-        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff, &[]));
         assert_eq!(vms.len(), 1);
     }
 
@@ -961,7 +1093,7 @@ mod tests {
         let mut vms: Vec<Vm> = Vec::new();
         let mut active = 0usize;
         let mut backoff = Backoff::default();
-        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff));
+        assert!(!reconcile_tabs(&mut vms, &pillar, &mut active, &mut backoff, &[]));
         assert!(vms.is_empty());
     }
 }

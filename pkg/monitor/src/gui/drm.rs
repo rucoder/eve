@@ -8,7 +8,7 @@
 //! plain root on a VT, which is what EVE gives us.
 
 use std::fs::OpenOptions;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
@@ -178,6 +178,83 @@ fn pick_mode(c: &connector::Info, name: &str, want_mode: Option<&str>) -> Option
 }
 
 /// One head per connected connector.
+/// A kernel uevent socket, for noticing a monitor plugged in or pulled out.
+///
+/// DRM reports connector changes as uevents, not as events on the DRM fd -
+/// that fd only carries vblank and page flips. libudev would do this too, but
+/// this console deliberately has no udev (see `input.rs`, which reads evdev
+/// and inotify directly), and the kernel's netlink group needs neither.
+///
+/// The alternative, re-probing connectors on a timer, is worse than it looks:
+/// `drmModeGetConnector` forces a probe, which means DDC traffic and
+/// milliseconds per connector, so a poll fast enough to feel instant would
+/// cost more than the compositor.
+pub struct HotplugWatch {
+    fd: OwnedFd,
+}
+
+impl HotplugWatch {
+    pub fn new() -> anyhow::Result<Self> {
+        // SAFETY: plain socket(2) with constant arguments.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                libc::NETLINK_KOBJECT_UEVENT,
+            )
+        };
+        if fd < 0 {
+            return Err(anyhow::anyhow!("uevent socket: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: fd is ours and valid; from_raw_fd takes ownership.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as u16;
+        // Group 1 is the kernel's own broadcast. Group 2 is udev's rewritten
+        // copy, which nothing sends here because there is no udev.
+        addr.nl_groups = 1;
+        let rc = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(anyhow::anyhow!("uevent bind: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { fd })
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// Drain the socket; true if any event was a DRM hotplug. Non-blocking,
+    /// so it is safe to call whether or not the fd polled readable.
+    pub fn drained_hotplug(&self) -> bool {
+        let mut hit = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            // SAFETY: buf is valid for its own length; the socket is
+            // non-blocking so this returns EAGAIN once drained.
+            let n = unsafe {
+                libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+            };
+            if n <= 0 {
+                return hit;
+            }
+            // A uevent is NUL-separated KEY=VALUE lines after a header line.
+            let msg = String::from_utf8_lossy(&buf[..n as usize]);
+            let drm = msg.contains("/drm/card") || msg.contains("SUBSYSTEM=drm");
+            if drm && (msg.contains("HOTPLUG=1") || msg.contains("ACTION=change")) {
+                log::info!("drm hotplug uevent");
+                hit = true;
+            }
+        }
+    }
+}
+
 pub fn discover_heads(gpu: &mut Gpu, want_mode: Option<&str>) -> anyhow::Result<Vec<Head>> {
     let res = gpu.drm.resource_handles()?;
     let mut heads = Vec::new();

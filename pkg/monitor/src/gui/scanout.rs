@@ -69,7 +69,7 @@ fn opaque(fc: Fourcc) -> Fourcc {
     }
 }
 
-/// One tab: a guest, its input channel, and its framebuffer state.
+/// One tab: a guest, its input channel, and one framebuffer state per head.
 pub struct Vm {
     pub name: String,
     /// Distinguishes one attach from the next on the same QMP socket. A guest
@@ -79,8 +79,20 @@ pub struct Vm {
     /// The QMP socket this tab was created from; the identity we reconcile on.
     /// Empty for a tab configured by hand through GUI_VMS.
     pub source: String,
-    pub shared: guest::Shared,
     pub tx: std::sync::mpsc::SyncSender<GuestAct>,
+    /// One per guest scanout, in head order: `scanouts[i]` is what we draw on
+    /// physical head `i`. Never empty - a guest with no usable console is not
+    /// given a tab at all.
+    pub scanouts: Vec<Scanout>,
+}
+
+/// One guest scanout: the QEMU console feeding it and everything we need to
+/// get its pixels onto one physical head.
+pub struct Scanout {
+    /// For logs only - `<vm>#<console>`, so two heads of one guest are told
+    /// apart in a line that has no other context.
+    label: String,
+    pub shared: guest::Shared,
 
     /// Framebuffer size in guest pixels, from whichever path delivered it.
     ///
@@ -161,16 +173,64 @@ pub struct BufferKey {
 impl Vm {
     pub fn new(
         name: String,
-        shared: guest::Shared,
+        shareds: Vec<guest::Shared>,
         tx: std::sync::mpsc::SyncSender<GuestAct>,
     ) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
-            name,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source: String::new(),
-            shared,
             tx,
+            scanouts: shareds
+                .into_iter()
+                .enumerate()
+                .map(|(i, sh)| Scanout::new(format!("{name}#{i}"), sh))
+                .collect(),
+            name,
+        }
+    }
+
+    /// Record which QMP socket this tab came from.
+    pub fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The scanout shown on head `i`, falling back to the first one.
+    ///
+    /// A guest can offer fewer scanouts than the box has monitors - QEMU's
+    /// `max_outputs` is fixed at domain start, monitors are not - and the
+    /// alternative to mirroring the first one is a black panel.
+    pub fn head(&self, i: usize) -> &Scanout {
+        self.scanouts.get(i).unwrap_or(&self.scanouts[0])
+    }
+
+    /// Pick up whatever the guest has produced on every head since last frame.
+    pub fn update(
+        &mut self,
+        renderer: &mut GlowRenderer,
+        painter: &mut egui_glow::Painter,
+        egui_ctx: &egui::Context,
+        probe: bool,
+        frame: u32,
+    ) {
+        for s in self.scanouts.iter_mut() {
+            s.update(renderer, painter, egui_ctx, probe, frame);
+        }
+    }
+
+    pub fn release_gl(&mut self) {
+        for s in self.scanouts.iter_mut() {
+            s.release_gl();
+        }
+    }
+}
+
+impl Scanout {
+    fn new(label: String, shared: guest::Shared) -> Self {
+        Self {
+            label,
+            shared,
             size: (0, 0),
             seq: 0,
             tex: None,
@@ -186,14 +246,8 @@ impl Vm {
         }
     }
 
-    /// Record which QMP socket this tab came from.
-    pub fn with_source(mut self, source: String) -> Self {
-        self.source = source;
-        self
-    }
-
     /// Pick up whatever the guest has produced since the last frame.
-    pub fn update(
+    fn update(
         &mut self,
         renderer: &mut GlowRenderer,
         painter: &mut egui_glow::Painter,
@@ -202,7 +256,7 @@ impl Vm {
         frame: u32,
     ) {
         if std::mem::take(&mut guest::frame(&self.shared).copy_takeover) && self.dma_id.is_some() {
-            log::info!("{}: guest switched back to the copy path", self.name);
+            log::info!("{}: guest switched back to the copy path", self.label);
             self.release_gl();
         }
         self.take_scanout(renderer);
@@ -447,7 +501,7 @@ impl Vm {
             // GL objects behind and the panel black until the box is rebooted.
             // Texture 0 means the blit failed; drawing nothing is recoverable.
             let Some(id) = std::num::NonZeroU32::new(id) else {
-                log::error!("{}: blit produced texture 0, skipping this frame", self.name);
+                log::error!("{}: blit produced texture 0, skipping this frame", self.label);
                 return;
             };
             self.dma_id = Some(painter.register_native_texture(glow::NativeTexture(id)));
@@ -455,8 +509,8 @@ impl Vm {
         }
     }
 
-    /// Drop this tab's GL objects, in the order the driver wants.
-    pub fn release_gl(&mut self) {
+    /// Drop this scanout's GL objects, in the order the driver wants.
+    fn release_gl(&mut self) {
         drop(self.dma_2d.take());
         drop(self.dma_tex.take());
         self.dma_cache.clear();

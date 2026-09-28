@@ -221,8 +221,35 @@ impl Listener {
 #[zbus::proxy(interface = "org.qemu.Display1.Console", default_service = "org.qemu")]
 trait Console {
     fn register_listener(&self, listener: Fd<'_>) -> zbus::Result<()>;
+    /// Geometry of the monitor this scanout is being shown on. QEMU turns it
+    /// into the connector's EDID and preferred mode, and enables or disables
+    /// the scanout on a non-zero or zero size - which is how a guest learns a
+    /// monitor was plugged in or taken away.
+    #[zbus(name = "SetUIInfo")]
+    fn set_ui_info(
+        &self,
+        width_mm: u16,
+        height_mm: u16,
+        xoff: i32,
+        yoff: i32,
+        width: u32,
+        height: u32,
+    ) -> zbus::Result<()>;
 }
 
+
+/// What one physical monitor looks like, for the guest scanout shown on it.
+/// Millimetres travel too: without them the guest has resolution but no DPI,
+/// and scales its desktop wrongly on anything but a ~96dpi panel.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadGeometry {
+    pub w: u32,
+    pub h: u32,
+    pub mm_w: u16,
+    pub mm_h: u16,
+    pub xoff: i32,
+    pub yoff: i32,
+}
 
 /// Linux evdev keycode -> QEMU "qnum", which is what the D-Bus Keyboard
 /// interface actually wants (`qemu_input_key_number_to_qcode`).
@@ -301,6 +328,12 @@ pub fn frame(shared: &Shared) -> std::sync::MutexGuard<'_, GuestFrame> {
 }
 
 /// Mark the tab dead so the render loop tears it down and retries.
+fn mark_all_gone(shared: &[Shared]) {
+    for s in shared {
+        mark_gone(s);
+    }
+}
+
 fn mark_gone(shared: &Shared) {
     if let Ok(mut f) = shared.lock() {
         f.gone = true;
@@ -313,8 +346,23 @@ fn mark_gone(shared: &Shared) {
 /// to stop it - the same shape as the scanout OOM.
 const INPUT_QUEUE: usize = 1024;
 
-pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync::mpsc::SyncSender<crate::gui::input::GuestAct>) {
-    let shared: Shared = Arc::new(Mutex::new(GuestFrame::default()));
+/// Attach to one guest and bring up `heads.len()` of its consoles.
+///
+/// One D-Bus connection carries them all - consoles are objects on it, not
+/// separate peers - so a second monitor costs a listener socket, not a second
+/// attach. The returned vector is in head order and is never longer than the
+/// number of consoles QEMU actually exposes: `max_outputs` is fixed when the
+/// domain starts, and monitors are not.
+pub fn spawn(
+    vm: &str,
+    transport: Transport,
+    heads: Vec<Option<HeadGeometry>>,
+) -> (Vec<Shared>, std::sync::mpsc::SyncSender<crate::gui::input::GuestAct>) {
+    let heads = if heads.is_empty() { vec![None] } else { heads };
+    let shared: Vec<Shared> = heads
+        .iter()
+        .map(|_| Arc::new(Mutex::new(GuestFrame::default())) as Shared)
+        .collect();
     let out = shared.clone();
     let shared_out = shared.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<crate::gui::input::GuestAct>(INPUT_QUEUE);
@@ -340,43 +388,82 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
                         Ok(sock) => Ok(zbus::connection::Builder::unix_stream(sock)
                             .p2p()
                             .max_queued(4)),
-                        Err(e) => { log::error!("display socket: {e}"); mark_gone(&shared_out); return; }
+                        Err(e) => { log::error!("display socket: {e}"); mark_all_gone(&shared_out); return; }
                     }
                 }
             };
             let conn = match built {
                 Ok(b) => match b.build().await {
                     Ok(c) => c,
-                    Err(e) => { log::error!("connect display: {e}"); mark_gone(&shared_out); return; }
+                    Err(e) => { log::error!("connect display: {e}"); mark_all_gone(&shared_out); return; }
                 },
-                Err(e) => { log::error!("bad display transport: {e}"); mark_gone(&shared_out); return; }
+                Err(e) => { log::error!("bad display transport: {e}"); mark_all_gone(&shared_out); return; }
             };
-            let path = format!("/org/qemu/Display1/Console_{console}");
-            let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
-                Ok(p) => p, Err(e) => { log::error!("no console: {e}"); mark_gone(&shared_out); return; }
-            };
-            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-            ours.set_nonblocking(true).unwrap();
-            let ours = tokio::net::UnixStream::from_std(ours).unwrap();
-            let builder = zbus::connection::Builder::unix_stream(ours)
-                .p2p()   // QEMU is the auth server on this socket
-                .serve_at("/org/qemu/Display1/Listener",
-                          Listener { f: out, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false }).unwrap();
-            let task = tokio::spawn(async move { builder.build().await });
-            let ofd: OwnedFd = theirs.into();
-            if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {
-                log::error!("RegisterListener failed: {e}"); mark_gone(&shared_out); return;
-            }
-            // Bind rather than forget: the connection must outlive the pump
+            // Bind rather than forget: a connection must outlive the pump
             // loop, but it must also be dropped when the loop ends, or the
             // thread's whole runtime leaks with it on every tab removal.
-            let _listener = match task.await {
-                Ok(Ok(c)) => { log::info!("listener up"); c }
-                other => { log::error!("listener build failed: {other:?}"); mark_gone(&shared_out); return; }
-            };
-            // input pump: drain the channel and drive QEMU's Keyboard/Mouse
+            let mut consoles: Vec<ConsoleProxy> = Vec::new();
+            let mut listeners = Vec::new();
+            for (console, (head, sink)) in heads.iter().zip(out.into_iter()).enumerate() {
+                let path = format!("/org/qemu/Display1/Console_{console}");
+                let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
+                    Ok(p) => p,
+                    Err(e) => { log::error!("no console {console}: {e}"); break; }
+                };
+                // Before registering: tell the guest what monitor this scanout
+                // is being shown on, so it configures that resolution rather
+                // than virtio-gpu's built-in default (1280x800 on a 1920x1080
+                // panel, which is how this was first noticed). Not fatal if the
+                // guest's driver does not implement it - Windows' display-only
+                // driver does not - so log and carry on.
+                if let Some(g) = head {
+                    match proxy.set_ui_info(g.mm_w, g.mm_h, g.xoff, g.yoff, g.w, g.h).await {
+                        Ok(()) => log::info!(
+                            "console {console}: told guest {}x{} ({}x{}mm) at +{}+{}",
+                            g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff
+                        ),
+                        Err(e) => log::warn!("console {console}: SetUIInfo refused: {e}"),
+                    }
+                }
+                let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+                ours.set_nonblocking(true).unwrap();
+                let ours = tokio::net::UnixStream::from_std(ours).unwrap();
+                // QEMU always calls the listener at this one path, so each
+                // console needs a socket - and therefore a connection - of
+                // its own; they cannot share one and be told apart.
+                let builder = zbus::connection::Builder::unix_stream(ours)
+                    .p2p()   // QEMU is the auth server on this socket
+                    .serve_at("/org/qemu/Display1/Listener",
+                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false }).unwrap();
+                let task = tokio::spawn(async move { builder.build().await });
+                let ofd: OwnedFd = theirs.into();
+                if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {
+                    log::error!("RegisterListener({console}) failed: {e}");
+                    break;
+                }
+                match task.await {
+                    Ok(Ok(c)) => { log::info!("console {console}: listener up"); listeners.push(c); }
+                    other => { log::error!("console {console}: listener build failed: {other:?}"); break; }
+                }
+                consoles.push(proxy);
+            }
+            if consoles.is_empty() {
+                log::error!("no usable console on this guest");
+                mark_all_gone(&shared_out);
+                return;
+            }
+            // A console we asked for but could not bring up will never produce
+            // a frame; say so rather than leaving a head waiting for ever.
+            for s in shared_out.iter().skip(consoles.len()) {
+                mark_gone(s);
+            }
+            let _listeners = listeners;
+            // input pump: drain the channel and drive QEMU's Keyboard/Mouse.
+            // Console 0 only: the guest has one keyboard and one absolute
+            // pointer whatever its monitor count, and both hang off the first
+            // console of the device.
             let mut pending: Vec<crate::gui::input::GuestAct> = Vec::new();
-            let path = format!("/org/qemu/Display1/Console_{console}");
+            let path = "/org/qemu/Display1/Console_0".to_string();
             let kbd = KeyboardProxy::builder(&conn).path(path.clone()).unwrap()
                 .build().await.ok();
             let mouse = MouseProxy::builder(&conn).path(path).unwrap()
@@ -401,6 +488,16 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
                         Btn(b, d) => { if let Some(m) = &mouse {
                             let r = if d { m.press(b).await } else { m.release(b).await };
                             if let Err(e) = r { log::error!("btn {b} down={d} ERR {e}"); } } }
+                        Ui(console, g) => {
+                            // Resolution follows the area we draw in, so a
+                            // guest is never scaled: fullscreen and windowed
+                            // are simply two different monitor sizes.
+                            let Some(p) = consoles.get(console) else { continue };
+                            match p.set_ui_info(g.mm_w, g.mm_h, g.xoff, g.yoff, g.w, g.h).await {
+                                Ok(()) => log::info!("console {console}: viewport now {}x{}", g.w, g.h),
+                                Err(e) => log::debug!("console {console}: SetUIInfo refused: {e}"),
+                            }
+                        }
                         Key(k, d) => { match (evdev_to_qnum(k), &kbd) {
                             (Some(q), Some(kb)) => {
                                 let r = if d { kb.press(q).await } else { kb.release(q).await };
@@ -438,7 +535,7 @@ pub fn spawn(vm: &str, transport: Transport, console: u32) -> (Shared, std::sync
                     break;
                 }
             }
-            mark_gone(&shared_out);
+            mark_all_gone(&shared_out);
         });
     });
     (shared, tx)
