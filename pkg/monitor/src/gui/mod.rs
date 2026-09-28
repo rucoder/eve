@@ -392,6 +392,7 @@ pub fn run(
                             orphan_updates: orphans,
                             desc: s.desc,
                             probe_nonblack: s.probe_nonblack,
+                            asleep: s.asleep,
                         },
                         None => ui::GuestView {
                             dma_id: None,
@@ -402,6 +403,7 @@ pub fn run(
                             orphan_updates: 0,
                             desc: None,
                             probe_nonblack: None,
+                            asleep: false,
                         },
                     },
                     // Only when the ACTIVE guest published one: a guest that

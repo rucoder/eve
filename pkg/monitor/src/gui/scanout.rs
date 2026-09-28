@@ -92,6 +92,10 @@ pub struct Scanout {
     /// For logs only - `<vm>#<console>`, so two heads of one guest are told
     /// apart in a line that has no other context.
     label: String,
+    /// The guest has turned this display off; there is nothing to draw and
+    /// nothing worth holding on to. Published so the UI can say so rather
+    /// than show a frozen desktop.
+    pub asleep: bool,
     pub shared: guest::Shared,
 
     /// Framebuffer size in guest pixels, from whichever path delivered it.
@@ -230,6 +234,7 @@ impl Scanout {
     fn new(label: String, shared: guest::Shared) -> Self {
         Self {
             label,
+            asleep: false,
             shared,
             size: (0, 0),
             seq: 0,
@@ -258,6 +263,24 @@ impl Scanout {
         if std::mem::take(&mut guest::frame(&self.shared).copy_takeover) && self.dma_id.is_some() {
             log::info!("{}: guest switched back to the copy path", self.label);
             self.release_gl();
+        }
+        // The guest released its scanout. Give the GPU memory back rather
+        // than pinning a buffer nothing will draw into again: on wake the
+        // guest allocates a new one and QEMU sends a fresh ScanoutDMABUF,
+        // so there is nothing here worth keeping warm.
+        let off = guest::frame(&self.shared).display_off;
+        if off != self.asleep {
+            self.asleep = off;
+            if off {
+                log::info!("{}: display off, releasing {} cached buffer(s)",
+                           self.label, self.dma_cache.len());
+                self.release_gl();
+                self.size = (0, 0);
+                self.desc = None;
+                self.tex = None;
+            } else {
+                log::info!("{}: display back", self.label);
+            }
         }
         self.take_scanout(renderer);
         self.upload_copy(egui_ctx);

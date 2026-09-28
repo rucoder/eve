@@ -42,6 +42,14 @@ pub struct GuestFrame {
     /// imported dmabuf and the tab freezes - which is what a guest reboot into
     /// a dumb framebuffer looks like.
     pub copy_takeover: bool,
+    /// QEMU called Listener.Disable: the guest turned its display off, so
+    /// the scanout it was rendering into is gone. Distinct from `gone`,
+    /// which is the guest itself going away, and from `orphan_updates`,
+    /// which is us having attached while it was already off.
+    ///
+    /// Set rather than acted on here: releasing GL objects is the render
+    /// thread's job, and this runs on the listener's.
+    pub display_off: bool,
 }
 
 /// A scanout buffer QEMU rendered on the host GPU. Importing this avoids the
@@ -125,6 +133,7 @@ impl Listener {
         {
             let mut g = self.f.lock().unwrap();
             g.w = width; g.h = height; g.dirty = None; g.orphan_updates = 0;
+            g.display_off = false;
             g.dmabuf = None;
             g.copy_takeover = true;
         }
@@ -166,6 +175,7 @@ impl Listener {
                 let ino = if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } == 0 { st.st_ino } else { 0 };
                 g.dmabuf = Some(GuestDmabuf { fd: owned, ino, w, h, stride, fourcc, modifier, y0_top });
                 g.orphan_updates = 0;
+                g.display_off = false;
                 self.have_scanout = true;
                 g.seq += 1;
                 log::debug!("ScanoutDMABUF {w}x{h} stride={stride} fourcc=0x{fourcc:08x} mod=0x{modifier:x} y0_top={y0_top}");
@@ -214,7 +224,23 @@ impl Listener {
         self.f.lock().unwrap().cursor_visible = on != 0;
     }
 
-    async fn disable(&mut self) {}
+    /// The guest turned its display off - a screen blank, a DPMS timeout, a
+    /// compositor releasing an output.
+    ///
+    /// The scanout resource is freed on the guest side, so the dmabuf we
+    /// hold is stale: nothing will ever be drawn into it again, and the next
+    /// wake allocates a new one and sends a fresh ScanoutDMABUF. Holding on
+    /// to it is worse than useless - our open fd keeps the memory alive and
+    /// charged to the app's cgroup after the guest has given it back, which
+    /// is memory an already tight GL guest cannot spare.
+    async fn disable(&mut self) {
+        let mut g = self.f.lock().unwrap();
+        g.display_off = true;
+        g.dmabuf = None;
+        g.cursor_visible = false;
+        self.have_scanout = false;
+        log::info!("display off: guest released its scanout");
+    }
     #[zbus(property)] fn interfaces(&self) -> Vec<String> { vec![] }
 }
 

@@ -27,6 +27,8 @@ pub struct GuestView<'a> {
     /// GUI_PROBE is on: the one fact that separates "we sampled nothing" from
     /// "the guest drew nothing".
     pub probe_nonblack: Option<(usize, usize)>,
+    /// The guest told us it turned this display off.
+    pub asleep: bool,
 }
 
 /// The pixel format, tiling and readback of the active guest's buffer, as a
@@ -461,7 +463,11 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
 
     let Some(sz) = src else {
         ui.centered_and_justified(|ui| {
-            if f.guest.orphan_updates > 0 {
+            if f.guest.asleep {
+                // Said, not inferred: QEMU tells us outright when the guest
+                // releases its scanout.
+                ui.label("the guest turned this display off.\nPress Wake, or move the mouse.");
+            } else if f.guest.orphan_updates > 0 {
                 ui.label(format!(
                     "guest is sending updates ({}) but QEMU never sent a scanout \
                      — its display is asleep.\nPress Wake.",
