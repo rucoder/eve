@@ -18,6 +18,7 @@ pub mod logger;
 pub mod qmp;
 pub mod scanout;
 pub mod ui;
+pub mod vmstat;
 pub mod vt;
 
 use std::sync::Arc;
@@ -155,6 +156,8 @@ pub fn run(
     // changes. Cached because it is handed to every attach.
     let mut head_geoms = head_geometries(&heads);
     let mut vms = spawn_vms(&cfg.vms, &heads);
+    // Host-side guest memory, sampled off the render thread.
+    let vmstat = vmstat::spawn();
     let mut active = 0usize;
     let mut backoff = Backoff::default();
     // Tab 0 is the node page; guests are tabs 1..n.
@@ -286,6 +289,16 @@ pub fn run(
                 win_gseq = seq;
             }
 
+            // Hold the sampler's lock for the whole paint: the alternative
+            // is cloning a 1200-sample history per head per frame.
+            let vmstat_all = vmstat.lock().unwrap();
+            let vmstat_now = vms.get(active).and_then(|vm| {
+                std::path::Path::new(&vm.source)
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .and_then(|dom| vmstat_all.get(dom))
+            });
             let mut act = ui::Actions::default();
             // Where each head wants the guest drawn, collected here because
             // `act` is overwritten by the next head's frame.
@@ -341,6 +354,7 @@ pub fn run(
                     apps: &apps,
                     edit: edit.as_ref(),
                     probe,
+                    vmstat: vmstat_now,
                     node: ui::NodeView {
                         name: &node.0,
                         serial: &node.1,

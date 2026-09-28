@@ -200,6 +200,8 @@ pub struct Frame<'a> {
     pub edit: Option<&'a PortEdit>,
     /// Whether the readback probe is running, for the checkbox that owns it.
     pub probe: bool,
+    /// Host-side memory for the active guest, if it has a cgroup yet.
+    pub vmstat: Option<&'a crate::gui::vmstat::Series>,
 }
 
 #[derive(Default)]
@@ -442,7 +444,9 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
                 }
             });
         match f.page {
-            NodePage::Summary => node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, act),
+            NodePage::Summary => {
+                node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, f.vmstat, act)
+            }
             NodePage::Network => network_page(ui, f.ports, act),
             NodePage::Apps => apps_page(ui, f.apps),
         }
@@ -708,6 +712,7 @@ fn node_page(
     fps: f32,
     g: &GuestView<'_>,
     probe: bool,
+    vmstat: Option<&crate::gui::vmstat::Series>,
     act: &mut Actions,
 ) {
     if !n.connected {
@@ -853,6 +858,116 @@ fn node_page(
             );
             ui.end_row();
         });
+
+    if let Some(v) = vmstat {
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.heading("Guest memory");
+        ui.add_space(8.0);
+        memory_plot(ui, v);
+    }
+}
+
+/// Bytes as a short human string. Guest memory spans orders of magnitude
+/// across a boot, so one fixed unit is unreadable at one end or the other.
+fn mib(b: u64) -> String {
+    let m = b as f64 / (1024.0 * 1024.0);
+    if m >= 1024.0 { format!("{:.2} GiB", m / 1024.0) } else { format!("{m:.0} MiB") }
+}
+
+/// The guest's charge against its cgroup limit, over time.
+///
+/// Drawn by hand rather than with a plotting crate: it is two polylines and
+/// a threshold, and the console links against enough already.
+fn memory_plot(ui: &mut egui::Ui, v: &crate::gui::vmstat::Series) {
+    let cur = v.latest();
+    let frac = v.headroom();
+    // The colour IS the warning: nothing else on this page says "about to be
+    // killed", and that is the state worth noticing from across a room.
+    let trace = if frac > 0.9 {
+        egui::Color32::from_rgb(235, 90, 80)
+    } else if frac > 0.75 {
+        egui::Color32::from_rgb(235, 180, 80)
+    } else {
+        egui::Color32::from_rgb(110, 190, 240)
+    };
+    let gpu_col = egui::Color32::from_rgb(160, 130, 220);
+
+    egui::Grid::new("vmmem").num_columns(2).spacing([28.0, 10.0]).show(ui, |ui| {
+        ui.label(egui::RichText::new("Now").strong());
+        ui.label(format!(
+            "{} of {}  ({:.0}%)   \u{b7}   GPU {}",
+            mib(cur.usage), mib(v.limit), frac * 100.0, mib(cur.shmem)
+        ));
+        ui.end_row();
+        ui.label(egui::RichText::new("Peak").strong());
+        let age = v.peak_age.as_secs();
+        let ago = if age < 60 { format!("{age}s ago") } else { format!("{}m ago", age / 60) };
+        let pf = if v.limit > 0 { v.peak.usage as f32 / v.limit as f32 * 100.0 } else { 0.0 };
+        ui.label(
+            egui::RichText::new(format!(
+                "{} ({pf:.0}%)  \u{b7}  GPU {}  \u{b7}  {ago}",
+                mib(v.peak.usage), mib(v.peak.shmem)
+            ))
+            .color(if pf > 90.0 {
+                egui::Color32::from_rgb(235, 90, 80)
+            } else {
+                ui.visuals().text_color()
+            }),
+        );
+        ui.end_row();
+    });
+
+    ui.add_space(10.0);
+    let w = (ui.available_width() - 24.0).max(200.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 150.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+
+    if v.limit == 0 || v.samples.is_empty() {
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, "waiting for the first sample",
+               egui::FontId::proportional(13.0), ui.visuals().weak_text_color());
+        return;
+    }
+
+    // Full scale is the limit, always. A plot that rescales to its own data
+    // hides the only thing this exists to show: how close the guest is to
+    // being killed.
+    let y_of = |b: u64| rect.bottom() - (b as f32 / v.limit as f32).min(1.0) * rect.height();
+    let n = v.samples.len().max(2) - 1;
+    let x_of = |i: usize| rect.left() + (i as f32 / n as f32) * rect.width();
+
+    let ly = y_of(v.limit);
+    let red = egui::Color32::from_rgb(200, 70, 60);
+    p.line_segment([egui::pos2(rect.left(), ly), egui::pos2(rect.right(), ly)],
+                   egui::Stroke::new(1.0, red));
+    p.text(egui::pos2(rect.right() - 4.0, ly + 2.0), egui::Align2::RIGHT_TOP,
+           format!("limit {}", mib(v.limit)), egui::FontId::proportional(11.0), red);
+
+    let series: [(fn(&crate::gui::vmstat::Sample) -> u64, egui::Color32); 2] =
+        [(|s| s.shmem, gpu_col), (|s| s.usage, trace)];
+    for (sel, col) in series {
+        let pts: Vec<egui::Pos2> =
+            v.samples.iter().enumerate().map(|(i, s)| egui::pos2(x_of(i), y_of(sel(s)))).collect();
+        if pts.len() > 1 {
+            p.add(egui::Shape::line(pts, egui::Stroke::new(1.6, col)));
+        }
+    }
+
+    // Mark the peak where it happened, not only in the text above.
+    if let Some((i, s)) = v.samples.iter().enumerate().max_by_key(|(_, s)| s.usage) {
+        let at = egui::pos2(x_of(i), y_of(s.usage));
+        p.circle_filled(at, 3.0, trace);
+        p.text(at - egui::vec2(0.0, 8.0), egui::Align2::CENTER_BOTTOM, mib(s.usage),
+               egui::FontId::proportional(11.0), trace);
+    }
+
+    ui.horizontal(|ui| {
+        ui.colored_label(trace, "total");
+        ui.colored_label(gpu_col, "GPU (shmem)");
+        ui.weak(format!("\u{b7} last {}s", v.samples.len()));
+    });
 }
 
 /// A standard arrow, as an explicit triangle mesh: the shape is concave, so
