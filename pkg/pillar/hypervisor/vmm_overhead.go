@@ -79,12 +79,29 @@ func virtualGPUVMMOverhead() int64 {
 	if !hostHasRenderNode() {
 		return 0
 	}
-	// virglrenderer, Mesa and their shader caches.
-	base := int64(128) << 20
-	// Per scanout, enough for a 1080p framebuffer triple-buffered: a guest
-	// compositor rotates buffers, and we hold a bounded cache of them for
-	// the zero-copy path. A guest on a 4K panel exceeds this; it is a floor
-	// that keeps an idle desktop from being killed, not a guarantee.
+	// Measured on a Tiger Lake iGPU running a GNOME desktop, by reading
+	// drm-resident-system0 from qemu's DRM fdinfo and cross-checking it
+	// against the cgroup's own shmem counter, which tracked it to within a
+	// megabyte: 44 MiB while the guest was still booting, 224 MiB with the
+	// desktop idle, and 321 MiB peak under glmark2. The bulk is
+	// virglrenderer, Mesa and the guest's GL working set rather than the
+	// scanout buffers, so most of the budget belongs in the base.
+	//
+	// Transients go higher - 971 MiB was seen while an operator cycled the
+	// guest through several modes including 4K - but GEM release is lazy:
+	// disabling a head freed nothing, and re-applying the display config
+	// halved the figure, so most of that peak is buffers awaiting purge
+	// rather than memory the guest needs. Steady state after a reconfigure
+	// was 372 MiB with two heads mirrored at 1080p.
+	//
+	// 512 MiB is roughly 1.6x the measured steady peak. Erring high is
+	// deliberate: the failure it prevents is the memcg OOM killer taking
+	// the guest down, while over-estimating only means fewer app instances
+	// are admitted. A guest that picks a mode far larger than anything the
+	// host can display can still exceed it; memory.vmm.limit.MiB is the
+	// documented override for that.
+	base := int64(512) << 20
+	// Per scanout, roughly a 1080p framebuffer triple-buffered.
 	perScanout := int64(32) << 20
 	return base + int64(hostMaxOutputs())*perScanout
 }
