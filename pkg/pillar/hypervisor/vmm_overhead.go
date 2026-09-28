@@ -75,10 +75,15 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 // Observed as an OOM kill of a 4GiB guest once its desktop started using
 // the GL path.
 //
-// These numbers are estimates and deliberately coarse. The part that cannot
-// be modelled at all is the guest's own GL allocations: a guest may allocate
-// as much GPU memory as it likes and virglrenderer mirrors it on the host,
-// so this bounds the fixed cost, not the workload.
+// These numbers are a budget, not a bound: nothing enforces them. qemu
+// accounts host memory for 2D resources and refuses them past max_hostmem
+// (hw/display/virtio-gpu.c), but once virgl is enabled resource creation is
+// dispatched to virgl_cmd_create_resource_2d/_3d in
+// hw/display/virtio-gpu-virgl.c, which compute no size, consult no limit and
+// do not even check whether the allocation succeeded. A GL guest can
+// therefore allocate until the cgroup kills it, and no value chosen here can
+// prevent that - it only decides how much warning there is. Capping it
+// properly needs a change in qemu.
 func virtualGPUVMMOverhead() int64 {
 	if !hostHasRenderNode() {
 		return 0
