@@ -96,13 +96,29 @@ impl Stats {
     }
 }
 
+/// One head's guest image: where it is on the host, and what it is in the
+/// guest. Everything needed to turn a host pointer position into a point in
+/// the guest's desktop, for the one head the pointer happens to be over.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GuestArea {
+    /// The guest image on the host, in combined host pixels: x, y, w, h.
+    pub view: (f32, f32, f32, f32),
+    /// The scanout the guest renders for this head.
+    pub size: (u32, u32),
+    /// Where that scanout sits in the guest's own desktop - the offsets we
+    /// gave it in `SetUIInfo`, which is the only layout either side knows.
+    pub off: (u32, u32),
+}
+
 #[derive(Default)]
 pub struct State {
     pub x: f64,
     pub y: f64,
     pub focus_guest: bool,
-    pub view: (f32, f32, f32, f32),
-    pub guest_size: (u32, u32),
+    /// One per head, in head order. Empty until the render loop has drawn.
+    pub areas: Vec<GuestArea>,
+    /// The guest's whole desktop: the bounding box of every `area.off+size`.
+    pub desktop: (u32, u32),
     pub egui_events: Vec<egui::Event>,
     pub want_tab: Option<usize>,
     /// Ctrl+Alt+F was pressed; the render loop toggles fullscreen and clears it.
@@ -173,7 +189,6 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
         // default means any click grabs into a guest that may not exist - the
         // pointer then routes nowhere and looks like it vanished, with no way
         // back except the release chord.
-        view: (0.0, 0.0, 0.0, 0.0),
         ..Default::default()
     }));
     let active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>> =
@@ -250,8 +265,10 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             s.egui_events.append(&mut inp.egui_events);
             if let Some(t) = inp.want_tab.take() { s.want_tab = Some(t); }
             if std::mem::take(&mut inp.want_fullscreen) { s.want_fullscreen = true; }
-            inp.view = s.view;            // render loop publishes these back
-            inp.guest_size = s.guest_size;
+            // render loop publishes these back
+            inp.areas.clear();
+            inp.areas.extend_from_slice(&s.areas);
+            inp.desktop = s.desktop;
         }
     })?;
     Ok(Handle { stats, bounds, state, active_tx, shutdown_fd, join })
@@ -283,9 +300,9 @@ pub struct Input {
     held: std::collections::HashSet<u32>,
     pub egui_events: Vec<egui::Event>,
     pub guest: Vec<GuestAct>,
-    /// viewport of the guest image on screen: x, y, w, h (physical px)
-    pub view: (f32, f32, f32, f32),
-    pub guest_size: (u32, u32),
+    /// One per head: the guest image on screen and what it maps to.
+    pub areas: Vec<GuestArea>,
+    pub desktop: (u32, u32),
     /// Tab the user asked for via Ctrl+Alt+N; consumed by the caller.
     pub want_tab: Option<usize>,
     /// Ctrl+Alt+F, consumed by the caller.
@@ -360,7 +377,7 @@ impl Input {
             stats: Default::default(),
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
-            view: (0.0, 0.0, 0.0, 0.0), guest_size: (0, 0), abs_n: 0, want_tab: None,
+            areas: Vec::new(), desktop: (0, 0), abs_n: 0, want_tab: None,
             want_fullscreen: false,
             inotify_fd, devices: HashMap::new(),
         };
@@ -455,19 +472,53 @@ impl Input {
 
     pub fn fd(&self) -> i32 { self.li.as_raw_fd() }
 
-    /// Map host cursor -> guest framebuffer coordinates.
+    /// The head whose guest image the pointer is over, if any.
+    fn area_at(&self, x: f32, y: f32) -> Option<&GuestArea> {
+        self.areas.iter().find(|a| {
+            let (vx, vy, vw, vh) = a.view;
+            // A head with no scanout yet is not a place to grab into: a tab
+            // can exist before its guest has produced a frame, and a click
+            // there used to route the pointer nowhere.
+            a.size != (0, 0)
+                && vw > 0.0
+                && vh > 0.0
+                && x >= vx && x < vx + vw && y >= vy && y < vy + vh
+        })
+    }
+
+    /// Map host cursor -> what to hand `SetAbsPosition`.
+    ///
+    /// The guest has ONE absolute pointer covering its whole desktop, however
+    /// many monitors it has, and QEMU scales whatever we send by the width of
+    /// the console we send it on. So the answer is a point in the guest's
+    /// DESKTOP, expressed as a fraction and then rescaled into console 0's
+    /// pixel range - not a point in the scanout under the cursor, which would
+    /// sweep the entire desktop across one monitor.
+    ///
+    /// With one head this is the identity it always was: the desktop is that
+    /// one scanout and the rescale cancels.
     fn to_guest(&self) -> Option<(u32, u32)> {
-        let (vx, vy, vw, vh) = self.view;
-        let (gw, gh) = self.guest_size;
-        if gw == 0 || vw <= 0.0 || vh <= 0.0 { return None; }
-        let rx = (self.x as f32 - vx) / vw;
-        let ry = (self.y as f32 - vy) / vh;
-        if !(0.0..=1.0).contains(&rx) || !(0.0..=1.0).contains(&ry) { return None; }
+        let a = self.area_at(self.x as f32, self.y as f32)?;
+        let (vx, vy, vw, vh) = a.view;
+        let (gw, gh) = a.size;
+        let (dw, dh) = self.desktop;
+        // Console 0's scanout is the range SetAbsPosition accepts; it rejects
+        // anything at or past its own width.
+        let (cw, ch) = self.areas.first().map_or((0, 0), |c| c.size);
+        if gw == 0 || gh == 0 || dw < 2 || dh < 2 || cw < 2 || ch < 2 {
+            return None;
+        }
+        let rx = ((self.x as f32 - vx) / vw).clamp(0.0, 1.0);
+        let ry = ((self.y as f32 - vy) / vh).clamp(0.0, 1.0);
+        // Where the cursor is in the guest's desktop.
+        let dx = a.off.0 as f32 + rx * (gw - 1) as f32;
+        let dy = a.off.1 as f32 + ry * (gh - 1) as f32;
         // round, don't truncate: `as u32` floors, which biases every event
         // half a pixel toward the origin and makes the last row and column of
         // the guest unreachable.
-        Some(((rx * (gw - 1) as f32).round() as u32,
-              (ry * (gh - 1) as f32).round() as u32))
+        let sx = (dx / (dw - 1) as f32 * (cw - 1) as f32).round() as u32;
+        let sy = (dy / (dh - 1) as f32 * (ch - 1) as f32).round() as u32;
+        Some((sx.min(cw - 1), sy.min(ch - 1)))
     }
 
     pub fn pump(&mut self, ppp: f32) {
@@ -547,7 +598,7 @@ impl Input {
                         // exist before its first scanout arrives, and grabbing
                         // into a guest with no image routes the pointer nowhere.
                         if self.focus == Focus::Gui && down && q == Some(0)
-                            && self.in_view() && self.guest_size != (0, 0) {
+                            && self.in_view() {
                             self.focus = Focus::Guest;
                             // Nothing may be held from a previous grab, and
                             // the guest may still hold keys we never saw
@@ -674,18 +725,36 @@ impl Input {
 
     /// Is the host pointer over the guest image?
     fn in_view(&self) -> bool {
-        let (vx, vy, vw, vh) = self.view;
-        let (x, y) = (self.x as f32, self.y as f32);
-        vw > 0.0 && vh > 0.0 && x >= vx && x < vx + vw && y >= vy && y < vy + vh
+        self.area_at(self.x as f32, self.y as f32).is_some()
     }
 
     /// While grabbed, keep the pointer inside the guest image. Otherwise it can
     /// sit in the top bar or the letterbox margin, to_guest() returns None, and
     /// the guest cursor silently stops following - it looks like it vanished.
     fn clamp_to_view(&mut self) {
-        if self.focus != Focus::Guest { return; }
-        let (vx, vy, vw, vh) = self.view;
-        if vw <= 0.0 || vh <= 0.0 { return; }
+        if self.focus != Focus::Guest || self.areas.is_empty() {
+            return;
+        }
+        // Already over one head's guest image: nothing to do, and in
+        // particular do NOT pull it back to some other head's rect.
+        if self.in_view() {
+            return;
+        }
+        // Outside every one: clamp into the nearest, by centre distance.
+        let (x, y) = (self.x as f32, self.y as f32);
+        let nearest = self
+            .areas
+            .iter()
+            .filter(|a| a.view.2 > 0.0 && a.view.3 > 0.0)
+            .min_by(|a, b| {
+                let d = |v: (f32, f32, f32, f32)| {
+                    let (cx, cy) = (v.0 + v.2 / 2.0, v.1 + v.3 / 2.0);
+                    (x - cx).powi(2) + (y - cy).powi(2)
+                };
+                d(a.view).total_cmp(&d(b.view))
+            });
+        let Some(a) = nearest else { return };
+        let (vx, vy, vw, vh) = a.view;
         self.x = self.x.clamp(vx as f64, (vx + vw - 1.0) as f64);
         self.y = self.y.clamp(vy as f64, (vy + vh - 1.0) as f64);
     }
@@ -696,9 +765,10 @@ impl Input {
             Focus::Guest => { if let Some((gx, gy)) = self.to_guest() {
                 self.abs_n += 1;
                 if self.abs_n % 30 == 1 {
-                    log::trace!("ABS host={:.0},{:.0} -> guest={gx},{gy} (view {:.0},{:.0} {:.0}x{:.0} gs={}x{})",
-                             self.x, self.y, self.view.0, self.view.1, self.view.2, self.view.3,
-                             self.guest_size.0, self.guest_size.1);
+                    log::trace!(
+                        "ABS host={:.0},{:.0} -> abs={gx},{gy} (desktop {}x{}, {} head(s))",
+                        self.x, self.y, self.desktop.0, self.desktop.1, self.areas.len()
+                    );
                 }
                 self.guest.push(GuestAct::AbsPos(gx, gy)); } }
             Focus::Gui => {

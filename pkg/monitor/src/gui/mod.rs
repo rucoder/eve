@@ -176,7 +176,8 @@ pub fn run(
 
     // Before anything converts coordinates or lays out a frame.
     let _ = PPP.set(scale_for(heads[0].w, heads[0].mm, cfg.scale));
-    let inp = input::spawn(heads[0].w, heads[0].h, cfg.ptr_scale)?;
+    let (host_w, host_h) = host_extent(&heads);
+    let inp = input::spawn(host_w, host_h, cfg.ptr_scale)?;
     if let Some(vm) = vms.get(active) {
         inp.set_active(vm.tx.clone());
     }
@@ -445,11 +446,13 @@ pub fn run(
                 if before != after {
                     log::info!("heads changed: {before:?} -> {after:?}");
                     head_geoms = head_geometries(&heads);
-                    // The pointer lives in head 0's pixels. It is set at
-                    // startup, so without this a monitor swap leaves every
-                    // click landing somewhere else - which is what a forced
-                    // connector demonstrated on the bench.
-                    inp.set_bounds(heads[0].w, heads[0].h);
+                    // The pointer travels across every head, so its area is
+                    // set at startup from the whole set - and without this a
+                    // monitor change leaves every click landing somewhere
+                    // else, which is what a forced connector showed on the
+                    // bench.
+                    let (w, h) = host_extent(&heads);
+                    inp.set_bounds(w, h);
                     // Each guest must be told its new geometry, and it only
                     // speaks when the viewport moves.
                     told_viewport = vec![None; heads.len()];
@@ -615,17 +618,41 @@ pub fn run(
                     log::info!("sent Ctrl+Alt+Del to {}", vm.name);
                 }
             }
-            if let Some(r) = act.viewport {
+            {
+                // One entry per head, in combined host pixels, so the pointer
+                // can cross from one monitor to the next and still land in
+                // the right place in the guest's desktop.
+                let ppp = points_per_pixel();
+                let mut areas: Vec<input::GuestArea> = Vec::with_capacity(heads.len());
+                let mut hx = 0.0f32;
+                let mut gx = 0u32;
+                let mut desktop = (0u32, 0u32);
+                for (hi, head) in heads.iter().enumerate() {
+                    let size = vms.get(active).map_or((0, 0), |v| v.head(hi).size);
+                    // The guest's own layout, which is the one we dictated:
+                    // scanouts left to right in head order. Summed from the
+                    // sizes the guest actually produced rather than from the
+                    // head widths, because a scanout is the drawing area we
+                    // gave it, not the whole panel.
+                    let off = (gx, 0u32);
+                    gx += size.0;
+                    let view = match viewports.get(hi).copied().flatten() {
+                        Some(r) => (
+                            hx + r.min.x * ppp,
+                            r.min.y * ppp,
+                            r.width() * ppp,
+                            r.height() * ppp,
+                        ),
+                        None => (0.0, 0.0, 0.0, 0.0),
+                    };
+                    desktop.0 = desktop.0.max(off.0 + size.0);
+                    desktop.1 = desktop.1.max(off.1 + size.1);
+                    areas.push(input::GuestArea { view, size, off });
+                    hx += head.w as f32;
+                }
                 let mut st = inp.state.lock().unwrap();
-                st.view = (
-                    r.min.x * points_per_pixel(),
-                    r.min.y * points_per_pixel(),
-                    r.width() * points_per_pixel(),
-                    r.height() * points_per_pixel(),
-                );
-                // Every frame, from the VM that owns it - never inferred from
-                // whether a scanout message happened to arrive.
-                st.guest_size = vms.get(active).map_or((0, 0), |v| v.head(0).size);
+                st.areas = areas;
+                st.desktop = desktop;
             }
 
             drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &heads, n)?;
@@ -856,6 +883,15 @@ fn head_geometry(heads: &[drm::Head], idx: usize) -> Option<guest::HeadGeometry>
         xoff: heads[..idx].iter().map(|p| p.w).sum(),
         yoff: 0,
     })
+}
+
+/// The host's whole drawing area: heads side by side in head order. The
+/// pointer lives in this space so it can cross from one monitor to the next.
+fn host_extent(heads: &[drm::Head]) -> (i32, i32) {
+    (
+        heads.iter().map(|h| h.w).sum::<i32>().max(1),
+        heads.iter().map(|h| h.h).max().unwrap_or(1).max(1),
+    )
 }
 
 /// The geometry of every head, in the order the guest's scanouts map onto them.
