@@ -54,9 +54,39 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 			domainName, err)
 	}
 	overhead = undefinedVMMOverhead() + ramVMMOverhead(domainRAMSize) +
-		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead
+		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead +
+		virtualGPUVMMOverhead()
 
 	return overhead, nil
+}
+
+// overhead for a GL-backed virtual GPU.
+//
+// virglrenderer and Mesa run inside qemu, and on an integrated GPU the
+// textures and scanout buffers they allocate are ordinary system memory,
+// charged to the app instance's cgroup like anything else qemu touches.
+// None of the other terms cover it: mmioVMMOverhead counts only PASSTHROUGH
+// devices, so a virtual GPU contributes nothing there, and a guest that is
+// actually rendering was therefore sized as though it had no GPU at all.
+// Observed as an OOM kill of a 4GiB guest once its desktop started using
+// the GL path.
+//
+// These numbers are estimates and deliberately coarse. The part that cannot
+// be modelled at all is the guest's own GL allocations: a guest may allocate
+// as much GPU memory as it likes and virglrenderer mirrors it on the host,
+// so this bounds the fixed cost, not the workload.
+func virtualGPUVMMOverhead() int64 {
+	if !hostHasRenderNode() {
+		return 0
+	}
+	// virglrenderer, Mesa and their shader caches.
+	base := int64(128) << 20
+	// Per scanout, enough for a 1080p framebuffer triple-buffered: a guest
+	// compositor rotates buffers, and we hold a bounded cache of them for
+	// the zero-copy path. A guest on a 4K panel exceeds this; it is a floor
+	// that keeps an idle desktop from being killed, not a guarantee.
+	perScanout := int64(32) << 20
+	return base + int64(hostMaxOutputs())*perScanout
 }
 
 func ramVMMOverhead(ramMemory int64) int64 {
