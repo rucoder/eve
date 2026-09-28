@@ -187,10 +187,19 @@ impl Listener {
     async fn update_dmabuf(&mut self, x: i32, y: i32, w: i32, h: i32) {
         // Same underlying buffer: nothing to copy, just note there is new content.
         let mut g = self.f.lock().unwrap();
-        if !self.have_scanout {
+        // An update with no scanout is only worth reporting when we do not
+        // already know why. `display_off` means the guest told us it
+        // released the scanout - because it blanked, or because we handed
+        // the display to a remote session - and in both cases there is
+        // nothing wrong and Wake is the wrong advice.
+        if !self.have_scanout && !g.display_off {
             g.orphan_updates += 1;
             if g.orphan_updates == 1 {
-                log::warn!("UpdateDMABUF with no scanout - the guest display was                             probably asleep when we attached; nothing to draw until                             it wakes (use the Wake button)");
+                log::warn!(
+                    "UpdateDMABUF with no scanout - the guest's display was probably \
+                     asleep when we attached; nothing to draw until it wakes \
+                     (use the Wake button)"
+                );
             }
         }
         g.seq += 1;
