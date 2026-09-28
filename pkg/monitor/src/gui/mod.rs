@@ -494,15 +494,28 @@ pub fn run(
                 let ppp = points_per_pixel();
                 let mut xoff = 0i32;
                 for (hi, head) in heads.iter().enumerate() {
+                    let near = |a: u32, b: u32| (a as i64 - b as i64).abs() <= 8;
+                    let told = told_viewport.get(hi).copied().flatten();
                     let want = match viewports.get(hi).copied().flatten() {
                         Some(r) => (
                             (r.width() * ppp).round().max(64.0) as u32,
                             (r.height() * ppp).round().max(64.0) as u32,
                         ),
-                        None => (head.w as u32, head.h as u32),
+                        // No guest is drawn - the Node page is up. Keep the
+                        // guest exactly where it is. Asking for the whole
+                        // panel here instead made every switch to the Node
+                        // page and back a resolution change, so the guest
+                        // reallocated its framebuffer on each one, and a
+                        // reallocation we are not re-sent a scanout for
+                        // leaves us blitting a stale, empty buffer: black.
+                        //
+                        // The panel size is only the right answer when the
+                        // guest has never been told anything at all, which is
+                        // the case this branch exists for - otherwise it sits
+                        // on virtio-gpu's 1280x800 default until somebody
+                        // opens its tab.
+                        None => told.map_or((head.w as u32, head.h as u32), |t| t.want),
                     };
-                    let near = |a: u32, b: u32| (a as i64 - b as i64).abs() <= 8;
-                    let told = told_viewport.get(hi).copied().flatten();
                     // Hysteresis: egui's layout wobbles by a point during a
                     // transition, and a resolution change per frame would
                     // have the guest re-allocating for ever.
