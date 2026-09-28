@@ -4,6 +4,10 @@
 package hypervisor
 
 import (
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
@@ -77,6 +81,16 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 // so this bounds the fixed cost, not the workload.
 func virtualGPUVMMOverhead() int64 {
 	if !hostHasRenderNode() {
+		return 0
+	}
+	// Only where the GPU has no memory of its own. A discrete card puts
+	// these objects in its local region - real VRAM, not system memory, and
+	// charged to no cgroup - so reserving host RAM for them would be so
+	// much lost capacity. An integrated GPU has only the `system` region,
+	// which is shmem and is charged to whoever allocated it: measured on a
+	// Tiger Lake iGPU, qemu's entire GPU footprint was in system0, with
+	// zero bytes in stolen-system0 and no local region existing at all.
+	if hostGPUHasLocalMemory() {
 		return 0
 	}
 	// Measured on a Tiger Lake iGPU running a GNOME desktop, by reading
@@ -218,4 +232,29 @@ func cpuVMMOverhead(maxCpus int64, vcpus int64) int64 {
 // it requires more investigation.
 func undefinedVMMOverhead() int64 {
 	return 350 << 20 // Mb in bytes
+}
+
+// hostGPUHasLocalMemory reports whether any render-capable GPU has a memory
+// region of its own. i915 and xe publish lmem_total_bytes for a card with
+// local memory and omit it entirely for an integrated one.
+func hostGPUHasLocalMemory() bool {
+	ents, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		name := e.Name()
+		// "card0", not "card0-HDMI-A-1" and not "renderD128".
+		if !strings.HasPrefix(name, "card") || strings.Contains(name, "-") {
+			continue
+		}
+		b, err := os.ReadFile("/sys/class/drm/" + name + "/lmem_total_bytes")
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil && n > 0 {
+			return true
+		}
+	}
+	return false
 }
