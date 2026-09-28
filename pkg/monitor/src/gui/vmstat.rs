@@ -26,6 +26,9 @@ pub struct Sample {
 /// A guest's recent history and its worst moment.
 pub struct Series {
     pub limit: u64,
+    /// VNC clients attached to this domain. A remote session owns the
+    /// guest's display while it lasts; see the ownership swap in gui::mod.
+    pub vnc_clients: usize,
     /// Oldest first. Bounded, so a long-running console cannot grow it.
     pub samples: Vec<Sample>,
     pub peak: Sample,
@@ -90,7 +93,10 @@ pub fn spawn() -> Shared {
     let out = shared.clone();
     let _ = std::thread::Builder::new()
         .name("vmstat".into())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut tick: u64 = 0;
+            loop {
+            tick = tick.wrapping_add(1);
             // The domain directory is the identity, and it carries the
             // pid of the qemu that serves it.
             let found: Vec<(String, u32)> = std::fs::read_dir("/run/hypervisor/kvm")
@@ -118,8 +124,21 @@ pub fn spawn() -> Shared {
                     let limit = read_u64(&format!("{dir}/memory.limit_in_bytes")).unwrap_or(0);
                     let s = Sample { usage, shmem: read_shmem(&dir) };
 
+                    // Every other tick: a QMP round trip is far dearer than
+                    // reading three sysfs files, and nobody connects to VNC
+                    // twice in a second.
+                    let vnc = if tick % 2 == 0 {
+                        crate::gui::qmp::vnc_clients(std::path::Path::new(&format!(
+                            "/run/hypervisor/kvm/{d}/qmp"
+                        )))
+                        .unwrap_or(0)
+                    } else {
+                        m.get(d).map_or(0, |e| e.vnc_clients)
+                    };
+
                     let e = m.entry(d.clone()).or_insert_with(|| Series {
                         limit,
+                        vnc_clients: vnc,
                         samples: Vec::with_capacity(KEEP),
                         peak: s,
                         peak_age: Duration::ZERO,
@@ -128,6 +147,7 @@ pub fn spawn() -> Shared {
                     // The limit changes when the instance is resized in the
                     // controller, without the domain name changing.
                     e.limit = limit;
+                    e.vnc_clients = vnc;
                     if s.usage > e.peak.usage {
                         e.peak = s;
                         e.peak_at = Instant::now();
@@ -140,6 +160,7 @@ pub fn spawn() -> Shared {
                 }
             }
             std::thread::sleep(PERIOD);
+            }
         });
     shared
 }

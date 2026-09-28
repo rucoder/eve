@@ -171,6 +171,8 @@ pub fn run(
     // scaled - and it changes when fullscreen is toggled.
     // Per head, because each one shows a different scanout at its own size.
     let mut told_viewport: Vec<Option<Told>> = vec![None; heads.len()];
+    // Whether a remote session currently owns the guest's display.
+    let mut remote = false;
     // The open port editor, if any, and what each port looked like before the
     // last Apply so Undo has somewhere to go.
     let mut edit: Option<ui::PortEdit> = None;
@@ -299,6 +301,24 @@ pub fn run(
                     .and_then(|n| n.to_str())
                     .and_then(|dom| vmstat_all.get(dom))
             });
+            // Hand the display over, or take it back. One consumer at a
+            // time: with heads enabled for both, the guest spreads its one
+            // absolute pointer across the union of them and neither side can
+            // place a cursor.
+            let want_remote = vmstat_now.is_some_and(|v| v.vnc_clients > 0);
+            if want_remote != remote {
+                remote = want_remote;
+                if let Some(vm) = vms.get(active) {
+                    let _ = vm.tx.try_send(input::GuestAct::Remote(remote));
+                }
+                // Our geometry is meaningless while we do not own the head,
+                // and must be re-sent from scratch when we get it back.
+                told_viewport = vec![None; heads.len()];
+                log::info!(
+                    "display {} a remote session",
+                    if remote { "handed to" } else { "taken back from" }
+                );
+            }
             let mut act = ui::Actions::default();
             // Where each head wants the guest drawn, collected here because
             // `act` is overwritten by the next head's frame.
@@ -354,6 +374,7 @@ pub fn run(
                     apps: &apps,
                     edit: edit.as_ref(),
                     probe,
+                    remote,
                     vmstat: vmstat_now,
                     node: ui::NodeView {
                         name: &node.0,
@@ -510,7 +531,7 @@ pub fn run(
             // of the area we give it, and we are giving it none. Running
             // this anyway is how a tab switch turned into a mode change, and
             // how a guest nobody was looking at got nagged to resize.
-            if let Some(vm) = vms.get(active).filter(|_| !show_node) {
+            if let Some(vm) = vms.get(active).filter(|_| !show_node && !remote) {
                 let ppp = points_per_pixel();
                 let mut xoff = 0i32;
                 for (hi, head) in heads.iter().enumerate() {

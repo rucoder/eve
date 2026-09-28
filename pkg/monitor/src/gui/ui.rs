@@ -204,6 +204,8 @@ pub struct Frame<'a> {
     pub probe: bool,
     /// Host-side memory for the active guest, if it has a cgroup yet.
     pub vmstat: Option<&'a crate::gui::vmstat::Series>,
+    /// A remote session owns the guest's display, so we are not drawing it.
+    pub remote: bool,
 }
 
 #[derive(Default)]
@@ -461,6 +463,15 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
         f.guest.tex.map(|t| t.size_vec2())
     };
 
+    if f.remote {
+        ui.centered_and_justified(|ui| {
+            ui.label(
+                "a remote session has this guest's display.\n\
+                 It comes back here when the remote client disconnects.",
+            );
+        });
+        return;
+    }
     let Some(sz) = src else {
         ui.centered_and_justified(|ui| {
             if f.guest.asleep {

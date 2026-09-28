@@ -28,44 +28,177 @@ use std::path::Path;
 const QMP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Apply `QMP_TIMEOUT` to both directions of the socket.
-fn set_timeouts(sock: &UnixStream) -> anyhow::Result<()> {
+fn set_timeouts(sock: &UnixStream) -> std::io::Result<()> {
     sock.set_read_timeout(Some(QMP_TIMEOUT))?;
     sock.set_write_timeout(Some(QMP_TIMEOUT))?;
     Ok(())
 }
 
-/// Read one QMP reply, failing on an error object.
-fn qmp_line(r: &mut BufReader<UnixStream>) -> anyhow::Result<String> {
-    let mut s = String::new();
-    anyhow::ensure!(r.read_line(&mut s)? > 0, "qmp: connection closed");
-    anyhow::ensure!(!s.contains("\"error\""), "qmp error: {}", s.trim());
-    Ok(s)
+/// What can go wrong talking to a QMP monitor.
+///
+/// Typed rather than stringly: the caller that polls for VNC clients wants to
+/// treat "this guest has no VNC configured" (a remote error) differently from
+/// "the monitor went away" (the guest is gone), and neither should be
+/// indistinguishable from a parse bug of ours.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("qmp i/o: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("qmp: malformed json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("qmp: the monitor closed the connection")]
+    Closed,
+    #[error("qmp: {class}: {desc}")]
+    Remote { class: String, desc: String },
+    #[error("qmp: {0}")]
+    Protocol(String),
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+/// One QMP session, already past the capabilities handshake.
+pub struct Qmp {
+    reader: BufReader<UnixStream>,
+    sock: UnixStream,
+}
+
+impl Qmp {
+    /// Connect and negotiate. The greeting is consumed here so that every
+    /// later read is either a reply or an event.
+    pub fn connect(path: &Path) -> Result<Self> {
+        let sock = UnixStream::connect(path)?;
+        set_timeouts(&sock)?;
+        let mut q = Qmp {
+            reader: BufReader::new(sock.try_clone()?),
+            sock,
+        };
+        let greeting = q.recv()?;
+        if greeting.get("QMP").is_none() {
+            return Err(Error::Protocol(format!("expected a greeting, got {greeting}")));
+        }
+        q.execute("qmp_capabilities", serde_json::Value::Null)?;
+        Ok(q)
+    }
+
+    /// One JSON object off the wire.
+    fn recv(&mut self) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Err(Error::Closed);
+        }
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    /// Run a command and return its `return` value.
+    ///
+    /// QMP interleaves asynchronous events with replies on the same socket,
+    /// so anything carrying an "event" key is skipped rather than mistaken
+    /// for the answer - a VNC_CONNECTED arriving between the command and its
+    /// reply is exactly the case this polls for. The skip is bounded so a
+    /// guest generating events faster than we read cannot pin us here; the
+    /// socket timeout covers everything else.
+    pub fn execute(&mut self, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        let mut req = serde_json::Map::new();
+        req.insert("execute".into(), cmd.into());
+        if !args.is_null() {
+            req.insert("arguments".into(), args);
+        }
+        self.send(&serde_json::Value::Object(req), None)?;
+        self.reply(cmd)
+    }
+
+    /// `execute`, with a file descriptor passed alongside the command.
+    ///
+    /// QMP's `getfd` names a descriptor the monitor is to keep; the
+    /// descriptor itself travels out of band as SCM_RIGHTS on the same
+    /// `sendmsg`, so it cannot be sent as part of the JSON.
+    pub fn execute_with_fd(
+        &mut self,
+        cmd: &str,
+        args: serde_json::Value,
+        fd: std::os::fd::RawFd,
+    ) -> Result<serde_json::Value> {
+        let mut req = serde_json::Map::new();
+        req.insert("execute".into(), cmd.into());
+        if !args.is_null() {
+            req.insert("arguments".into(), args);
+        }
+        self.send(&serde_json::Value::Object(req), Some(fd))?;
+        self.reply(cmd)
+    }
+
+    fn send(&mut self, req: &serde_json::Value, fd: Option<std::os::fd::RawFd>) -> Result<()> {
+        let mut line = serde_json::to_vec(req)?;
+        line.extend_from_slice(b"\r\n");
+        match fd {
+            Some(fd) => send_fd(&self.sock, fd, &line)
+                .map_err(|e| Error::Protocol(format!("sending a descriptor: {e}")))?,
+            None => self.sock.write_all(&line)?,
+        }
+        Ok(())
+    }
+
+    fn reply(&mut self, cmd: &str) -> Result<serde_json::Value> {
+        // Generous: events are rare next to replies, and the read timeout is
+        // the real bound. This only stops an unbounded loop.
+        for _ in 0..64 {
+            let v = self.recv()?;
+            if let Some(ev) = v.get("event").and_then(|e| e.as_str()) {
+                log::debug!("qmp event while awaiting {cmd}: {ev}");
+                continue;
+            }
+            if let Some(err) = v.get("error") {
+                return Err(Error::Remote {
+                    class: err.get("class").and_then(|c| c.as_str()).unwrap_or("?").to_string(),
+                    desc: err.get("desc").and_then(|d| d.as_str()).unwrap_or("?").to_string(),
+                });
+            }
+            if let Some(ret) = v.get("return") {
+                return Ok(ret.clone());
+            }
+            return Err(Error::Protocol(format!("{cmd}: unexpected reply {v}")));
+        }
+        Err(Error::Protocol(format!("{cmd}: drowned in events")))
+    }
+}
+
+/// The parts of `query-vnc` we use. Everything is optional because a domain
+/// without VNC configured answers `{"enabled": false}` and nothing else.
+#[derive(serde::Deserialize, Default)]
+struct VncInfo {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    clients: Vec<serde_json::Value>,
+}
+
+/// How many VNC clients are attached to this domain.
+///
+/// Polled rather than subscribed: QEMU's VNC_CONNECTED/VNC_DISCONNECTED
+/// events go to the `listener.qmp` monitor, which domainmgr already holds
+/// open, and a second reader there would be competing for someone else's
+/// event stream. A short-lived query on the executor socket is the pattern
+/// `connect_display` already uses and steps on nobody.
+pub fn vnc_clients(qmp: &Path) -> Result<usize> {
+    let mut q = Qmp::connect(qmp)?;
+    let info: VncInfo = serde_json::from_value(q.execute("query-vnc", serde_json::Value::Null)?)?;
+    Ok(if info.enabled { info.clients.len() } else { 0 })
 }
 
 /// Hand QEMU one end of a socketpair and get back the other, already accepted
 /// as a D-Bus peer connection.
 pub fn connect_display(qmp: &Path) -> anyhow::Result<OwnedFd> {
-    let stream = UnixStream::connect(qmp)?;
-    set_timeouts(&stream)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut w = stream.try_clone()?;
-
-    qmp_line(&mut reader)?; // greeting
-    w.write_all(b"{\"execute\":\"qmp_capabilities\"}\r\n")?;
-    qmp_line(&mut reader)?;
-
+    let mut q = Qmp::connect(qmp)?;
     let (ours, theirs) = UnixStream::pair()?;
-    send_fd(
-        &stream,
+    q.execute_with_fd(
+        "getfd",
+        serde_json::json!({ "fdname": "guifd" }),
         theirs.as_raw_fd(),
-        b"{\"execute\":\"getfd\",\"arguments\":{\"fdname\":\"guifd\"}}\r\n",
     )?;
-    qmp_line(&mut reader)?;
-
-    w.write_all(
-        b"{\"execute\":\"add_client\",\"arguments\":{\"protocol\":\"@dbus-display\",\"fdname\":\"guifd\"}}\r\n",
+    q.execute(
+        "add_client",
+        serde_json::json!({ "protocol": "@dbus-display", "fdname": "guifd" }),
     )?;
-    qmp_line(&mut reader)?;
     drop(theirs);
     Ok(OwnedFd::from(ours))
 }
@@ -152,3 +285,4 @@ mod tests {
         assert!(buf[..n].starts_with(b"OK "), "got {:?}", &buf[..n]);
     }
 }
+

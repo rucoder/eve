@@ -377,6 +377,25 @@ fn mark_gone(shared: &Shared) {
 /// to stop it - the same shape as the scanout OOM.
 const INPUT_QUEUE: usize = 1024;
 
+/// Highest console index worth probing. VIRTIO_GPU_MAX_SCANOUTS is 16, and a
+/// domain may have a second display device after those, so this is a
+/// generous stop for the walk that looks for consoles we do not drive.
+const MAX_CONSOLES: usize = 24;
+
+/// The display DEVICE a console label names.
+///
+/// qemu labels a graphic console with the device's id and, once the device
+/// has more than one head, a `.N` suffix for the head - so `video0` with
+/// max_outputs=5 gives `video0.0` through `video0.4`, and the second device
+/// is `video1`. Comparing whole labels therefore makes every head of our own
+/// card look like a different card.
+fn device_of(label: &str) -> &str {
+    match label.rsplit_once('.') {
+        Some((dev, head)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => dev,
+        _ => label,
+    }
+}
+
 /// Attach to one guest and bring up `heads.len()` of its consoles.
 ///
 /// One D-Bus connection carries them all - consoles are objects on it, not
@@ -441,6 +460,9 @@ pub fn spawn(
             // entirely - drawing that on a second monitor would show the VNC
             // head's contents, not the guest's second desktop.
             let mut device: Option<String> = None;
+            // Consoles belonging to another display device. We do not draw
+            // them, but we do own whether the guest can see them.
+            let mut foreign: Vec<ConsoleProxy> = Vec::new();
             for (console, (head, sink)) in heads.iter().zip(out.into_iter()).enumerate() {
                 let path = format!("/org/qemu/Display1/Console_{console}");
                 let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
@@ -453,10 +475,35 @@ pub fn spawn(
                 match (proxy.label().await.ok(), device.as_deref()) {
                     (Some(l), None) => {
                         log::info!("console 0 is {l}");
-                        device = Some(l);
+                        device = Some(device_of(&l).to_string());
                     }
-                    (Some(l), Some(d)) if l != d && !l.starts_with(&format!("{d}.")) => {
-                        log::info!("console {console} is {l}, not a head of {d}: stopping here");
+                    (Some(l), Some(d)) if device_of(&l) != d => {
+                        // A console on another display device - the plain
+                        // head that exists so VNC has something it can read.
+                        //
+                        // Its scanout is enabled from reset
+                        // (virtio_gpu_base_reset sets enabled_output_bitmask
+                        // to 1), so the guest sees it as a second monitor and
+                        // extends its desktop onto a screen nobody is looking
+                        // at. That desktop is then wider than anything we
+                        // draw, and since the guest's one absolute pointer is
+                        // scaled across the whole of it, the operator's cursor
+                        // runs ahead and eventually walks off onto the part
+                        // they cannot see.
+                        //
+                        // Zero size takes the monitor away: qemu's
+                        // virtio_gpu_ui_info clears the output's bit when
+                        // either dimension is zero and raises a display-change
+                        // event, so the guest is told the screen was unplugged
+                        // rather than blanked.
+                        match proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
+                            Ok(()) => log::info!(
+                                "console {console} is {l}, not a head of {d}: disabled it"
+                            ),
+                            Err(e) => log::warn!(
+                                "console {console} is {l}: could not disable it: {e}"
+                            ),
+                        }
                         break;
                     }
                     _ => {}
@@ -498,6 +545,37 @@ pub fn spawn(
                 }
                 consoles.push(proxy);
             }
+            // Our heads are up; now look PAST them. With max_outputs set
+            // from the host's connector count, video0 owns consoles 0..N-1
+            // and the plain head VNC reads sits after all of them - so with
+            // one monitor it is console 5, not console 1, and the loop above
+            // never reaches it.
+            //
+            // video0's own unused scanouts need no attention: virtio-gpu
+            // enables only scanout 0 at reset, so they are already invisible
+            // to the guest. A second DEVICE has its own bitmask and its own
+            // enabled scanout 0, which is the one that becomes a phantom
+            // monitor.
+            if let Some(d) = device.clone() {
+                for console in consoles.len()..MAX_CONSOLES {
+                    let path = format!("/org/qemu/Display1/Console_{console}");
+                    let Ok(proxy) = ConsoleProxy::builder(&conn).path(path).unwrap().build().await
+                    else {
+                        break;
+                    };
+                    // No label means no console: we have run off the end.
+                    let Ok(label) = proxy.label().await else { break };
+                    if device_of(&label) == d {
+                        continue; // another of our own scanouts, already off
+                    }
+                    match proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
+                        Ok(()) => log::info!("console {console} is {label}: disabled it"),
+                        Err(e) => log::warn!("console {console} is {label}: cannot disable: {e}"),
+                    }
+                    foreign.push(proxy);
+                }
+            }
+
             if consoles.is_empty() {
                 log::error!("no usable console on this guest");
                 mark_all_gone(&shared_out);
@@ -509,6 +587,13 @@ pub fn spawn(
                 mark_gone(s);
             }
             let _listeners = listeners;
+            // Geometry last given to each of our consoles, so it can be
+            // restored when a remote session hands the display back.
+            let mut last: Vec<Option<HeadGeometry>> = vec![None; consoles.len()];
+            for (i, h) in heads.iter().enumerate().take(consoles.len()) {
+                last[i] = *h;
+            }
+            let mut remote = false;
             // input pump: drain the channel and drive QEMU's Keyboard/Mouse.
             // Console 0 only: the guest has one keyboard and one absolute
             // pointer whatever its monitor count, and both hang off the first
@@ -539,11 +624,65 @@ pub fn spawn(
                         Btn(b, d) => { if let Some(m) = &mouse {
                             let r = if d { m.press(b).await } else { m.release(b).await };
                             if let Err(e) = r { log::error!("btn {b} down={d} ERR {e}"); } } }
+                        Remote(on) => {
+                            // Exactly one consumer owns the guest's monitors.
+                            //
+                            // The guest has ONE absolute pointer whose range
+                            // is spread across whatever desktop it has, so
+                            // two consumers with heads enabled at once means
+                            // neither can place a cursor correctly - each
+                            // scales against its own head while the guest
+                            // scales against the union, and neither can see
+                            // the other's layout to correct for it. Handing
+                            // the display over whole, the way RDP does, is
+                            // the only arrangement in which the arithmetic
+                            // closes.
+                            if on == remote {
+                                continue;
+                            }
+                            remote = on;
+                            log::info!(
+                                "display owner -> {}",
+                                if on { "remote session" } else { "local console" }
+                            );
+                            // Give the remote head the geometry of our first
+                            // one, so a VNC client sees the same picture the
+                            // operator would. It may renegotiate its own size
+                            // afterwards; that is its business, not ours.
+                            let hand = last.first().copied().flatten();
+                            for (i, p) in consoles.iter().enumerate() {
+                                let g = if on { None } else { last.get(i).copied().flatten() };
+                                let (w, h, mw, mh, x, y) = match g {
+                                    Some(g) => (g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff),
+                                    None => (0, 0, 0, 0, 0, 0),
+                                };
+                                if let Err(e) = p.set_ui_info(mw, mh, x, y, w, h).await {
+                                    log::debug!("console {i}: SetUIInfo refused: {e}");
+                                }
+                            }
+                            for p in foreign.iter() {
+                                let g = if on { hand } else { None };
+                                let (w, h, mw, mh) = match g {
+                                    Some(g) => (g.w, g.h, g.mm_w, g.mm_h),
+                                    None => (0, 0, 0, 0),
+                                };
+                                if let Err(e) = p.set_ui_info(mw, mh, 0, 0, w, h).await {
+                                    log::debug!("remote console: SetUIInfo refused: {e}");
+                                }
+                            }
+                        }
+                        // While a remote session owns the display our heads
+                        // are gone; re-enabling one behind its back would put
+                        // the guest back into the two-owner state.
+                        Ui(..) if remote => {}
                         Ui(console, g) => {
                             // Resolution follows the area we draw in, so a
                             // guest is never scaled: fullscreen and windowed
                             // are simply two different monitor sizes.
                             let Some(p) = consoles.get(console) else { continue };
+                            if let Some(slot) = last.get_mut(console) {
+                                *slot = Some(g);
+                            }
                             match p.set_ui_info(g.mm_w, g.mm_h, g.xoff, g.yoff, g.w, g.h).await {
                                 Ok(()) => log::info!("console {console}: viewport now {}x{}", g.w, g.h),
                                 Err(e) => log::debug!("console {console}: SetUIInfo refused: {e}"),

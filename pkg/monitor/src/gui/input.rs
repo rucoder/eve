@@ -68,6 +68,9 @@ pub enum GuestAct {
     /// head changed mode. Tell it, so it renders at exactly that size and we
     /// blit one pixel to one pixel instead of scaling.
     Ui(usize, crate::gui::guest::HeadGeometry),
+    /// A remote session took the display, or gave it back. Exactly one
+    /// consumer owns the guest's monitors at a time: see the handler.
+    Remote(bool),
     AbsPos(u32, u32),
     Btn(u32, bool),
     Key(u32, bool),
