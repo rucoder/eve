@@ -216,6 +216,12 @@ pub struct Actions {
     pub edit_cancel: bool,
     pub send_cad: bool,
     pub send_wake: bool,
+    /// Leave fullscreen; the overlay's button, equivalent to Ctrl+Alt+F.
+    pub toggle_fullscreen: bool,
+    /// Chrome drawn over the guest, in points. Input must reach US here even
+    /// while the guest holds the pointer, or the way out is unclickable
+    /// exactly when it is needed.
+    pub chrome: Option<egui::Rect>,
     /// Where the guest image landed, in points. Input maps through this.
     pub viewport: Option<egui::Rect>,
 }
@@ -226,11 +232,17 @@ pub struct Actions {
 /// hand stops short, and a 2px strip is unhittable on a 1080p panel.
 const REVEAL_BAND: f32 = 48.0;
 
+/// Width of the fullscreen escape tab, in points.
+const TAB_W: f32 = 200.0;
+
+/// Height of the closed tab - a hint that something is there, small enough
+/// to sit above a guest's own top panel without hiding any of it.
+const TAB_SHUT_H: f32 = 5.0;
+
 pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
     let mut act = Actions::default();
     // In fullscreen the bar is drawn last, as an overlay, so it sits above
     // the guest image instead of taking space from it.
-    let reveal = f.pointer.y <= REVEAL_BAND;
     if !f.fullscreen {
         top_bar(ctx, f, &mut act);
     }
@@ -241,20 +253,8 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
         egui::Frame::central_panel(&ctx.style())
     };
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| central(ui, f, &mut act));
-    if f.fullscreen && reveal {
-        egui::Area::new(egui::Id::new("fs_bar"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(0.0, 0.0))
-            .show(ctx, |ui| {
-                let w = ctx.screen_rect().width();
-                egui::Frame::NONE
-                    .fill(ui.visuals().panel_fill.gamma_multiply(0.94))
-                    .inner_margin(egui::Margin::symmetric(8, 4))
-                    .show(ui, |ui| {
-                        ui.set_width(w - 16.0);
-                        bar_contents(ui, f, &mut act);
-                    });
-            });
+    if f.fullscreen {
+        fs_tab(ctx, f, &mut act);
     }
     // Our own pointer goes on a foreground layer so no panel can clip it, and
     // only over OUR chrome: inside the guest view either the guest composites
@@ -263,10 +263,70 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
         port_dialog(ctx, e, &mut act);
     }
     let over_guest = act.viewport.is_some_and(|r| r.contains(f.pointer));
-    if f.focus == Focus::Gui && !over_guest {
+    // Over our own chrome the guest's cursor is behind it, so draw ours even
+    // when the guest holds the pointer - otherwise the operator is aiming at
+    // the exit button with nothing visible to aim.
+    let over_chrome = act.chrome.is_some_and(|r| r.contains(f.pointer));
+    if (f.focus == Focus::Gui && !over_guest) || over_chrome {
         draw_arrow(ctx, f.pointer);
     }
     act
+}
+
+/// The way out of fullscreen: a small tab at the top centre, like the
+/// connection bar an RDP client drops down.
+///
+/// Deliberately NOT the whole status bar. Full width covers the guest's own
+/// top panel - an XFCE menu, a Windows taskbar docked to the top - and the
+/// operator cannot reach it without leaving fullscreen first, which is the
+/// one thing the bar is there to let them do. Centred for the same reason:
+/// the corners are where guests put their menus.
+fn fs_tab(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
+    let sw = ctx.screen_rect().width();
+    let x0 = ((sw - TAB_W) / 2.0).max(0.0);
+    let w = TAB_W.min(sw);
+    // Only the tab's own column reveals it, so the pointer can reach the
+    // guest's top-left menu without the chrome appearing over it.
+    let hot = egui::Rect::from_min_size(egui::pos2(x0, 0.0), egui::vec2(w, REVEAL_BAND));
+    let open = hot.contains(f.pointer);
+    if open {
+        act.chrome = Some(hot);
+    }
+    egui::Area::new(egui::Id::new("fs_tab"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(x0, 0.0))
+        .show(ctx, |ui| {
+            let fill = ui.visuals().panel_fill;
+            if !open {
+                // Shut: a sliver, so the way out is discoverable without
+                // anyone having to be told the chord.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(w, TAB_SHUT_H), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    egui::CornerRadius {
+                        nw: 0, ne: 0,
+                        sw: TAB_SHUT_H as u8,
+                        se: TAB_SHUT_H as u8,
+                    },
+                    fill.gamma_multiply(0.55),
+                );
+                return;
+            }
+            egui::Frame::NONE
+                .fill(fill.gamma_multiply(0.96))
+                .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
+                .inner_margin(egui::Margin::symmetric(10, 5))
+                .show(ui, |ui| {
+                    ui.set_width(w - 20.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Exit fullscreen").clicked() {
+                            act.toggle_fullscreen = true;
+                        }
+                        ui.weak("Ctrl+Alt+F");
+                    });
+                });
+        });
 }
 
 fn top_bar(ctx: &egui::Context, f: &Frame, act: &mut Actions) {

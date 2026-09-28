@@ -471,7 +471,7 @@ pub fn run(
                     }
                 }
             }
-            if hot_fs {
+            if hot_fs || act.toggle_fullscreen {
                 fullscreen = !fullscreen;
                 log::info!("fullscreen -> {fullscreen}");
             }
@@ -684,6 +684,9 @@ pub fn run(
                 let mut st = inp.state.lock().unwrap();
                 st.areas = areas;
                 st.desktop = desktop;
+                st.chrome = act.chrome.map(|r| {
+                    (r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp)
+                });
             }
 
             drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &heads, n)?;

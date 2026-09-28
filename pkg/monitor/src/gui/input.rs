@@ -119,6 +119,9 @@ pub struct State {
     pub areas: Vec<GuestArea>,
     /// The guest's whole desktop: the bounding box of every `area.off+size`.
     pub desktop: (u32, u32),
+    /// Chrome drawn ON TOP of the guest, in host pixels. The guest does not
+    /// get pointer buttons here even while it holds the pointer.
+    pub chrome: Option<(f32, f32, f32, f32)>,
     pub egui_events: Vec<egui::Event>,
     pub want_tab: Option<usize>,
     /// Ctrl+Alt+F was pressed; the render loop toggles fullscreen and clears it.
@@ -269,6 +272,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             inp.areas.clear();
             inp.areas.extend_from_slice(&s.areas);
             inp.desktop = s.desktop;
+            inp.chrome = s.chrome;
         }
     })?;
     Ok(Handle { stats, bounds, state, active_tx, shutdown_fd, join })
@@ -303,6 +307,7 @@ pub struct Input {
     /// One per head: the guest image on screen and what it maps to.
     pub areas: Vec<GuestArea>,
     pub desktop: (u32, u32),
+    pub chrome: Option<(f32, f32, f32, f32)>,
     /// Tab the user asked for via Ctrl+Alt+N; consumed by the caller.
     pub want_tab: Option<usize>,
     /// Ctrl+Alt+F, consumed by the caller.
@@ -377,7 +382,7 @@ impl Input {
             stats: Default::default(),
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
-            areas: Vec::new(), desktop: (0, 0), abs_n: 0, want_tab: None,
+            areas: Vec::new(), desktop: (0, 0), chrome: None, abs_n: 0, want_tab: None,
             want_fullscreen: false,
             inotify_fd, devices: HashMap::new(),
         };
@@ -617,7 +622,9 @@ impl Input {
                             continue;
                         }
                         match self.focus {
-                            Focus::Guest if q.is_some() => self.guest.push(GuestAct::Btn(q.unwrap(), down)),
+                            Focus::Guest if q.is_some() && !self.in_chrome() => {
+                                self.guest.push(GuestAct::Btn(q.unwrap(), down))
+                            }
                             _ => {
                                 let eb = match b.button() {
                                     272 => egui::PointerButton::Primary,
@@ -726,6 +733,15 @@ impl Input {
     /// Is the host pointer over the guest image?
     fn in_view(&self) -> bool {
         self.area_at(self.x as f32, self.y as f32).is_some()
+    }
+
+    /// Is the pointer over chrome we drew on top of the guest? That chrome
+    /// wins over the guest's grab: the fullscreen exit button lives there,
+    /// and a grab the operator cannot click their way out of is a trap.
+    fn in_chrome(&self) -> bool {
+        let Some((cx, cy, cw, ch)) = self.chrome else { return false };
+        let (x, y) = (self.x as f32, self.y as f32);
+        x >= cx && x < cx + cw && y >= cy && y < cy + ch
     }
 
     /// While grabbed, keep the pointer inside the guest image. Otherwise it can
