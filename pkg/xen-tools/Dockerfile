@@ -82,10 +82,16 @@ ENV XEN_SOURCE=https://downloads.xenproject.org/release/xen/${XEN_VERSION}/xen-$
 # opengl and virglrenderer are what build the virtio-gpu-gl device variants;
 # without them QEMU has no device that can hand over a dmabuf, and the console
 # falls back to copying whole framebuffers over the bus.
+# Frame pointers, so a core dump gives a usable stack. qemu's default build
+# type is already debugoptimized (-O2 -g), but -O2 omits the frame pointer,
+# and unwinding a musl-linked qemu without one gets a few frames at best.
+# The cost is one register; the benefit is that a crash on a device is
+# diagnosable at all. See also the strip exclusion further down.
 ENV EXTRA_QEMUU_CONFIGURE_ARGS="--enable-libusb --enable-linux-aio \
     --enable-vhost-net --enable-vhost-kernel \
     --enable-vhost-user --enable-linux-io-uring --enable-zstd \
-    --enable-dbus-display --enable-opengl --enable-virglrenderer"
+    --enable-dbus-display --enable-opengl --enable-virglrenderer \
+    --extra-cflags=-fno-omit-frame-pointer"
 
 WORKDIR /
 
@@ -208,7 +214,41 @@ RUN rm -rf /out/usr/share/qemu-xen/qemu/edk2-* /out/var/run /out/usr/include
 # FIXME: this is a workaround for Xen on ARM still requiring qemu-system-i386
 #   https://wiki.xenproject.org/wiki/Xen_ARM_with_Virtualization_Extensions#Use_of_qemu-system-i386_on_ARM
 WORKDIR /out/usr/lib/xen/bin/
-RUN strip * || :
+# Split qemu's debug info out instead of discarding it.
+#
+# A stripped core dump is nearly useless - no function names, no line
+# numbers, and the unwinder cannot reliably walk the stack - so the first
+# crash on a device buys nothing and the bug has to be reproduced against a
+# special build before it can even be looked at. Splitting costs nothing on
+# the device: the shipped binary is still stripped, and .gnu_debuglink lets
+# gdb pick the symbols up later when they are put beside it.
+#
+# /debug is deliberately OUTSIDE /out. The final stage is `FROM scratch` plus
+# `COPY --from=build /out/ /`, so only /out reaches EVE; /debug stays in the
+# build image and never ships. To get the symbols for a core:
+#
+#   docker build --target build -t xen-tools-debug pkg/xen-tools
+#   cid=$(docker create xen-tools-debug)
+#   docker cp "$cid:/debug/usr/lib/xen/bin/qemu-system-x86_64.debug" .
+#   docker rm "$cid"
+#
+# then point gdb at the stripped binary with the .debug file alongside it.
+RUN mkdir -p /debug/usr/lib/xen/bin && \
+    for f in *; do \
+        case "$f" in \
+        qemu-system-*) \
+            if command -v objcopy >/dev/null 2>&1; then \
+                objcopy --only-keep-debug "$f" "/debug/usr/lib/xen/bin/$f.debug" && \
+                strip --strip-debug --strip-unneeded "$f" && \
+                objcopy --add-gnu-debuglink="/debug/usr/lib/xen/bin/$f.debug" "$f" && \
+                echo "split symbols out of $f"; \
+            else \
+                echo "WARNING: no objcopy, shipping $f stripped with no symbols kept"; \
+                strip "$f" || :; \
+            fi ;; \
+        *) strip "$f" || : ;; \
+        esac; \
+    done
 RUN if [ "$(uname -m)" = "x86_64" ]; then rm -f qemu-system-i386 && ln -s "qemu-system-$(uname -m)" qemu-system-i386 ;fi
 
 COPY --from=uefi-build / /uefi/
