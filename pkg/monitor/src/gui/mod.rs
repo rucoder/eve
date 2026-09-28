@@ -429,36 +429,43 @@ pub fn run(
             // tab mean the same thing.
             // Cheap: one non-blocking recv that almost always says EAGAIN.
             if hotplug.as_ref().is_some_and(|w| w.drained_hotplug()) {
-                match drm::discover_heads(&mut gpu, mode) {
-                    Ok(found) => {
-                        let before: Vec<&str> = heads.iter().map(|h| h.name.as_str()).collect();
-                        let after: Vec<&str> = found.iter().map(|h| h.name.as_str()).collect();
-                        if before != after {
-                            log::info!("heads changed: {before:?} -> {after:?}");
-                            let recount = found.len() != heads.len();
-                            // Dropping the old heads releases their GBM
-                            // buffers and DRM framebuffers.
-                            heads = found;
-                            head_geoms = head_geometries(&heads);
-                            // Each guest must be told its new geometry, and it
-                            // only speaks when the viewport moves.
-                            told_viewport = vec![None; heads.len()];
-                            // A guest's scanout count is fixed when its listeners
-                            // are registered, so a head appearing or going away
-                            // needs the whole attach redone. reconcile_tabs
-                            // rebuilds every tab it finds an app for.
-                            if recount {
-                                log::info!("head count changed; re-attaching guests");
-                                for vm in vms.iter_mut() {
-                                    vm.release_gl();
-                                }
-                                vms.clear();
-                                inp.clear_active();
-                                show_node = true;
-                            }
+                let before: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
+                // Heads that stayed put hand their surfaces to the new set, so
+                // `heads` has to be surrendered for the call - which leaves
+                // nothing to draw on if it fails. Retry from scratch once:
+                // every old surface is gone by then, so the CRTCs that the
+                // reconciling pass could not place are free.
+                let found = drm::rediscover_heads(&mut gpu, mode, std::mem::take(&mut heads))
+                    .or_else(|e| {
+                        log::error!("re-discovering heads after hotplug failed: {e}");
+                        drm::discover_heads(&mut gpu, mode)
+                    })?;
+                let after: Vec<String> = found.iter().map(|h| h.name.clone()).collect();
+                heads = found;
+                if before != after {
+                    log::info!("heads changed: {before:?} -> {after:?}");
+                    head_geoms = head_geometries(&heads);
+                    // The pointer lives in head 0's pixels. It is set at
+                    // startup, so without this a monitor swap leaves every
+                    // click landing somewhere else - which is what a forced
+                    // connector demonstrated on the bench.
+                    inp.set_bounds(heads[0].w, heads[0].h);
+                    // Each guest must be told its new geometry, and it only
+                    // speaks when the viewport moves.
+                    told_viewport = vec![None; heads.len()];
+                    // A guest's scanout count is fixed when its listeners are
+                    // registered, so a head appearing or going away needs the
+                    // whole attach redone. reconcile_tabs rebuilds every tab
+                    // it still finds an app for.
+                    if before.len() != after.len() {
+                        log::info!("head count changed; re-attaching guests");
+                        for vm in vms.iter_mut() {
+                            vm.release_gl();
                         }
+                        vms.clear();
+                        inp.clear_active();
+                        show_node = true;
                     }
-                    Err(e) => log::error!("re-discovering heads after hotplug failed: {e}"),
                 }
             }
             if hot_fs {

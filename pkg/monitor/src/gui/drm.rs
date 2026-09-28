@@ -256,10 +256,24 @@ impl HotplugWatch {
 }
 
 pub fn discover_heads(gpu: &mut Gpu, want_mode: Option<&str>) -> anyhow::Result<Vec<Head>> {
-    let res = gpu.drm.resource_handles()?;
-    let mut heads = Vec::new();
-    let mut used_crtcs: std::collections::HashSet<u32> = Default::default();
+    rediscover_heads(gpu, want_mode, Vec::new())
+}
 
+/// Re-discover the heads, reusing the surfaces of monitors that stayed put.
+///
+/// A head that is still there must keep the surface it has. Building a second
+/// surface for a CRTC the first one still owns fails the kernel's atomic test
+/// with EINVAL - which is what a naive "throw them all away and discover
+/// again" does, because the old heads are only dropped once the new set is
+/// built. Dropping them first instead would black the panel on every hotplug
+/// and lose the working set if discovery then failed.
+pub fn rediscover_heads(
+    gpu: &mut Gpu,
+    want_mode: Option<&str>,
+    old: Vec<Head>,
+) -> anyhow::Result<Vec<Head>> {
+    let res = gpu.drm.resource_handles()?;
+    let mut connected: Vec<(connector::Info, String, Mode)> = Vec::new();
     for h in res.connectors() {
         let c: connector::Info = gpu.drm.get_connector(*h, false)?;
         if c.state() != connector::State::Connected {
@@ -267,6 +281,31 @@ pub fn discover_heads(gpu: &mut Gpu, want_mode: Option<&str>) -> anyhow::Result<
         }
         let name = format!("{}-{}", c.interface().as_str(), c.interface_id());
         let mode = pick_mode(&c, &name, want_mode).ok_or_else(|| anyhow::anyhow!("{name}: no modes"))?;
+        connected.push((c, name, mode));
+    }
+
+    // Keep what is unchanged; everything else is dropped here, before a
+    // single new surface is built, so its CRTC is free for whoever wants it.
+    let mut kept: std::collections::HashMap<String, Head> = Default::default();
+    for h in old {
+        let same = connected
+            .iter()
+            .any(|(_, n, m)| *n == h.name && m.size() == (h.w as u16, h.h as u16));
+        if same {
+            kept.insert(h.name.clone(), h);
+        } else {
+            log::info!("  head {} released", h.name);
+        }
+    }
+    let mut used_crtcs: std::collections::HashSet<u32> =
+        kept.values().map(|h| Into::<u32>::into(h.crtc)).collect();
+
+    let mut heads = Vec::new();
+    for (c, name, mode) in connected {
+        if let Some(h) = kept.remove(&name) {
+            heads.push(h);
+            continue;
+        }
 
         // Prefer the CRTC already wired to this connector, but fall back to any
         // free one the encoder can drive. Requiring a pre-assigned CRTC fails

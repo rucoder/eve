@@ -114,6 +114,10 @@ pub struct State {
 /// our frame rate - polling libinput once per frame added up to a frame of lag.
 pub struct Handle {
     pub stats: std::sync::Arc<Stats>,
+    /// The area the pointer may move in, packed as `w << 32 | h`. Shared
+    /// rather than owned because the input thread blocks in `poll()` and a
+    /// monitor can be plugged in while it is asleep.
+    bounds: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub state: std::sync::Arc<std::sync::Mutex<State>>,
     pub active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>>,
     /// Write side of the eventfd that wakes the thread's `poll()` for
@@ -123,6 +127,14 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// A head changed size or went away: keep the pointer inside the panel.
+    pub fn set_bounds(&self, w: i32, h: i32) {
+        self.bounds.store(
+            ((w.max(1) as u64) << 32) | h.max(1) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn set_active(&self, tx: std::sync::mpsc::SyncSender<GuestAct>) {
         *self.active_tx.lock().unwrap() = Some(tx);
     }
@@ -167,6 +179,10 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
     let active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>> =
         Default::default();
     let stats: std::sync::Arc<Stats> = Default::default();
+    let bounds = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        ((w.max(1) as u64) << 32) | h.max(1) as u64,
+    ));
+    let bnd = bounds.clone();
     let st = state.clone();
     let tx = active_tx.clone();
     let sts = stats.clone();
@@ -186,6 +202,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
         };
         inp.scale = scale;
         inp.stats = sts;
+        inp.bounds = bnd;
         let fd = inp.fd();
         let hotplug_fd = inp.hotplug_fd();
         loop {
@@ -212,6 +229,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             if pfds[2].revents & libc::POLLIN != 0 {
                 inp.handle_hotplug();
             }
+            inp.take_bounds();
             inp.pump(crate::gui::points_per_pixel());
             // forward to the guest IMMEDIATELY, at device rate
             if !inp.guest.is_empty() {
@@ -236,7 +254,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             inp.guest_size = s.guest_size;
         }
     })?;
-    Ok(Handle { stats, state, active_tx, shutdown_fd, join })
+    Ok(Handle { stats, bounds, state, active_tx, shutdown_fd, join })
 }
 
 pub struct Input {
@@ -257,6 +275,8 @@ pub struct Input {
     /// relative events ignored - a global flag also killed the physical mouse.
     abs_devices: std::collections::HashSet<String>,
     scale: f64,
+    /// See `Handle::bounds`.
+    bounds: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats: std::sync::Arc<Stats>,
     /// Keys currently held down IN THE GUEST, so we can release them on
     /// ungrab - otherwise Ctrl/Alt stay stuck down in the guest.
@@ -295,6 +315,22 @@ impl Drop for Input {
 }
 
 impl Input {
+    /// Adopt a head set that changed under us, clamping the pointer into it.
+    /// A pointer left outside the panel is invisible and cannot be recovered
+    /// with the mouse, only by unplugging the monitor that was removed.
+    fn take_bounds(&mut self) {
+        let v = self.bounds.load(std::sync::atomic::Ordering::Relaxed);
+        let (w, h) = ((v >> 32) as f64, (v & 0xFFFF_FFFF) as f64);
+        if (w, h) == (self.w, self.h) {
+            return;
+        }
+        log::info!("input: area {}x{} -> {w}x{h}", self.w, self.h);
+        self.w = w;
+        self.h = h;
+        self.x = self.x.min(w - 1.0).max(0.0);
+        self.y = self.y.min(h - 1.0).max(0.0);
+    }
+
     pub fn new(w: i32, h: i32) -> anyhow::Result<Self> {
         let li = Libinput::new_from_path(Iface);
 
@@ -318,6 +354,9 @@ impl Input {
             w: w as f64, h: h as f64, ctrl: false, alt: false, last_toggle: None, swallow_release: None, scroll_acc: (0.0, 0.0), abs_devices: Default::default(),
             scale: std::env::var("GUI_PTR_SCALE").ok()
                      .and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            bounds: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                ((w.max(1) as u64) << 32) | h.max(1) as u64,
+            )),
             stats: Default::default(),
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),

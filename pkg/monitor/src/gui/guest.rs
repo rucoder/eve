@@ -221,6 +221,11 @@ impl Listener {
 #[zbus::proxy(interface = "org.qemu.Display1.Console", default_service = "org.qemu")]
 trait Console {
     fn register_listener(&self, listener: Fd<'_>) -> zbus::Result<()>;
+    /// QEMU's name for this console: the display device's id, with `.N`
+    /// appended for its Nth head. The only way to tell one device's extra
+    /// scanouts from a different device's first one.
+    #[zbus(property)]
+    fn label(&self) -> zbus::Result<String>;
     /// Geometry of the monitor this scanout is being shown on. QEMU turns it
     /// into the connector's EDID and preferred mode, and enables or disables
     /// the scanout on a non-zero or zero size - which is how a guest learns a
@@ -404,12 +409,32 @@ pub fn spawn(
             // thread's whole runtime leaks with it on every tab removal.
             let mut consoles: Vec<ConsoleProxy> = Vec::new();
             let mut listeners = Vec::new();
+            // The id of the device console 0 belongs to. Consoles are numbered
+            // across every display device QEMU has, so with VNC enabled the
+            // console after the GL device's last scanout is a different card
+            // entirely - drawing that on a second monitor would show the VNC
+            // head's contents, not the guest's second desktop.
+            let mut device: Option<String> = None;
             for (console, (head, sink)) in heads.iter().zip(out.into_iter()).enumerate() {
                 let path = format!("/org/qemu/Display1/Console_{console}");
                 let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
                     Ok(p) => p,
                     Err(e) => { log::error!("no console {console}: {e}"); break; }
                 };
+                // A label QEMU will not give us is not a reason to refuse the
+                // console: an older QEMU without the property would otherwise
+                // lose its display entirely.
+                match (proxy.label().await.ok(), device.as_deref()) {
+                    (Some(l), None) => {
+                        log::info!("console 0 is {l}");
+                        device = Some(l);
+                    }
+                    (Some(l), Some(d)) if l != d && !l.starts_with(&format!("{d}.")) => {
+                        log::info!("console {console} is {l}, not a head of {d}: stopping here");
+                        break;
+                    }
+                    _ => {}
+                }
                 // Before registering: tell the guest what monitor this scanout
                 // is being shown on, so it configures that resolution rather
                 // than virtio-gpu's built-in default (1280x800 on a 1920x1080
