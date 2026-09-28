@@ -290,6 +290,8 @@ pub fn run(
             // Where each head wants the guest drawn, collected here because
             // `act` is overwritten by the next head's frame.
             let mut viewports: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
+            // The container, not the letterboxed image: see `Actions::area`.
+            let mut areas_avail: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
             for (hi, head) in heads.iter_mut().enumerate() {
                 let head_name = head.name.clone();
                 let (mut dmabuf, _age) = head.surface.next_buffer()?;
@@ -398,6 +400,7 @@ pub fn run(
 
                 let out = egui_ctx.run(raw_input, |ctx| act = ui::draw(ctx, &view));
                 viewports.push(act.viewport);
+                areas_avail.push(act.area);
 
                 let mut prims = egui_ctx.tessellate(out.shapes, out.pixels_per_point);
                 ui::fix_orientation(
@@ -497,7 +500,14 @@ pub fn run(
                 for (hi, head) in heads.iter().enumerate() {
                     let near = |a: u32, b: u32| (a as i64 - b as i64).abs() <= 8;
                     let told = told_viewport.get(hi).copied().flatten();
-                    let want = match viewports.get(hi).copied().flatten() {
+                    // Ask for the CONTAINER, never the letterboxed image.
+                    // The image's size is computed from the guest's current
+                    // size, so asking for it feeds the guest's own answer
+                    // back in: if the guest snaps to the nearest mode it has
+                    // rather than the one we asked for, the two never agree
+                    // and the guest re-allocates its framebuffer about twice
+                    // a second for ever.
+                    let want = match areas_avail.get(hi).copied().flatten() {
                         Some(r) => (
                             (r.width() * ppp).round().max(64.0) as u32,
                             (r.height() * ppp).round().max(64.0) as u32,
@@ -512,19 +522,18 @@ pub fn run(
                     // have the guest re-allocating for ever.
                     let moved =
                         told.map_or(true, |t: Told| !near(t.want.0, want.0) || !near(t.want.1, want.1));
-                    // Told, and not doing it. SetUIInfo only makes a mode
-                    // PREFERRED; a guest is free to ignore it, and X does -
-                    // it keeps whatever mode it has and falls back to the
-                    // 1280x800 default when the one it was using disappears.
-                    // Nothing recovered that, because we only ever spoke when
-                    // our own layout moved. Bounded, because a guest that
-                    // never implements SetUIInfo must not be nagged for ever.
+                    // We asked recently and the guest has not caught up.
+                    // SetUIInfo only makes a mode PREFERRED, so a guest may
+                    // take a moment - or never. Chase only inside the window
+                    // after OUR change: outside it, a size the guest is
+                    // running is a size the guest chose, and it is not ours
+                    // to overrule.
                     let got = vm.head(hi).size;
                     let ignored = told.is_some_and(|t| {
                         got != (0, 0)
                             && (!near(got.0, t.want.0) || !near(got.1, t.want.1))
-                            && t.at.elapsed() > std::time::Duration::from_secs(3)
-                            && t.tries < 3
+                            && t.asked.elapsed() < CHASE
+                            && t.said.elapsed() > CHASE_GAP
                     });
                     if moved || ignored {
                         let (mm_w, mm_h) = head.mm.unwrap_or((0, 0));
@@ -547,21 +556,22 @@ pub fn run(
                             yoff: 0,
                         };
                         if vm.tx.try_send(input::GuestAct::Ui(hi, g)).is_ok() {
-                            let tries = if moved { 0 } else { told.map_or(0, |t| t.tries) + 1 };
+                            let now = std::time::Instant::now();
                             if ignored {
                                 log::info!(
-                                    "head {hi}: guest is {}x{}, asked for {}x{}; re-asking ({tries}/3)",
-                                    got.0, got.1, want.0, want.1
+                                    "head {hi}: guest is {}x{}, asked for {}x{} {:.0}s ago; re-asking",
+                                    got.0, got.1, want.0, want.1,
+                                    told.map_or(0.0, |t| t.asked.elapsed().as_secs_f32()),
                                 );
                             }
                             if let Some(slot) = told_viewport.get_mut(hi) {
-                                *slot = Some(Told { want, at: std::time::Instant::now(), tries });
+                                *slot = Some(Told {
+                                    want,
+                                    // Only OUR change restarts the window.
+                                    asked: if moved { now } else { told.map_or(now, |t| t.asked) },
+                                    said: now,
+                                });
                             }
-                        }
-                    } else if told.is_some_and(|t| near(got.0, t.want.0) && near(got.1, t.want.1)) {
-                        // Settled: let a later drift spend a fresh budget.
-                        if let Some(Some(t)) = told_viewport.get_mut(hi) {
-                            t.tries = 0;
                         }
                     }
                     xoff += want.0 as i32;
@@ -968,16 +978,29 @@ fn save_gui_probe(path: &std::path::Path, on: bool) {
     }
 }
 
-/// The geometry last asked of one head's guest, and how hard we have pushed.
+/// The geometry last asked of one head's guest.
+///
+/// Carries WHEN WE asked, because that is what decides whether a
+/// disagreement is ours to fix. A guest that has not caught up with a change
+/// we just made should be asked again; a guest whose own operator picked a
+/// resolution five minutes ago has made a decision, and overriding it is
+/// what turned a settings dialog into a fight neither side could win.
 #[derive(Clone, Copy)]
 struct Told {
     want: (u32, u32),
-    at: std::time::Instant,
-    /// Re-asks spent since the guest last agreed. Bounded: a guest whose
-    /// driver does not implement SetUIInfo - Windows' display-only one does
-    /// not - would otherwise be nagged for the life of the process.
-    tries: u8,
+    /// When we last changed our mind about the area.
+    asked: std::time::Instant,
+    /// When we last said so, re-asks included.
+    said: std::time::Instant,
 }
+
+/// How long after our own change we keep chasing a guest that has not
+/// adopted it. Long enough for a desktop still starting up - measured at two
+/// re-asks before GNOME took the size - and short enough that a later change
+/// by the guest's own operator is left alone.
+const CHASE: std::time::Duration = std::time::Duration::from_secs(20);
+/// Gap between re-asks. Each one makes the guest re-probe its displays.
+const CHASE_GAP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The host's whole drawing area: heads side by side in head order. The
 /// pointer lives in this space so it can cross from one monitor to the next.

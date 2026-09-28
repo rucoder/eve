@@ -781,9 +781,13 @@ impl Input {
             Focus::Guest => { if let Some((gx, gy)) = self.to_guest() {
                 self.abs_n += 1;
                 if self.abs_n % 30 == 1 {
-                    log::trace!(
-                        "ABS host={:.0},{:.0} -> abs={gx},{gy} (desktop {}x{}, {} head(s))",
-                        self.x, self.y, self.desktop.0, self.desktop.1, self.areas.len()
+                    let a = self.area_at(self.x as f32, self.y as f32);
+                    log::info!(
+                        "ABS host={:.0},{:.0} -> abs={gx},{gy}  view={:?} size={:?} off={:?} desktop={:?} c0={:?}",
+                        self.x, self.y,
+                        a.map(|a| a.view), a.map(|a| a.size), a.map(|a| a.off),
+                        self.desktop,
+                        self.areas.first().map(|c| c.size),
                     );
                 }
                 self.guest.push(GuestAct::AbsPos(gx, gy)); } }

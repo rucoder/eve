@@ -228,6 +228,11 @@ pub struct Actions {
     pub chrome: Option<egui::Rect>,
     /// Where the guest image landed, in points. Input maps through this.
     pub viewport: Option<egui::Rect>,
+    /// The whole area the guest may draw in, in points - the letterboxed
+    /// image's container. This, NOT `viewport`, is the size we ask the guest
+    /// to render at: `viewport` is derived from the guest's current size, so
+    /// asking for it feeds the guest's answer back into the next question.
+    pub area: Option<egui::Rect>,
 }
 
 /// How close to the top edge, in points, reveals the chrome in fullscreen.
@@ -504,6 +509,7 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
         }
     }
     act.viewport = Some(rect);
+    act.area = Some(avail);
 }
 
 /// The port editor. Modal on purpose: changing the address of the port you
