@@ -283,49 +283,54 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
 /// the corners are where guests put their menus.
 fn fs_tab(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
     let sw = ctx.screen_rect().width();
-    let x0 = ((sw - TAB_W) / 2.0).max(0.0);
     let w = TAB_W.min(sw);
+    let x0 = ((sw - w) / 2.0).max(0.0);
     // Only the tab's own column reveals it, so the pointer can reach the
-    // guest's top-left menu without the chrome appearing over it.
+    // guest's top-left menu with no chrome appearing over it. The hot zone
+    // does not move with the animation, or the tab would chatter as it slid
+    // out from under the pointer.
     let hot = egui::Rect::from_min_size(egui::pos2(x0, 0.0), egui::vec2(w, REVEAL_BAND));
     let open = hot.contains(f.pointer);
     if open {
         act.chrome = Some(hot);
     }
-    egui::Area::new(egui::Id::new("fs_tab"))
+
+    let id = egui::Id::new("fs_tab");
+    let t = ctx.animate_bool_with_time(id.with("open"), open, 0.13);
+    // Ease out: it should arrive gently rather than stop dead.
+    let e = 1.0 - (1.0 - t).powi(3);
+    // Height measured last frame. The tab is one row of chrome, so the first
+    // frame's guess only has to be close; it is corrected below.
+    let full_h: f32 = ctx.data(|d| d.get_temp(id.with("h")).unwrap_or(34.0));
+    // Slid fully home at e=1. At e=0 all but TAB_SHUT_H is above the top
+    // edge, so the shut state is simply the tab peeking out - no second
+    // widget pretending to be a sliver, and nothing to keep in step.
+    let y = -(full_h - TAB_SHUT_H).max(0.0) * (1.0 - e);
+
+    egui::Area::new(id)
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(x0, 0.0))
+        .fixed_pos(egui::pos2(x0, y))
         .show(ctx, |ui| {
-            let fill = ui.visuals().panel_fill;
-            if !open {
-                // Shut: a sliver, so the way out is discoverable without
-                // anyone having to be told the chord.
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(w, TAB_SHUT_H), egui::Sense::hover());
-                ui.painter().rect_filled(
-                    rect,
-                    egui::CornerRadius {
-                        nw: 0, ne: 0,
-                        sw: TAB_SHUT_H as u8,
-                        se: TAB_SHUT_H as u8,
-                    },
-                    fill.gamma_multiply(0.55),
-                );
-                return;
-            }
-            egui::Frame::NONE
-                .fill(fill.gamma_multiply(0.96))
+            let r = egui::Frame::NONE
+                .fill(ui.visuals().panel_fill.gamma_multiply(0.96))
                 .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
                 .inner_margin(egui::Margin::symmetric(10, 5))
                 .show(ui, |ui| {
                     ui.set_width(w - 20.0);
                     ui.horizontal(|ui| {
+                        // Fade the contents in behind the slide, so the
+                        // peeking edge reads as a handle rather than as a
+                        // clipped button.
+                        ui.set_opacity(e);
                         if ui.button("Exit fullscreen").clicked() {
                             act.toggle_fullscreen = true;
                         }
                         ui.weak("Ctrl+Alt+F");
                     });
-                });
+                })
+                .response
+                .rect;
+            ctx.data_mut(|d| d.insert_temp(id.with("h"), r.height()));
         });
 }
 
