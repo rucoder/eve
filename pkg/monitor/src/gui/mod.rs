@@ -486,11 +486,12 @@ pub fn run(
             // head: the guest's scanout for head N renders at exactly the
             // area head N gives it, so nothing is ever scaled.
             //
-            // A head with no viewport - the Node page is up, so no guest is
-            // drawn - is still told the whole panel rather than nothing.
-            // Leaving it untold parks the guest on virtio-gpu's 1280x800
-            // default until somebody opens its tab.
-            if let Some(vm) = vms.get(active) {
+            // Nothing at all while the Node page is up. A guest we are not
+            // drawing has no business being resized: its size is a property
+            // of the area we give it, and we are giving it none. Running
+            // this anyway is how a tab switch turned into a mode change, and
+            // how a guest nobody was looking at got nagged to resize.
+            if let Some(vm) = vms.get(active).filter(|_| !show_node) {
                 let ppp = points_per_pixel();
                 let mut xoff = 0i32;
                 for (hi, head) in heads.iter().enumerate() {
@@ -501,20 +502,10 @@ pub fn run(
                             (r.width() * ppp).round().max(64.0) as u32,
                             (r.height() * ppp).round().max(64.0) as u32,
                         ),
-                        // No guest is drawn - the Node page is up. Keep the
-                        // guest exactly where it is. Asking for the whole
-                        // panel here instead made every switch to the Node
-                        // page and back a resolution change, so the guest
-                        // reallocated its framebuffer on each one, and a
-                        // reallocation we are not re-sent a scanout for
-                        // leaves us blitting a stale, empty buffer: black.
-                        //
-                        // The panel size is only the right answer when the
-                        // guest has never been told anything at all, which is
-                        // the case this branch exists for - otherwise it sits
-                        // on virtio-gpu's 1280x800 default until somebody
-                        // opens its tab.
-                        None => told.map_or((head.w as u32, head.h as u32), |t| t.want),
+                        // Drawn, but this head has no guest area yet: the
+                        // first frame after a tab opens. Say nothing rather
+                        // than guess.
+                        None => continue,
                     };
                     // Hysteresis: egui's layout wobbles by a point during a
                     // transition, and a resolution change per frame would
