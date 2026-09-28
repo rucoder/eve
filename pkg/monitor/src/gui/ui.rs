@@ -309,6 +309,10 @@ fn fs_tab(ctx: &egui::Context, f: &Frame, act: &mut Actions) {
 
     egui::Area::new(id)
         .order(egui::Order::Foreground)
+        // An Area is kept inside the screen by default, which silently
+        // snapped the negative y back to 0: the tab never moved and only the
+        // contents faded. Sliding it off the top edge is the whole point.
+        .constrain(false)
         .fixed_pos(egui::pos2(x0, y))
         .show(ctx, |ui| {
             let r = egui::Frame::NONE
