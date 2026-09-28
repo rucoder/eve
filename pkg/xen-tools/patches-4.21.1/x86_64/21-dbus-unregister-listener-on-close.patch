@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Mon, 28 Sep 2026 23:30:00 +0000
+Subject: [PATCH] ui/dbus: stop listening when the peer disconnects
+
+A DBusDisplayListener unregisters itself from the display only in
+dispose(), and dispose never runs when a peer goes away.
+
+dbus_display_listener_new() installs a connection filter whose user data
+is a reference to the listener, and the listener keeps a reference to the
+connection. That is a cycle: when the remote peer vanishes neither object
+is finalised, so the DisplayChangeListener stays on the display's list for
+the life of the machine. Every console update is then formatted and
+dispatched to a peer that is not there, and the sends fail one after
+another.
+
+The cost is per client that has ever attached, so it accumulates. Found on
+an edge device whose graphical console had been restarted a number of
+times: seven dbus-gl listeners on one console, six of them dead. That also
+multiplied the QEMUCursor reference traffic by seven, which is what turned
+a narrow refcount race into a reproducible double free.
+
+Unregister from the connection's "closed" signal instead, guarded by
+dcl.ds so that a later dispose does not remove an already-removed node.
+
+This does not break the reference cycle itself - the listener object and
+the connection still leak their memory - but it stops the dead listener
+being called, which is the part that costs anything at runtime. Breaking
+the cycle properly means dropping the filter from the closed handler, and
+that wants more care about the listener being finalised inside its own
+callback than seemed wise to combine with this.
+
+Note "closed" is emitted in the thread-default main context of the
+connection, which for these connections is the main loop, so the
+unregistration happens on the main thread as the display list requires.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+diff --git a/tools/qemu-xen/ui/dbus-listener.c b/tools/qemu-xen/ui/dbus-listener.c
+index a54123acea..c93f9ff990 100644
+--- a/tools/qemu-xen/ui/dbus-listener.c
++++ b/tools/qemu-xen/ui/dbus-listener.c
+@@ -793,12 +793,45 @@ const DisplayChangeListenerOps dbus_dcl_ops = {
+     .dpy_cursor_define       = dbus_cursor_define,
+ };
+ 
++/*
++ * The peer went away. Stop being a display listener now.
++ *
++ * Waiting for dispose is not enough: the connection filter installed in
++ * dbus_display_listener_new() holds a reference to us, and we hold one to
++ * the connection, so neither object is finalised when the peer vanishes and
++ * dispose may never run at all. The listener then stays on the display's
++ * list for the lifetime of the machine, and every console update is
++ * delivered to a dead peer - a cost that accumulates with every client that
++ * has ever attached.
++ *
++ * Observed on an edge device whose graphical console had reconnected a
++ * number of times: seven listeners on one console, six of them dead, each
++ * one multiplying the per-update work and the cursor refcount traffic.
++ */
++static void
++dbus_display_listener_closed(GDBusConnection *conn G_GNUC_UNUSED,
++                             gboolean remote_peer_vanished G_GNUC_UNUSED,
++                             GError *error G_GNUC_UNUSED,
++                             gpointer user_data)
++{
++    DBusDisplayListener *ddl = DBUS_DISPLAY_LISTENER(user_data);
++
++    /* dcl.ds is set by register_displaychangelistener and cleared by
++     * unregister_displaychangelistener, so it says whether we are still on
++     * the list. Unregistering twice would remove an already-removed node. */
++    if (ddl->dcl.ds) {
++        unregister_displaychangelistener(&ddl->dcl);
++    }
++}
++
+ static void
+ dbus_display_listener_dispose(GObject *object)
+ {
+     DBusDisplayListener *ddl = DBUS_DISPLAY_LISTENER(object);
+ 
+-    unregister_displaychangelistener(&ddl->dcl);
++    if (ddl->dcl.ds) {
++        unregister_displaychangelistener(&ddl->dcl);
++    }
+     g_clear_object(&ddl->conn);
+     g_clear_pointer(&ddl->bus_name, g_free);
+     g_clear_object(&ddl->proxy);
+@@ -1036,6 +1069,12 @@ dbus_display_listener_new(const char *bus_name,
+     ddl->conn = conn;
+     ddl->console = console;
+ 
++    /* _object so the handler goes away with us, rather than being left
++     * pointing at a freed listener if the connection outlives it. */
++    g_signal_connect_object(conn, "closed",
++                            G_CALLBACK(dbus_display_listener_closed),
++                            ddl, 0);
++
+     dbus_display_listener_setup_shared_map(ddl);
+     dbus_display_listener_setup_d3d11(ddl);
+ 
