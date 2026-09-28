@@ -2429,22 +2429,45 @@ func (ctx KvmContext) virtualGPUFor(config types.DomainConfig, hasIntelIGPU, igp
 // with host GL. Only present on a device with a usable GPU.
 const renderNode = "/dev/dri/renderD128"
 
-// hostMaxOutputs is how many displays the host GPU can drive at once, which
-// is its CRTC count - not its connector count. A Tiger Lake iGPU exposes five
-// connectors but has four pipes, and a guest told it may have five monitors
-// would carry a head that can never be lit.
+// hostMaxOutputs is how many displays a guest's virtio-gpu may have. It is
+// the host GPU's connector count: every socket a monitor could ever be
+// plugged into, not how many are plugged in now, because max_outputs is fixed
+// when the domain starts and monitors are not.
+//
+// Connectors rather than CRTCs, although CRTCs are what actually limit how
+// many displays can be lit at once - a Tiger Lake iGPU has four pipes and
+// five connectors. The CRTC count is only in debugfs, which is not mounted in
+// pillar's mount namespace (measured: /sys/kernel/debug does not exist there,
+// while /sys/class/drm does), and reading it through the host namespace from
+// here would be worse than the small over-count. Over-counting is cheap:
+// scanouts past the first come up disabled and are only enabled when a
+// console reports a monitor for them, so a scanout the hardware could never
+// light simply never gets used.
 //
 // Falls back to 1: a guest with one head is always right, a guest with heads
-// the hardware cannot drive is not.
+// nothing can drive is not.
 func hostMaxOutputs() int {
-	ents, err := os.ReadDir("/sys/kernel/debug/dri/0")
+	ents, err := os.ReadDir("/sys/class/drm")
 	if err != nil {
 		return 1
 	}
-	n := 0
+	// Per card, because a box with two GPUs lists both here and a guest's
+	// display can only follow one of them.
+	perCard := map[string]int{}
 	for _, e := range ents {
-		if strings.HasPrefix(e.Name(), "crtc-") {
-			n++
+		// "card0-HDMI-A-3" is a connector; "card0" and "renderD128" are not.
+		name := e.Name()
+		if !strings.HasPrefix(name, "card") {
+			continue
+		}
+		if card, _, found := strings.Cut(name, "-"); found {
+			perCard[card]++
+		}
+	}
+	n := 0
+	for _, c := range perCard {
+		if c > n {
+			n = c
 		}
 	}
 	if n < 1 {
