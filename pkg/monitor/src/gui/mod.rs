@@ -162,7 +162,7 @@ pub fn run(
     // the size we tell it, so this is what keeps the blit 1:1 rather than
     // scaled - and it changes when fullscreen is toggled.
     // Per head, because each one shows a different scanout at its own size.
-    let mut told_viewport: Vec<Option<(u32, u32)>> = vec![None; heads.len()];
+    let mut told_viewport: Vec<Option<Told>> = vec![None; heads.len()];
     // The open port editor, if any, and what each port looked like before the
     // last Apply so Undo has somewhere to go.
     let mut edit: Option<ui::PortEdit> = None;
@@ -479,51 +479,82 @@ pub fn run(
             // The viewports are in points; the guest wants pixels. One per
             // head: the guest's scanout for head N renders at exactly the
             // area head N gives it, so nothing is ever scaled.
-            if !show_node {
-                if let Some(vm) = vms.get(active) {
-                    let ppp = points_per_pixel();
-                    let mut xoff = 0i32;
-                    for (hi, head) in heads.iter().enumerate() {
-                        let Some(r) = viewports.get(hi).copied().flatten() else { continue };
-                        let want = (
+            //
+            // A head with no viewport - the Node page is up, so no guest is
+            // drawn - is still told the whole panel rather than nothing.
+            // Leaving it untold parks the guest on virtio-gpu's 1280x800
+            // default until somebody opens its tab.
+            if let Some(vm) = vms.get(active) {
+                let ppp = points_per_pixel();
+                let mut xoff = 0i32;
+                for (hi, head) in heads.iter().enumerate() {
+                    let want = match viewports.get(hi).copied().flatten() {
+                        Some(r) => (
                             (r.width() * ppp).round().max(64.0) as u32,
                             (r.height() * ppp).round().max(64.0) as u32,
-                        );
-                        // Hysteresis: egui's layout wobbles by a point during
-                        // a transition, and a resolution change per frame
-                        // would have the guest re-allocating for ever.
-                        let moved = told_viewport.get(hi).copied().flatten().map_or(true, |(w, h)| {
-                            (w as i64 - want.0 as i64).abs() > 8
-                                || (h as i64 - want.1 as i64).abs() > 8
-                        });
-                        if moved {
-                            let (mm_w, mm_h) = head.mm.unwrap_or((0, 0));
-                            // Scale the millimetres with the area, so the DPI
-                            // the guest computes stays the panel's real one.
-                            let mm = |full_mm: u32, part: u32, full: u32| -> u16 {
-                                if full == 0 { 0 } else { ((full_mm * part) / full) as u16 }
-                            };
-                            let g = guest::HeadGeometry {
-                                w: want.0,
-                                h: want.1,
-                                mm_w: mm(mm_w as u32, want.0, head.w as u32),
-                                mm_h: mm(mm_h as u32, want.1, head.h as u32),
-                                // Side by side in head order, using the area
-                                // the guest actually gets rather than the
-                                // panel width: a guest laying its desktop out
-                                // across two heads must not leave a gap where
-                                // our chrome is.
-                                xoff,
-                                yoff: 0,
-                            };
-                            if vm.tx.try_send(input::GuestAct::Ui(hi, g)).is_ok() {
-                                if let Some(slot) = told_viewport.get_mut(hi) {
-                                    *slot = Some(want);
-                                }
+                        ),
+                        None => (head.w as u32, head.h as u32),
+                    };
+                    let near = |a: u32, b: u32| (a as i64 - b as i64).abs() <= 8;
+                    let told = told_viewport.get(hi).copied().flatten();
+                    // Hysteresis: egui's layout wobbles by a point during a
+                    // transition, and a resolution change per frame would
+                    // have the guest re-allocating for ever.
+                    let moved =
+                        told.map_or(true, |t: Told| !near(t.want.0, want.0) || !near(t.want.1, want.1));
+                    // Told, and not doing it. SetUIInfo only makes a mode
+                    // PREFERRED; a guest is free to ignore it, and X does -
+                    // it keeps whatever mode it has and falls back to the
+                    // 1280x800 default when the one it was using disappears.
+                    // Nothing recovered that, because we only ever spoke when
+                    // our own layout moved. Bounded, because a guest that
+                    // never implements SetUIInfo must not be nagged for ever.
+                    let got = vm.head(hi).size;
+                    let ignored = told.is_some_and(|t| {
+                        got != (0, 0)
+                            && (!near(got.0, t.want.0) || !near(got.1, t.want.1))
+                            && t.at.elapsed() > std::time::Duration::from_secs(3)
+                            && t.tries < 3
+                    });
+                    if moved || ignored {
+                        let (mm_w, mm_h) = head.mm.unwrap_or((0, 0));
+                        // Scale the millimetres with the area, so the DPI
+                        // the guest computes stays the panel's real one.
+                        let mm = |full_mm: u32, part: u32, full: u32| -> u16 {
+                            if full == 0 { 0 } else { ((full_mm * part) / full) as u16 }
+                        };
+                        let g = guest::HeadGeometry {
+                            w: want.0,
+                            h: want.1,
+                            mm_w: mm(mm_w as u32, want.0, head.w as u32),
+                            mm_h: mm(mm_h as u32, want.1, head.h as u32),
+                            // Side by side in head order, using the area
+                            // the guest actually gets rather than the
+                            // panel width: a guest laying its desktop out
+                            // across two heads must not leave a gap where
+                            // our chrome is.
+                            xoff,
+                            yoff: 0,
+                        };
+                        if vm.tx.try_send(input::GuestAct::Ui(hi, g)).is_ok() {
+                            let tries = if moved { 0 } else { told.map_or(0, |t| t.tries) + 1 };
+                            if ignored {
+                                log::info!(
+                                    "head {hi}: guest is {}x{}, asked for {}x{}; re-asking ({tries}/3)",
+                                    got.0, got.1, want.0, want.1
+                                );
+                            }
+                            if let Some(slot) = told_viewport.get_mut(hi) {
+                                *slot = Some(Told { want, at: std::time::Instant::now(), tries });
                             }
                         }
-                        xoff += want.0 as i32;
+                    } else if told.is_some_and(|t| near(got.0, t.want.0) && near(got.1, t.want.1)) {
+                        // Settled: let a later drift spend a fresh budget.
+                        if let Some(Some(t)) = told_viewport.get_mut(hi) {
+                            t.tries = 0;
+                        }
                     }
+                    xoff += want.0 as i32;
                 }
             }
             if let Some(p) = act.page {
@@ -883,6 +914,17 @@ fn head_geometry(heads: &[drm::Head], idx: usize) -> Option<guest::HeadGeometry>
         xoff: heads[..idx].iter().map(|p| p.w).sum(),
         yoff: 0,
     })
+}
+
+/// The geometry last asked of one head's guest, and how hard we have pushed.
+#[derive(Clone, Copy)]
+struct Told {
+    want: (u32, u32),
+    at: std::time::Instant,
+    /// Re-asks spent since the guest last agreed. Bounded: a guest whose
+    /// driver does not implement SetUIInfo - Windows' display-only one does
+    /// not - would otherwise be nagged for the life of the process.
+    tries: u8,
 }
 
 /// The host's whole drawing area: heads side by side in head order. The
