@@ -261,6 +261,13 @@ trait Console {
     /// scanouts from a different device's first one.
     #[zbus(property)]
     fn label(&self) -> zbus::Result<String>;
+    /// The scanout size the guest has configured on this console. Non-zero
+    /// once the guest has actually put something on the head, which is the
+    /// only positive evidence available that it accepted one.
+    #[zbus(property)]
+    fn width(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn height(&self) -> zbus::Result<u32>;
     /// Geometry of the monitor this scanout is being shown on. QEMU turns it
     /// into the connector's EDID and preferred mode, and enables or disables
     /// the scanout on a non-zero or zero size - which is how a guest learns a
@@ -289,6 +296,35 @@ pub struct HeadGeometry {
     pub mm_h: u16,
     pub xoff: i32,
     pub yoff: i32,
+}
+
+/// Who currently has heads enabled on the guest.
+///
+/// Two states are not enough. A handover that the guest refuses to follow
+/// is rolled back to BOTH, which is neither of the others - and treating it
+/// as "local" means the next request to go local is skipped as a no-op, so
+/// the guest is left with a monitor nobody is looking at for as long as it
+/// runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Owner {
+    Local,
+    Remote,
+    Both,
+}
+
+/// Enable a head at this geometry, or take it away entirely with a zero
+/// size. Failure is logged and swallowed: a guest whose driver does not
+/// implement SetUIInfo - Windows' display-only one ignores the size,
+/// though it does act on a head appearing or going - must not take the
+/// pump down with it.
+async fn set_head(p: &ConsoleProxy<'_>, g: Option<HeadGeometry>) {
+    let (w, h, mw, mh, x, y) = match g {
+        Some(g) => (g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff),
+        None => (0, 0, 0, 0, 0, 0),
+    };
+    if let Err(e) = p.set_ui_info(mw, mh, x, y, w, h).await {
+        log::debug!("SetUIInfo({w}x{h}) refused: {e}");
+    }
 }
 
 /// Linux evdev keycode -> QEMU "qnum", which is what the D-Bus Keyboard
@@ -577,6 +613,11 @@ pub fn spawn(
                     if device_of(&label) == d {
                         continue; // another of our own scanouts, already off
                     }
+                    // Take it away: a guest that can see a monitor nobody
+                    // is looking at extends its desktop onto it, spreads
+                    // its one absolute pointer across the union, and - on
+                    // Windows - remembers the layout afterwards, so windows
+                    // reopen on coordinates that no longer exist.
                     match proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
                         Ok(()) => log::info!("console {console} is {label}: disabled it"),
                         Err(e) => log::warn!("console {console} is {label}: cannot disable: {e}"),
@@ -602,7 +643,7 @@ pub fn spawn(
             for (i, h) in heads.iter().enumerate().take(consoles.len()) {
                 last[i] = *h;
             }
-            let mut remote = false;
+            let mut owner = Owner::Local;
             // input pump: drain the channel and drive QEMU's Keyboard/Mouse.
             // Console 0 only: the guest has one keyboard and one absolute
             // pointer whatever its monitor count, and both hang off the first
@@ -633,57 +674,116 @@ pub fn spawn(
                         Btn(b, d) => { if let Some(m) = &mouse {
                             let r = if d { m.press(b).await } else { m.release(b).await };
                             if let Err(e) = r { log::error!("btn {b} down={d} ERR {e}"); } } }
+                        ManageHeads(_) => {}
                         Remote(on) => {
-                            // Exactly one consumer owns the guest's monitors.
+                            // Exactly one consumer owns the guest's
+                            // monitors. The guest has ONE absolute pointer
+                            // whose range is spread across whatever desktop
+                            // it has, so while two consumers each hold a
+                            // head neither can place a cursor - and Windows
+                            // additionally remembers the second monitor's
+                            // geometry long after it is gone, reopening
+                            // windows on coordinates that no longer exist.
                             //
-                            // The guest has ONE absolute pointer whose range
-                            // is spread across whatever desktop it has, so
-                            // two consumers with heads enabled at once means
-                            // neither can place a cursor correctly - each
-                            // scales against its own head while the guest
-                            // scales against the union, and neither can see
-                            // the other's layout to correct for it. Handing
-                            // the display over whole, the way RDP does, is
-                            // the only arrangement in which the arithmetic
-                            // closes.
-                            if on == remote {
+                            // Done as a transaction. The guest only moves
+                            // BECAUSE the source goes away, so there is no
+                            // "wait for it to move, then take the old one"
+                            // ordering that works: we have to make the
+                            // change and then check it landed. If the guest
+                            // ends up drawing nowhere - which is how a
+                            // Windows guest was left with a black screen on
+                            // both heads - put it back the way it was.
+                            let want = if on { Owner::Remote } else { Owner::Local };
+                            if owner == want {
                                 continue;
                             }
-                            remote = on;
-                            log::info!(
-                                "display owner -> {}",
-                                if on { "remote session" } else { "local console" }
-                            );
-                            // Give the remote head the geometry of our first
-                            // one, so a VNC client sees the same picture the
-                            // operator would. It may renegotiate its own size
-                            // afterwards; that is its business, not ours.
                             let hand = last.first().copied().flatten();
-                            for (i, p) in consoles.iter().enumerate() {
-                                let g = if on { None } else { last.get(i).copied().flatten() };
-                                let (w, h, mw, mh, x, y) = match g {
-                                    Some(g) => (g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff),
-                                    None => (0, 0, 0, 0, 0, 0),
-                                };
-                                if let Err(e) = p.set_ui_info(mw, mh, x, y, w, h).await {
-                                    log::debug!("console {i}: SetUIInfo refused: {e}");
+
+                            // Destination first, so there is no instant
+                            // with no head at all.
+                            if on {
+                                for p in foreign.iter() {
+                                    set_head(p, hand).await;
+                                }
+                                for p in consoles.iter() {
+                                    set_head(p, None).await;
+                                }
+                            } else {
+                                for (i, p) in consoles.iter().enumerate() {
+                                    set_head(p, last.get(i).copied().flatten()).await;
+                                }
+                                for p in foreign.iter() {
+                                    set_head(p, None).await;
                                 }
                             }
-                            for p in foreign.iter() {
-                                let g = if on { hand } else { None };
-                                let (w, h, mw, mh) = match g {
-                                    Some(g) => (g.w, g.h, g.mm_w, g.mm_h),
-                                    None => (0, 0, 0, 0),
+                            owner = want;
+                            log::info!("display owner -> {owner:?}");
+
+                            // Did it land?
+                            //
+                            // Ask the DESTINATION, not the source. The
+                            // obvious test - wait for our own head to go
+                            // quiet - only fires when the guest RELEASES
+                            // the scanout resource, and a guest may simply
+                            // stop drawing to a disabled output without
+                            // releasing it. QEMU then never calls Disable
+                            // on us, we see nothing, and a handover that
+                            // worked gets undone.
+                            //
+                            // A console's Width/Height is what the guest
+                            // has configured there, so non-zero on the head
+                            // we just handed over is the guest saying yes.
+                            let mut ok = false;
+                            for _ in 0..40 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                let live = if on {
+                                    let mut any = false;
+                                    for p in foreign.iter() {
+                                        if p.width().await.unwrap_or(0) > 0 {
+                                            any = true;
+                                        }
+                                    }
+                                    any
+                                } else {
+                                    consoles
+                                        .first()
+                                        .map(|p| p.width())
+                                        .unwrap()
+                                        .await
+                                        .unwrap_or(0)
+                                        > 0
                                 };
-                                if let Err(e) = p.set_ui_info(mw, mh, 0, 0, w, h).await {
-                                    log::debug!("remote console: SetUIInfo refused: {e}");
+                                if live {
+                                    ok = true;
+                                    break;
                                 }
+                            }
+                            if !ok {
+                                log::warn!(
+                                    "the guest did not follow the display to the {}; \
+                                     putting both heads back",
+                                    if on { "remote session" } else { "local console" }
+                                );
+                                for (i, p) in consoles.iter().enumerate() {
+                                    let g = last.get(i).copied().flatten().or(hand);
+                                    set_head(p, g).await;
+                                }
+                                for p in foreign.iter() {
+                                    set_head(p, hand).await;
+                                }
+                                // Both up is wrong, but it is visible; one
+                                // head disabled and a guest that ignored the
+                                // other is a black screen with no way back.
+                                // Recorded as its own state so that the next
+                                // request is not mistaken for a no-op.
+                                owner = Owner::Both;
                             }
                         }
                         // While a remote session owns the display our heads
                         // are gone; re-enabling one behind its back would put
-                        // the guest back into the two-owner state.
-                        Ui(..) if remote => {}
+                        // the guest back into the two-owner state. Both is
+                        // different: our head IS up, so it may be resized.
+                        Ui(..) if owner == Owner::Remote => {}
                         Ui(console, g) => {
                             // Resolution follows the area we draw in, so a
                             // guest is never scaled: fullscreen and windowed

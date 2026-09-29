@@ -71,6 +71,12 @@ pub enum GuestAct {
     /// A remote session took the display, or gave it back. Exactly one
     /// consumer owns the guest's monitors at a time: see the handler.
     Remote(bool),
+    /// Whether the heads we do not draw may be switched off.
+    ///
+    /// Only sent once a guest has proved it acts on SetUIInfo. Taking a
+    /// head away from a guest that ignores us is a one-way door: we can
+    /// disable it and never get it back.
+    ManageHeads(bool),
     AbsPos(u32, u32),
     Btn(u32, bool),
     Key(u32, bool),
