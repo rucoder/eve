@@ -94,7 +94,7 @@ RUN case "$(uname -m)" in \
     esac && \
     ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
         --target-list="$TARGETS" \
-        --enable-kvm --disable-xen \
+        --enable-kvm --disable-xen --disable-tools \
         --disable-werror --disable-docs --disable-guest-agent \
         --disable-slirp --disable-sdl --disable-gtk --disable-curses \
         --enable-trace-backends=log,simple \
@@ -106,18 +106,20 @@ RUN case "$(uname -m)" in \
     make -j "$(getconf _NPROCESSORS_ONLN)" && \
     make install DESTDIR=/dist
 
-# Split QEMU's debug info out instead of discarding it. The binaries ship
-# stripped; the symbols ship under /usr/lib/debug, where gdb finds them
-# through .gnu_debuglink, so a core from a device opens against the rootfs
-# with no further setup.
+# QEMU ships stripped. To ship its debug info again - so a core from a device
+# opens against the rootfs with gdb and no further setup - replace the plain
+# strip below with the commented split, which keeps the symbols under
+# /usr/lib/debug where gdb finds them through .gnu_debuglink. It costs about
+# 58MB raw, 17MB in the squashfs rootfs.
 WORKDIR /dist/usr/bin
-RUN mkdir -p /dist/usr/lib/debug/usr/bin && \
-    for f in qemu-system-*; do \
-        objcopy --only-keep-debug "$f" "/dist/usr/lib/debug/usr/bin/$f.debug" && \
-        strip --strip-debug --strip-unneeded "$f" && \
-        objcopy --add-gnu-debuglink="/dist/usr/lib/debug/usr/bin/$f.debug" "$f"; \
-    done && \
-    for f in *; do case "$f" in qemu-system-*) ;; *) strip "$f" || : ;; esac; done
+RUN for f in *; do strip "$f" || :; done
+# RUN mkdir -p /dist/usr/lib/debug/usr/bin && \
+#     for f in qemu-system-*; do \
+#         objcopy --only-keep-debug "$f" "/dist/usr/lib/debug/usr/bin/$f.debug" && \
+#         strip --strip-debug --strip-unneeded "$f" && \
+#         objcopy --add-gnu-debuglink="/dist/usr/lib/debug/usr/bin/$f.debug" "$f"; \
+#     done && \
+#     for f in *; do case "$f" in qemu-system-*) ;; *) strip "$f" || : ;; esac; done
 
 # The Mesa this was built against, runtime parts only.
 RUN cp -a /usr/lib/libgallium-*.so /usr/lib/libgbm.so.* /usr/lib/libEGL.so.* \
@@ -127,12 +129,10 @@ RUN cp -a /usr/lib/libgallium-*.so /usr/lib/libgbm.so.* /usr/lib/libEGL.so.* \
     cp -a /usr/lib/gbm/dri_gbm.so /dist/usr/lib/gbm/ && \
     cp -a /usr/share/glvnd /usr/share/drirc.d /dist/usr/share/
 
-# Firmware for machines EVE never runs, build-time files, and the storage
-# daemon, which nothing uses.
+# Firmware for machines EVE never runs, and build-time files.
 RUN rm -rf /dist/usr/include /dist/usr/lib/pkgconfig /dist/usr/share/man \
            /dist/usr/share/doc /dist/usr/share/qemu/edk2-* \
-           /dist/usr/share/qemu/openbios-* /dist/usr/bin/qemu-storage-daemon \
-           /dist/usr/bin/virgl_test_server && \
+           /dist/usr/share/qemu/openbios-* /dist/usr/bin/virgl_test_server && \
     find /dist -name '*.a' -delete && \
     rm -f /dist/usr/share/qemu/skiboot.lid /dist/usr/share/qemu/hppa-firmware.img \
           /dist/usr/share/qemu/hppa-firmware64.img /dist/usr/share/qemu/s390-ccw.img \
