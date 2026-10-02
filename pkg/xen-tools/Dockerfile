@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 FROM lfedge/eve-uefi:7e975cf524ce81922f283bf434563a08ac400a17 AS uefi-build
-FROM lfedge/eve-qemu:838bf5eec09b841c35bf3c273d39889b5a977c9b AS qemu
+FROM lfedge/eve-qemu:6912406c9ccec7e76dad82459f3315b71cd114bb AS qemu
 FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runx-build
 ENV BUILD_PKGS="mkinitfs gcc musl-dev e2fsprogs chrony agetty"
 RUN eve-alpine-deploy.sh
@@ -106,12 +106,16 @@ RUN mkdir -p /out/usr/lib/xen/boot && cp /uefi/OVMF.fd /out/usr/lib/xen/boot/ovm
 
 # We need to keep a slim profile, which means removing things we don't need
 RUN rm -rf /out/usr/lib/debug /out/usr/lib/python*
+# eve-alpine-deploy.sh always installs apk-tools, and with it OpenSSL; nothing
+# else here links libcrypto or libssl. The apk DB stays, for the SBOM.
+RUN rm -rf /out/sbin/apk /out/usr/lib/libapk.so.* /out/usr/lib/libcrypto.so.* \
+           /out/usr/lib/libssl.so.* /out/usr/lib/engines-3 /out/usr/lib/ossl-modules \
+           /out/usr/bin/ssl_client
 # Static libraries are build-time only; some live in subdirectories (e.g. xen/lib/libfdt.a).
 RUN find /out -type f -name '*.a' -exec rm -f {} +
 RUN rm -rf /out/usr/share/man
 
-# QEMU for KVM, with virglrenderer and Mesa, and QEMU's debug symbols under
-# /usr/lib/debug (pkg/qemu). The Alpine libraries it links are in PKGS; fail
+# QEMU for KVM, with virglrenderer and Mesa (pkg/qemu). The Alpine libraries it links are in PKGS; fail
 # here, not at the first VM start, if one is missing.
 COPY --from=qemu /usr/ /out/usr/
 RUN set -e; missing=""; \
