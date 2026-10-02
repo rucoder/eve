@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 FROM lfedge/eve-uefi:7e975cf524ce81922f283bf434563a08ac400a17 AS uefi-build
+FROM lfedge/eve-qemu:838bf5eec09b841c35bf3c273d39889b5a977c9b AS qemu
 FROM lfedge/eve-alpine:1d60238fe336a7782fb173fed1be692246a27dfa AS runx-build
 ENV BUILD_PKGS="mkinitfs gcc musl-dev e2fsprogs chrony agetty"
 RUN eve-alpine-deploy.sh
@@ -27,28 +28,13 @@ ENV BUILD_PKGS="\
     pixman-dev libaio-dev yajl-dev argp-standalone \
     linux-headers git patch texinfo tar libcap-ng-dev \
     attr-dev flex bison cmake libusb-dev zstd-dev \
-    python3 build-base ninja gnutls-dev agetty py3-setuptools \
-    libepoxy-dev virglrenderer-dev mesa-dev"
+    python3 build-base ninja gnutls-dev agetty py3-setuptools"
 
 ENV BUILD_PKGS_arm64=dtc-dev
 
-ENV PKGS="alpine-baselayout libgcc bash musl-utils libaio libbz2 glib pixman yajl keyutils libusb xz-libs libuuid zstd-libs util-linux-misc gnutls libepoxy virglrenderer mesa-gbm mesa-egl mesa-gl"
-ENV PKGS_arm64=libfdt
+ENV PKGS="alpine-baselayout libgcc bash musl-utils libaio libbz2 glib pixman yajl keyutils libusb xz-libs libuuid zstd-libs util-linux-misc gnutls zlib libdrm libexpat libstdc++ libcap-ng libfdt"
 
 RUN eve-alpine-deploy.sh
-
-# Drop every gallium pipe driver except iris. QEMU only needs host GL here to
-# back a guest's virtual GPU, and EVE's graphical console targets Gen12+ Intel
-# graphics; the other eight (crocus, nouveau, r300, r600, radeonsi, swrast,
-# vmwgfx, i915) are 83MB of drivers for hardware this image will never see, and
-# the rootfs partition has a size budget. A host with no supported GPU has no
-# render node either, so domainmgr gives its guests no display at all and QEMU
-# never reaches a driver.
-#
-# libLLVM stays: libgallium.so lists it as NEEDED, so removing it stops the
-# loader dead even for iris, which does not itself use it. Getting rid of it
-# means building mesa with -Dllvm=disabled -Dgallium-drivers=iris.
-RUN find /out/usr/lib/gallium-pipe -name 'pipe_*.so' ! -name 'pipe_iris.so' -delete
 
 # Alpine linux defines all 64bit integer types as long. Patch
 # /usr/include/bits/alltypes.h to fix compilation with -m32
@@ -56,43 +42,9 @@ WORKDIR /
 COPY alpine.patch /
 RUN patch -p1 < alpine.patch
 
-ENV LIBURING_VERSION=0.7
-ENV LIBURING_SOURCE=https://git.kernel.org/pub/scm/linux/kernel/git/axboe/liburing.git/snapshot/liburing-${LIBURING_VERSION}.tar.gz
-
-# Download and verify liburing
-# hadolint ignore=DL3020
-ADD ${LIBURING_SOURCE} /liburing.tar.gz
-RUN tar --absolute-names -xz < /liburing.tar.gz && mv "/liburing-${LIBURING_VERSION}" /liburing
-
-WORKDIR /liburing
-RUN ./configure --prefix=/usr
-RUN make src && make install DESTDIR=/out && make install
-
-# Filter out unneeded stuff
-RUN rm -rf /out/usr/man
-RUN strip /out/usr/lib/* || :
-
-# Register liburing in the APK DB, mandatory for it to be included in the SBOM.
-RUN register-sbom-pkg.sh -n liburing -v "${LIBURING_VERSION}" -l LGPL-2.1-only -u https://github.com/axboe/liburing
-
 # When changing this version, also update SEABIOS_UPSTREAM_REVISION to whatever is in `Config.mk` in the xen source
 ENV XEN_VERSION=4.21.1
 ENV XEN_SOURCE=https://downloads.xenproject.org/release/xen/${XEN_VERSION}/xen-${XEN_VERSION}.tar.gz
-# dbus-display is how the graphical console receives guest framebuffers.
-# opengl and virglrenderer are what build the virtio-gpu-gl device variants;
-# without them QEMU has no device that can hand over a dmabuf, and the console
-# falls back to copying whole framebuffers over the bus.
-# Frame pointers, so a core dump gives a usable stack. qemu's default build
-# type is already debugoptimized (-O2 -g), but -O2 omits the frame pointer,
-# and unwinding a musl-linked qemu without one gets a few frames at best.
-# The cost is one register; the benefit is that a crash on a device is
-# diagnosable at all. See also the strip exclusion further down.
-ENV EXTRA_QEMUU_CONFIGURE_ARGS="--enable-libusb --enable-linux-aio \
-    --enable-vhost-net --enable-vhost-kernel \
-    --enable-vhost-user --enable-linux-io-uring --enable-zstd \
-    --enable-dbus-display --enable-opengl --enable-virglrenderer \
-    --extra-cflags=-fno-omit-frame-pointer"
-
 WORKDIR /
 
 # Download and verify xen
@@ -100,70 +52,6 @@ WORKDIR /
 # hadolint ignore=DL3020
 ADD ${XEN_SOURCE} /xen.tar.gz
 RUN [ -f "$(basename ${XEN_SOURCE})" ] || tar --absolute-names -xz < /xen.tar.gz && mv "/xen-${XEN_VERSION}" /xen
-
-# Starting with xen 4.21, the release tarball no longer bundles tools/qemu-xen/
-# in-tree (4.19 did).  Fetch the qemu source separately so our local patches in
-# patches-${XEN_VERSION} that touch tools/qemu-xen/ have something to apply
-# against, and so the xen build uses our patched tree instead of cloning a
-# fresh one.
-#
-# We pull the official upstream qemu release tarball rather than cloning
-# xenbits.xen.org/qemu-xen.git so that every source line in the resulting
-# image can be attributed to a discrete URL + sha256 by the buildkit SBOM
-# scanner.  A `RUN git clone` would be opaque to that tooling.
-#
-# qemu-xen-4.21.0 ≡ upstream qemu v9.1.0 plus two small Xen-bus patches
-# (xs_node_read helper, %ms scanf fix); we carry those as 02-/03- patches in
-# patches-${XEN_VERSION}/ so the resulting tree is functionally identical to
-# qemu-xen-4.21.0.
-ENV QEMU_VERSION=9.1.0
-ENV QEMU_SOURCE=https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz
-# hadolint ignore=DL3020
-ADD ${QEMU_SOURCE} /qemu.tar.xz
-RUN mkdir -p /xen/tools/qemu-xen && \
-    tar --absolute-names -xJf /qemu.tar.xz --strip-components=1 -C /xen/tools/qemu-xen && \
-    rm -f /qemu.tar.xz && \
-    rm -rf /xen/tools/qemu-xen/roms
-
-# Meson subprojects.  qemu's release tarball ships .wrap files (not the
-# subproject source itself); without these, the meson build step in the
-# qemu configure phase would try to `git clone` each from gitlab.com at
-# build time, which (a) leaks the source URL out of the SBOM, and (b)
-# requires `network: yes` in build.yml.
-#
-# Instead, ADD each subproject's tarball at the exact SHA the wrap pins
-# (one ADD per source = one SBOM record per source) and stage them under
-# subprojects/<name>/ where meson expects them.  Meson short-circuits the
-# wrap fetch when the target directory already exists.
-# hadolint ignore=DL3020
-ADD https://gitlab.com/qemu-project/berkeley-softfloat-3/-/archive/b64af41c3276f97f0e181920400ee056b9c88037/berkeley-softfloat-3-b64af41c3276f97f0e181920400ee056b9c88037.tar.gz /subprojects/berkeley-softfloat-3.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.com/qemu-project/berkeley-testfloat-3/-/archive/e7af9751d9f9fd3b47911f51a5cfd08af256a9ab/berkeley-testfloat-3-e7af9751d9f9fd3b47911f51a5cfd08af256a9ab.tar.gz /subprojects/berkeley-testfloat-3.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.com/qemu-project/dtc/-/archive/b6910bec11614980a21e46fbccc35934b671bd81/dtc-b6910bec11614980a21e46fbccc35934b671bd81.tar.gz /subprojects/dtc.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.com/qemu-project/keycodemapdb/-/archive/f5772a62ec52591ff6870b7e8ef32482371f22c6/keycodemapdb-f5772a62ec52591ff6870b7e8ef32482371f22c6.tar.gz /subprojects/keycodemapdb.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.com/libblkio/libblkio/-/archive/f84cc963a444e4cb34813b2dcfc5bf8526947dc0/libblkio-f84cc963a444e4cb34813b2dcfc5bf8526947dc0.tar.gz /subprojects/libblkio.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.com/qemu-project/libvfio-user/-/archive/0b28d205572c80b568a1003db2c8f37ca333e4d7/libvfio-user-0b28d205572c80b568a1003db2c8f37ca333e4d7.tar.gz /subprojects/libvfio-user.tar.gz
-# hadolint ignore=DL3020
-ADD https://gitlab.freedesktop.org/slirp/libslirp/-/archive/26be815b86e8d49add8c9a8b320239b9594ff03d/libslirp-26be815b86e8d49add8c9a8b320239b9594ff03d.tar.gz /subprojects/slirp.tar.gz
-RUN cd /xen/tools/qemu-xen/subprojects && \
-    for name in berkeley-softfloat-3 berkeley-testfloat-3 dtc keycodemapdb libblkio libvfio-user slirp; do \
-        rm -rf "$name" && mkdir "$name" && \
-        tar --absolute-names -xzf "/subprojects/$name.tar.gz" -C "$name" --strip-components=1; \
-    done && \
-    # berkeley-softfloat-3 / berkeley-testfloat-3 .wrap files declare
-    # `patch_directory = <name>`, telling meson to overlay
-    # subprojects/packagefiles/<name>/ (a meson.build that qemu provides for
-    # this otherwise-build-system-less upstream) onto the extracted source.
-    # When meson skips the wrap fetch (because we pre-extracted), it also
-    # skips the overlay — apply it manually here.
-    for name in berkeley-softfloat-3 berkeley-testfloat-3; do \
-        cp -r packagefiles/"$name"/. "$name"/; \
-    done && \
-    rm -rf /subprojects
 
 # Apply local patches
 COPY patches-${XEN_VERSION} /patches
@@ -186,15 +74,11 @@ COPY gmp.patch /xen/stubdom
 
 WORKDIR /xen
 
-# DEBUG-ONLY: to build the qemu fault injector (x-inject-internal-error QMP
-# command, patch x86_64/14-*) into qemu-xen, uncomment the ENV line below to
-# define CONFIG_EVE_CRASH_INJECTOR. linuxkit `pkg build` cannot pass a
-# --build-arg, so this manual edit is the toggle. Left OFF for production
-# builds — the injector code stays inert (guarded) and out of the QMP schema.
-# ENV EXTRA_QEMUU_CONFIGURE_ARGS="${EXTRA_QEMUU_CONFIGURE_ARGS} --extra-cflags=-DCONFIG_EVE_CRASH_INJECTOR"
-
+# QEMU comes from pkg/qemu, built without Xen support: xl can no longer start
+# a device model, so HVM guests and PV backends on the Xen flavour do not work.
 # disable golang as it does not play well together with musl (stderr is defined as FILE* const and fails to compile)
 RUN ./configure --prefix=/usr --disable-xen --disable-golang --disable-qemu-traditional --disable-docs --enable-9pfs \
+    --with-system-qemu="/usr/bin/qemu-system-$(uname -m)" \
     --with-system-ovmf=/usr/lib/xen/boot/ovmf.bin --disable-stubdom --disable-openbios \
     --enable-vhost-vsock --enable-vhost-scsi \
     --disable-microblaze --disable-mips --disable-ppc \
@@ -210,46 +94,9 @@ RUN register-sbom-pkg.sh -n xen -v "${XEN_VERSION}" -l GPL-2.0-only -u https://x
 RUN register-sbom-pkg.sh -n seabios -v "${SEABIOS_UPSTREAM_REVISION}" -l LGPL-2.1-only -u https://www.seabios.org
 
 # Filter out a few things that we don't currently need
-RUN rm -rf /out/usr/share/qemu-xen/qemu/edk2-* /out/var/run /out/usr/include
-# FIXME: this is a workaround for Xen on ARM still requiring qemu-system-i386
-#   https://wiki.xenproject.org/wiki/Xen_ARM_with_Virtualization_Extensions#Use_of_qemu-system-i386_on_ARM
+RUN rm -rf /out/var/run /out/usr/include
 WORKDIR /out/usr/lib/xen/bin/
-# Split qemu's debug info out instead of discarding it.
-#
-# A stripped core dump is nearly useless - no function names, no line
-# numbers, and the unwinder cannot reliably walk the stack - so the first
-# crash on a device buys nothing and the bug has to be reproduced against a
-# special build before it can even be looked at. Splitting costs nothing on
-# the device: the shipped binary is still stripped, and .gnu_debuglink lets
-# gdb pick the symbols up later when they are put beside it.
-#
-# /debug is deliberately OUTSIDE /out. The final stage is `FROM scratch` plus
-# `COPY --from=build /out/ /`, so only /out reaches EVE; /debug stays in the
-# build image and never ships. To get the symbols for a core:
-#
-#   docker build --target build -t xen-tools-debug pkg/xen-tools
-#   cid=$(docker create xen-tools-debug)
-#   docker cp "$cid:/debug/usr/lib/xen/bin/qemu-system-x86_64.debug" .
-#   docker rm "$cid"
-#
-# then point gdb at the stripped binary with the .debug file alongside it.
-RUN mkdir -p /debug/usr/lib/xen/bin && \
-    for f in *; do \
-        case "$f" in \
-        qemu-system-*) \
-            if command -v objcopy >/dev/null 2>&1; then \
-                objcopy --only-keep-debug "$f" "/debug/usr/lib/xen/bin/$f.debug" && \
-                strip --strip-debug --strip-unneeded "$f" && \
-                objcopy --add-gnu-debuglink="/debug/usr/lib/xen/bin/$f.debug" "$f" && \
-                echo "split symbols out of $f"; \
-            else \
-                echo "WARNING: no objcopy, shipping $f stripped with no symbols kept"; \
-                strip "$f" || :; \
-            fi ;; \
-        *) strip "$f" || : ;; \
-        esac; \
-    done
-RUN if [ "$(uname -m)" = "x86_64" ]; then rm -f qemu-system-i386 && ln -s "qemu-system-$(uname -m)" qemu-system-i386 ;fi
+RUN for f in *; do strip "$f" || :; done
 
 COPY --from=uefi-build / /uefi/
 RUN mkdir -p /out/usr/lib/xen/boot && cp /uefi/OVMF.fd /out/usr/lib/xen/boot/ovmf.bin && \
@@ -262,14 +109,18 @@ RUN rm -rf /out/usr/lib/debug /out/usr/lib/python*
 # Static libraries are build-time only; some live in subdirectories (e.g. xen/lib/libfdt.a).
 RUN find /out -type f -name '*.a' -exec rm -f {} +
 RUN rm -rf /out/usr/share/man
-RUN rm -rf /out/usr/share/qemu-xen/qemu/openbios-*
-RUN rm -rf /out/usr/lib/xen/bin/qemu-storage-daemon
-RUN rm /out/usr/share/qemu-xen/qemu/skiboot.lid
-RUN rm /out/usr/share/qemu-xen/qemu/hppa-firmware.img
-RUN rm /out/usr/share/qemu-xen/qemu/s390-netboot.img
-RUN rm /out/usr/share/qemu-xen/qemu/opensbi-riscv32-generic-fw_dynamic.bin
-RUN rm /out/usr/share/qemu-xen/qemu/opensbi-riscv64-generic-fw_dynamic.bin
-RUN rm /out/usr/share/qemu-xen/qemu/slof.bin
+
+# QEMU for KVM, with virglrenderer and Mesa, and QEMU's debug symbols under
+# /usr/lib/debug (pkg/qemu). The Alpine libraries it links are in PKGS; fail
+# here, not at the first VM start, if one is missing.
+COPY --from=qemu /usr/ /out/usr/
+RUN set -e; missing=""; \
+    for f in /out/usr/bin/qemu-system-* $(find /out/usr/lib -maxdepth 2 -name '*.so*' -type f); do \
+        for lib in $(readelf -d "$f" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do \
+            [ -e "/out/usr/lib/$lib" ] || [ -e "/out/lib/$lib" ] || missing="$missing $f:$lib"; \
+        done; \
+    done; \
+    [ -z "$missing" ] || { echo "ERROR: unresolved libraries:$missing"; exit 1; }
 
 FROM scratch
 COPY --from=build /out/ /
