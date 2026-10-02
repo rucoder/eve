@@ -1,0 +1,485 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Mon, 28 Sep 2026 12:00:00 +0000
+Subject: [PATCH] virtio-gpu: enforce max_hostmem on the virgl resource path
+
+The virtio-gpu device has a max_hostmem property (256 MiB by default)
+that is supposed to bound how much host memory a guest can make the
+device allocate. virtio_gpu_resource_create_2d() honours it: it computes
+the image size, refuses to allocate past the budget, and answers
+VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY.
+
+None of that happens once the guest talks GL. virtio_gpu_virgl_process_cmd()
+routes RESOURCE_CREATE_2D and RESOURCE_CREATE_3D to
+virgl_cmd_create_resource_2d()/_3d(), which fill in a
+virgl_renderer_resource_create_args and call
+virgl_renderer_resource_create() with no size computed, no budget
+consulted and - worse - no check of the return value. max_hostmem is
+dead code for every guest that binds a GL context, which is every
+modern desktop guest.
+
+What that costs in practice: a GNOME guest on an integrated GPU walked
+host GPU memory up to roughly 950 MiB of i915 GEM objects in the
+"system" region. Those are shmem-backed and charged to the memory
+cgroup of the process that created them, so the cgroup OOM killer took
+qemu down three times. The guest was not malicious, just a desktop.
+
+Fix the accounting rather than the symptom:
+
+ - Estimate a resource's host footprint from the parameters the guest
+   gives us (format, width, height, depth, array_size, nr_samples,
+   last_level) and charge it against the same g->hostmem counter and
+   the same conf_max_hostmem limit the 2D path uses. The admission rule
+   is written so it cannot overflow on a hostile request.
+
+ - Refuse, do not reserve. Nothing is preallocated; the budget is only
+   consulted at create time, and the running total reflects what has
+   actually been created. When a create would go over, the resource is
+   not created and the command is answered with
+   VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY. A guest GL driver has to handle a
+   failed resource allocation - that is an ordinary out-of-memory path
+   for it. Having the host kernel kill the entire VM instead is
+   strictly worse, and it takes the other domains' service with it when
+   the cgroup is shared.
+
+ - Give the memory back. virglrenderer owns virgl resources, so there is
+   no g->reslist entry to hang a size off. Keep a resource_id -> bytes
+   GHashTable on the VirtIOGPUGL instance, created in instance_init and
+   destroyed in instance_finalize, credited on create and debited in
+   virgl_cmd_resource_unref(). Without this a long-running guest that
+   cycles resources normally would be starved as the counter ratcheted
+   up. virtio_gpu_virgl_reset() drops the whole renderer, so the table
+   and the counter are cleared there too.
+
+ - Check virgl_renderer_resource_create()'s return value and report the
+   failure to the guest instead of silently pretending the resource
+   exists.
+
+The size estimate is an estimate and the comment in the code says so.
+virglrenderer hands the allocation to the GL/EGL driver, which may pad
+the stride, tile the surface, promote a format or attach auxiliary
+compression buffers, none of which is visible from qemu. The bits-per-
+pixel table covers the VIRGL_FORMAT_* codes a desktop guest allocates in
+bulk and falls back to 32 bits (4 bytes/pixel) for anything else, which
+is the mode of the distribution and errs towards charging too much
+rather than treating an unknown format as free. virglrenderer does not
+install virgl_hw.h, so the format codes - which are fixed guest/host
+protocol values - are spelled out locally rather than included.
+
+The first refusal is logged once via qemu_log_mask(LOG_GUEST_ERROR) so
+that an operator can tell "the guest is being refused GPU memory" from
+"the guest is broken", without a line per resource.
+
+Note for operators: the 256 MiB default was never actually enforced on
+the GL path, so guests that have been silently exceeding it will start
+seeing refusals. A full desktop guest wants considerably more than
+256 MiB; set max_hostmem to a value that fits the host's memory cgroup
+budget rather than leaving the default in place.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+diff --git a/tools/qemu-xen/hw/display/virtio-gpu-gl.c b/tools/qemu-xen/hw/display/virtio-gpu-gl.c
+index 29d20b0132..33aee36928 100644
+--- a/tools/qemu-xen/hw/display/virtio-gpu-gl.c
++++ b/tools/qemu-xen/hw/display/virtio-gpu-gl.c
+@@ -104,6 +104,26 @@ static void virtio_gpu_gl_reset(VirtIODevice *vdev)
+     }
+ }
+ 
++static void virtio_gpu_gl_instance_init(Object *obj)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(obj);
++
++    /*
++     * virgl resources are owned by virglrenderer, so there is no reslist to
++     * hang the host memory accounting off. Keep a resource_id -> bytes map of
++     * our own; the value is a heap uint64_t freed by the hash table.
++     */
++    gl->virgl_hostmem = g_hash_table_new_full(g_direct_hash, g_direct_equal,
++                                              NULL, g_free);
++}
++
++static void virtio_gpu_gl_instance_finalize(Object *obj)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(obj);
++
++    g_clear_pointer(&gl->virgl_hostmem, g_hash_table_destroy);
++}
++
+ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+ {
+     ERRP_GUARD();
+@@ -163,6 +183,8 @@ static const TypeInfo virtio_gpu_gl_info = {
+     .name = TYPE_VIRTIO_GPU_GL,
+     .parent = TYPE_VIRTIO_GPU,
+     .instance_size = sizeof(VirtIOGPUGL),
++    .instance_init = virtio_gpu_gl_instance_init,
++    .instance_finalize = virtio_gpu_gl_instance_finalize,
+     .class_init = virtio_gpu_gl_class_init,
+ };
+ module_obj(TYPE_VIRTIO_GPU_GL);
+diff --git a/tools/qemu-xen/hw/display/virtio-gpu-virgl.c b/tools/qemu-xen/hw/display/virtio-gpu-virgl.c
+index 9f34d0e661..e51352b7b0 100644
+--- a/tools/qemu-xen/hw/display/virtio-gpu-virgl.c
++++ b/tools/qemu-xen/hw/display/virtio-gpu-virgl.c
+@@ -30,6 +30,306 @@ virgl_get_egl_display(G_GNUC_UNUSED void *cookie)
+ }
+ #endif
+ 
++/*
++ * VIRGL_FORMAT_* codes used by the size estimate below. They are part of the
++ * guest/host virgl protocol and therefore fixed, but virglrenderer does not
++ * install virgl_hw.h, so the handful we care about are spelled out here
++ * instead of included.
++ */
++enum {
++    VIRGL_FMT_B8G8R8A8_UNORM        = 1,
++    VIRGL_FMT_B8G8R8X8_UNORM        = 2,
++    VIRGL_FMT_A8R8G8B8_UNORM        = 3,
++    VIRGL_FMT_X8R8G8B8_UNORM        = 4,
++    VIRGL_FMT_B5G5R5A1_UNORM        = 5,
++    VIRGL_FMT_B4G4R4A4_UNORM        = 6,
++    VIRGL_FMT_B5G6R5_UNORM          = 7,
++    VIRGL_FMT_R10G10B10A2_UNORM     = 8,
++    VIRGL_FMT_L8_UNORM              = 9,
++    VIRGL_FMT_A8_UNORM              = 10,
++    VIRGL_FMT_I8_UNORM              = 11,
++    VIRGL_FMT_L8A8_UNORM            = 12,
++    VIRGL_FMT_L16_UNORM             = 13,
++    VIRGL_FMT_UYVY                  = 14,
++    VIRGL_FMT_YUYV                  = 15,
++    VIRGL_FMT_Z16_UNORM             = 16,
++    VIRGL_FMT_Z32_UNORM             = 17,
++    VIRGL_FMT_Z32_FLOAT             = 18,
++    VIRGL_FMT_Z24_UNORM_S8_UINT     = 19,
++    VIRGL_FMT_S8_UINT_Z24_UNORM     = 20,
++    VIRGL_FMT_Z24X8_UNORM           = 21,
++    VIRGL_FMT_X8Z24_UNORM           = 22,
++    VIRGL_FMT_S8_UINT               = 23,
++    VIRGL_FMT_R32_FLOAT             = 28,
++    VIRGL_FMT_R32G32_FLOAT          = 29,
++    VIRGL_FMT_R32G32B32_FLOAT       = 30,
++    VIRGL_FMT_R32G32B32A32_FLOAT    = 31,
++    VIRGL_FMT_R16_UNORM             = 48,
++    VIRGL_FMT_R16G16_UNORM          = 49,
++    VIRGL_FMT_R16G16B16A16_UNORM    = 51,
++    VIRGL_FMT_R8_UNORM              = 64,
++    VIRGL_FMT_R8G8_UNORM            = 65,
++    VIRGL_FMT_R8G8B8_UNORM          = 66,
++    VIRGL_FMT_R8G8B8A8_UNORM        = 67,
++    VIRGL_FMT_X8B8G8R8_UNORM        = 68,
++    VIRGL_FMT_R16_FLOAT             = 91,
++    VIRGL_FMT_R16G16_FLOAT          = 92,
++    VIRGL_FMT_R16G16B16A16_FLOAT    = 94,
++    VIRGL_FMT_B8G8R8A8_SRGB         = 100,
++    VIRGL_FMT_R8G8B8A8_SRGB         = 104,
++    VIRGL_FMT_DXT1_RGB              = 105,
++    VIRGL_FMT_DXT1_RGBA             = 106,
++    VIRGL_FMT_DXT3_RGBA             = 107,
++    VIRGL_FMT_DXT5_RGBA             = 108,
++    VIRGL_FMT_A8B8G8R8_UNORM        = 121,
++    VIRGL_FMT_R11G11B10_FLOAT       = 124,
++    VIRGL_FMT_R9G9B9E5_FLOAT        = 125,
++    VIRGL_FMT_Z32_FLOAT_S8X24_UINT  = 126,
++    VIRGL_FMT_B10G10R10A2_UNORM     = 131,
++    VIRGL_FMT_R8G8B8X8_UNORM        = 134,
++    VIRGL_FMT_R8_UINT               = 177,
++    VIRGL_FMT_R8G8B8A8_UINT         = 180,
++    VIRGL_FMT_R16_UINT              = 185,
++    VIRGL_FMT_R32_UINT              = 193,
++    VIRGL_FMT_R32G32B32A32_UINT     = 196,
++    VIRGL_FMT_B10G10R10X2_UNORM     = 233,
++    VIRGL_FMT_R16G16B16X16_FLOAT    = 236,
++    VIRGL_FMT_ETC2_RGB8             = 269,
++    VIRGL_FMT_ETC2_RGBA8            = 273,
++};
++
++/*
++ * Bits per pixel for the formats a desktop guest actually allocates in bulk.
++ * Anything not listed falls back to 32 bits, which is the mode of the
++ * distribution and keeps an unknown format from being accounted as free.
++ */
++static uint32_t virgl_format_bits_pp(uint32_t format)
++{
++    switch (format) {
++    case VIRGL_FMT_L8_UNORM:
++    case VIRGL_FMT_A8_UNORM:
++    case VIRGL_FMT_I8_UNORM:
++    case VIRGL_FMT_S8_UINT:
++    case VIRGL_FMT_R8_UNORM:
++    case VIRGL_FMT_R8_UINT:
++    case VIRGL_FMT_ETC2_RGBA8:
++        return 8;
++
++    case VIRGL_FMT_B5G5R5A1_UNORM:
++    case VIRGL_FMT_B4G4R4A4_UNORM:
++    case VIRGL_FMT_B5G6R5_UNORM:
++    case VIRGL_FMT_L8A8_UNORM:
++    case VIRGL_FMT_L16_UNORM:
++    case VIRGL_FMT_UYVY:
++    case VIRGL_FMT_YUYV:
++    case VIRGL_FMT_Z16_UNORM:
++    case VIRGL_FMT_R16_UNORM:
++    case VIRGL_FMT_R8G8_UNORM:
++    case VIRGL_FMT_R16_FLOAT:
++    case VIRGL_FMT_R16_UINT:
++        return 16;
++
++    case VIRGL_FMT_R8G8B8_UNORM:
++        return 24;
++
++    case VIRGL_FMT_R16G16B16A16_UNORM:
++    case VIRGL_FMT_R16G16B16A16_FLOAT:
++    case VIRGL_FMT_R16G16B16X16_FLOAT:
++    case VIRGL_FMT_R32G32_FLOAT:
++    case VIRGL_FMT_Z32_FLOAT_S8X24_UINT:
++        return 64;
++
++    case VIRGL_FMT_R32G32B32_FLOAT:
++        return 96;
++
++    case VIRGL_FMT_R32G32B32A32_FLOAT:
++    case VIRGL_FMT_R32G32B32A32_UINT:
++        return 128;
++
++    /*
++     * Block compressed formats. DXT1 and ETC2_RGB8 are 8 bytes per 4x4
++     * block (4 bits/pixel); DXT3, DXT5 and ETC2_RGBA8 are 16 bytes per
++     * block (8 bits/pixel, already covered above for ETC2_RGBA8).
++     */
++    case VIRGL_FMT_DXT1_RGB:
++    case VIRGL_FMT_DXT1_RGBA:
++    case VIRGL_FMT_ETC2_RGB8:
++        return 4;
++    case VIRGL_FMT_DXT3_RGBA:
++    case VIRGL_FMT_DXT5_RGBA:
++        return 8;
++
++    /*
++     * 32 bits: every RGBA8/BGRA8 variant, the packed 10:10:10:2 and
++     * 11:11:10 formats, the 32 bit depth/stencil combinations and the
++     * single channel 32 bit formats. This is also the fallback below.
++     */
++    case VIRGL_FMT_B8G8R8A8_UNORM:
++    case VIRGL_FMT_B8G8R8X8_UNORM:
++    case VIRGL_FMT_A8R8G8B8_UNORM:
++    case VIRGL_FMT_X8R8G8B8_UNORM:
++    case VIRGL_FMT_R10G10B10A2_UNORM:
++    case VIRGL_FMT_Z32_UNORM:
++    case VIRGL_FMT_Z32_FLOAT:
++    case VIRGL_FMT_Z24_UNORM_S8_UINT:
++    case VIRGL_FMT_S8_UINT_Z24_UNORM:
++    case VIRGL_FMT_Z24X8_UNORM:
++    case VIRGL_FMT_X8Z24_UNORM:
++    case VIRGL_FMT_R32_FLOAT:
++    case VIRGL_FMT_R32_UINT:
++    case VIRGL_FMT_R16G16_UNORM:
++    case VIRGL_FMT_R16G16_FLOAT:
++    case VIRGL_FMT_R8G8B8A8_UNORM:
++    case VIRGL_FMT_X8B8G8R8_UNORM:
++    case VIRGL_FMT_A8B8G8R8_UNORM:
++    case VIRGL_FMT_R8G8B8X8_UNORM:
++    case VIRGL_FMT_R8G8B8A8_UINT:
++    case VIRGL_FMT_B8G8R8A8_SRGB:
++    case VIRGL_FMT_R8G8B8A8_SRGB:
++    case VIRGL_FMT_R11G11B10_FLOAT:
++    case VIRGL_FMT_R9G9B9E5_FLOAT:
++    case VIRGL_FMT_B10G10R10A2_UNORM:
++    case VIRGL_FMT_B10G10R10X2_UNORM:
++        return 32;
++
++    default:
++        /* Unrecognised: assume 4 bytes/pixel rather than assume nothing. */
++        return 32;
++    }
++}
++
++static uint64_t virgl_sat_mul(uint64_t a, uint64_t b)
++{
++    if (a != 0 && b > UINT64_MAX / a) {
++        return UINT64_MAX;
++    }
++    return a * b;
++}
++
++/*
++ * Estimate how much host memory virglrenderer will need for a resource.
++ *
++ * This is deliberately an estimate: virglrenderer hands the allocation to the
++ * GL/EGL driver, which is free to pad the stride, tile the surface, promote a
++ * format or allocate auxiliary compression buffers, and none of that is
++ * visible from here. It is close enough to keep a runaway guest inside a
++ * budget, which is all it is used for - it is not an allocator.
++ */
++static uint64_t virgl_estimate_hostmem(
++    const struct virgl_renderer_resource_create_args *args)
++{
++    uint64_t bits_pp = virgl_format_bits_pp(args->format);
++    uint64_t size;
++
++    size = virgl_sat_mul(MAX(args->width, 1), MAX(args->height, 1));
++    size = virgl_sat_mul(size, bits_pp);
++    size = size / 8 + (size % 8 ? 1 : 0);
++    size = virgl_sat_mul(size, MAX(args->depth, 1));
++    size = virgl_sat_mul(size, MAX(args->array_size, 1));
++    size = virgl_sat_mul(size, MAX(args->nr_samples, 1));
++
++    if (args->last_level) {
++        /*
++         * A full mip chain adds at most a third on top of level 0; using the
++         * limit rather than walking the levels keeps this cheap and errs on
++         * the high side, which is the safe direction for a cap.
++         */
++        size += size / 3;
++    }
++
++    return size;
++}
++
++static void virgl_hostmem_forget(VirtIOGPU *g, uint32_t resource_id)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++    gpointer val;
++
++    if (!gl->virgl_hostmem) {
++        return;
++    }
++    if (g_hash_table_lookup_extended(gl->virgl_hostmem,
++                                     GUINT_TO_POINTER(resource_id),
++                                     NULL, &val)) {
++        uint64_t size = *(uint64_t *)val;
++
++        g->hostmem = g->hostmem > size ? g->hostmem - size : 0;
++        g_hash_table_remove(gl->virgl_hostmem, GUINT_TO_POINTER(resource_id));
++    }
++}
++
++static void virgl_hostmem_remember(VirtIOGPU *g, uint32_t resource_id,
++                                   uint64_t size)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++    uint64_t *slot;
++
++    if (!gl->virgl_hostmem) {
++        return;
++    }
++    /* A re-used id should not happen, but do not leak the old charge if it does. */
++    virgl_hostmem_forget(g, resource_id);
++
++    slot = g_new(uint64_t, 1);
++    *slot = size;
++    g_hash_table_insert(gl->virgl_hostmem, GUINT_TO_POINTER(resource_id), slot);
++    g->hostmem += size;
++}
++
++static void virgl_hostmem_reset(VirtIOGPU *g)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++
++    if (gl->virgl_hostmem) {
++        g_hash_table_remove_all(gl->virgl_hostmem);
++    }
++    g->hostmem = 0;
++    gl->virgl_hostmem_capped = false;
++}
++
++/*
++ * Create a virgl resource, refusing it if it would take us over
++ * conf_max_hostmem. Returns 0 on success, with cmd->error already set
++ * otherwise.
++ */
++static int virgl_create_resource(VirtIOGPU *g,
++                                 struct virtio_gpu_ctrl_command *cmd,
++                                 struct virgl_renderer_resource_create_args *args)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++    uint64_t size = virgl_estimate_hostmem(args);
++    int ret;
++
++    /* Same admission rule as the 2D path, written so it cannot overflow. */
++    if (size >= g->conf_max_hostmem ||
++        g->hostmem >= g->conf_max_hostmem - size) {
++        if (!gl->virgl_hostmem_capped) {
++            gl->virgl_hostmem_capped = true;
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: virgl host memory budget exhausted: %" PRIu64
++                          " bytes charged, %" PRIu64 " more requested, "
++                          "max_hostmem=%" PRIu64 ". Refusing this and any "
++                          "further over-budget resource; raise max_hostmem if "
++                          "the guest legitimately needs more. Logged once.\n",
++                          __func__, g->hostmem, size, g->conf_max_hostmem);
++        }
++        cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
++        return -1;
++    }
++
++    ret = virgl_renderer_resource_create(args, NULL, 0);
++    if (ret != 0) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: virgl_renderer_resource_create(%u) failed: %d\n",
++                      __func__, args->handle, ret);
++        cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
++        return -1;
++    }
++
++    virgl_hostmem_remember(g, args->handle, size);
++    return 0;
++}
++
+ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
+                                          struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -51,7 +351,7 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
+     args.last_level = 0;
+     args.nr_samples = 0;
+     args.flags = VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP;
+-    virgl_renderer_resource_create(&args, NULL, 0);
++    virgl_create_resource(g, cmd, &args);
+ }
+ 
+ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
+@@ -75,7 +375,7 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
+     args.last_level = c3d.last_level;
+     args.nr_samples = c3d.nr_samples;
+     args.flags = c3d.flags;
+-    virgl_renderer_resource_create(&args, NULL, 0);
++    virgl_create_resource(g, cmd, &args);
+ }
+ 
+ static void virgl_cmd_resource_unref(VirtIOGPU *g,
+@@ -95,6 +395,7 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
+         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
+     }
+     virgl_renderer_resource_unref(unref.resource_id);
++    virgl_hostmem_forget(g, unref.resource_id);
+ }
+ 
+ static void virgl_cmd_context_create(VirtIOGPU *g,
+@@ -620,6 +921,8 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
+ void virtio_gpu_virgl_reset(VirtIOGPU *g)
+ {
+     virgl_renderer_reset();
++    /* Every virgl resource is gone with the renderer: start the budget over. */
++    virgl_hostmem_reset(g);
+ }
+ 
+ int virtio_gpu_virgl_init(VirtIOGPU *g)
+diff --git a/tools/qemu-xen/include/hw/virtio/virtio-gpu.h b/tools/qemu-xen/include/hw/virtio/virtio-gpu.h
+index 7a59379f5a..14323d7bae 100644
+--- a/tools/qemu-xen/include/hw/virtio/virtio-gpu.h
++++ b/tools/qemu-xen/include/hw/virtio/virtio-gpu.h
+@@ -231,6 +231,14 @@ struct VirtIOGPUGL {
+ 
+     bool renderer_inited;
+     bool renderer_reset;
++
++    /*
++     * virgl resources live inside virglrenderer, not on g->reslist, so we
++     * keep our own resource_id -> estimated host bytes map to be able to
++     * give the memory back on unref. Only used to enforce conf_max_hostmem.
++     */
++    GHashTable *virgl_hostmem;
++    bool virgl_hostmem_capped;
+ };
+ 
+ struct VhostUserGPU {

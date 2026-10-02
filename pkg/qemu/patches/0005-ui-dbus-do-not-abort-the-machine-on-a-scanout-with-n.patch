@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Fri, 2 Oct 2026 16:10:12 +0000
+Subject: [PATCH 05/10] ui/dbus: do not abort the machine on a scanout with no
+ texture
+
+dbus_scanout_texture() asserts on tex_id, so a zero one takes down the
+whole VM:
+
+  qemu-system-x86_64: Failed to call update: The connection is closed
+  qemu-system-x86_64: Failed to call update: The connection is closed
+  Assertion failed: tex_id (ui/dbus-listener.c: dbus_scanout_texture: 450)
+
+Observed with a Windows guest on virtio-vga-gl whose display powered off
+after an idle timeout, against a D-Bus display client that had gone away
+earlier - the listener is only unregistered from dispose, so it keeps
+being called after its peer disconnects, and the first scanout without a
+texture is fatal.
+
+A missing texture is a frame we cannot show, not a state the machine
+cannot continue from. Report it and skip the frame.
+
+The listener outliving its connection is a separate problem and is left
+alone here.
+
+Rebased onto QEMU 11.1.2. Still needed there: upstream master keeps the
+assert, and it was reproduced on 11.1.2 by updating viogpudo in a Windows
+11 guest.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ ui/dbus-listener.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/ui/dbus-listener.c b/ui/dbus-listener.c
+index 2e2f6ba41..dc7ad0992 100644
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -597,7 +597,15 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
+     uint32_t offset[DMABUF_MAX_PLANES], stride[DMABUF_MAX_PLANES], fourcc;
+     uint64_t modifier;
+ 
+-    assert(tex_id);
++    if (!tex_id) {
++        /*
++         * virgl has no texture for this scanout: the guest released it
++         * (a driver reinstall or a display powered off). Not a reason to
++         * abort a running machine - skip the frame and keep the guest alive.
++         */
++        error_report("%s: no texture for scanout, skipping", __func__);
++        return;
++    }
+     if (!egl_dmabuf_export_texture(tex_id, fd, (EGLint *)offset, (EGLint *)stride,
+                                    (EGLint *)&fourcc, &num_planes, &modifier)) {
+         error_report("%s: failed to export dmabuf for texture", __func__);

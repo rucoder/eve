@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Fri, 2 Oct 2026 16:09:26 +0000
+Subject: [PATCH 02/10] net/tap: pass the bridge name to the tap setup script
+
+EVE attaches each tap to a bridge from its ifup script, and the bridge
+differs per network instance. QEMU already accepts a bridge name on a
+tap netdev (br=, used with helper=), but runs the setup script with the
+interface name only. Pass br, when it is set, as the script's second
+argument:
+
+    [netdev "hostnet0"]
+      type = "tap"
+      ifname = "<vif>"
+      br = "<bridge>"
+      script = "/etc/xen/scripts/qemu-ifup"
+
+runs "qemu-ifup <vif> <bridge>". Without br= the script gets the interface
+name alone, as before. The down script is unchanged.
+
+Rebased onto QEMU 11.1.2 from EVE's 10-bridge-helper-support.patch. That
+version fell back to "bn1" when br= was missing; EVE always sets it, so
+the fallback is dropped.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ net/tap.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/net/tap.c b/net/tap.c
+index 57ffb0988..ebb073f8e 100644
+--- a/net/tap.c
++++ b/net/tap.c
+@@ -87,7 +87,7 @@ typedef struct TAPState {
+ } TAPState;
+ 
+ static void launch_script(const char *setup_script, const char *ifname,
+-                          int fd, Error **errp);
++                          const char *bridge, int fd, Error **errp);
+ 
+ static void tap_send(void *opaque);
+ static void tap_writable(void *opaque);
+@@ -327,7 +327,7 @@ static void tap_exit_notify(Notifier *notifier, void *data)
+     TAPState *s = container_of(notifier, TAPState, exit);
+     Error *err = NULL;
+ 
+-    launch_script(s->down_script, s->down_script_arg, s->fd, &err);
++    launch_script(s->down_script, s->down_script_arg, NULL, s->fd, &err);
+     if (err) {
+         error_report_err(err);
+     }
+@@ -467,10 +467,10 @@ static void close_all_fds_after_fork(int excluded_fd)
+ }
+ 
+ static void launch_script(const char *setup_script, const char *ifname,
+-                          int fd, Error **errp)
++                          const char *bridge, int fd, Error **errp)
+ {
+     int pid, status;
+-    char *args[3];
++    char *args[4];
+     char **parg;
+ 
+     /* try to launch network script */
+@@ -485,6 +485,9 @@ static void launch_script(const char *setup_script, const char *ifname,
+         parg = args;
+         *parg++ = (char *)setup_script;
+         *parg++ = (char *)ifname;
++        if (bridge) {
++            *parg++ = (char *)bridge;
++        }
+         *parg = NULL;
+         execv(setup_script, args);
+         _exit(1);
+@@ -691,7 +694,7 @@ static int net_tap_init(const NetdevTapOptions *tap, int *vnet_hdr,
+     }
+ 
+     if (setup_script) {
+-        launch_script(setup_script, ifname, fd, &err);
++        launch_script(setup_script, ifname, tap->br, fd, &err);
+         if (err) {
+             error_propagate(errp, err);
+             close(fd);
