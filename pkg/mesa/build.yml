@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+image: eve-mesa
+org: lfedge
+# TEMPORARY: the Dockerfile fetches the build dependencies that the
+# eve-alpine mirror does not carry yet straight from Alpine. Drop this once
+# they are in pkg/alpine/mirrors.
+network: yes
