@@ -17,10 +17,14 @@ pub mod input;
 pub mod logger;
 pub mod qmp;
 pub mod scanout;
+pub mod stats;
+pub mod typist;
 pub mod ui;
 pub mod vmstat;
 pub mod vt;
+pub mod wake;
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use smithay::backend::renderer::{Bind, Color32F, Frame as _, Renderer};
@@ -162,6 +166,11 @@ pub fn run(
     let mut backoff = Backoff::default();
     // Tab 0 is the node page; guests are tabs 1..n.
     let mut show_node = true;
+    // GUI_START_ON_GUEST: open on the first guest tab instead, at startup and
+    // after a re-attach, so a rig that restarts the console unattended (the
+    // perf bench) measures the guest view and not the Node page.
+    let start_on_guest = std::env::var_os("GUI_START_ON_GUEST").is_some();
+    let mut pending_tab: Option<usize> = start_on_guest.then_some(1);
     // Chrome hidden, guest filling the head; Ctrl+Alt+F toggles it.
     let mut fullscreen = false;
     // Which page of the node tab is showing.
@@ -206,6 +215,23 @@ pub fn run(
     let mut win_gseq = 0u64;
     let (mut fps_now, mut gfps_now) = (0.0f32, 0.0f32);
     let mut n_done = 0u32;
+    // The guest frame each head last put on screen, for stats::Head::shown.
+    let mut last_shown = [u64::MAX; stats::MAX_HEADS];
+    // Per head: a fingerprint of what it showed when last drawn, so a head
+    // nothing changed on is neither redrawn nor flipped. Redrawing a 4K and a
+    // 1080p head at 60 Hz regardless was most of the console's GPU time.
+    let mut drawn_key: Vec<Option<u64>> = Vec::new();
+    // egui asked to be run again for this head by then (hover, animation).
+    let mut repaint_at: Vec<Option<std::time::Instant>> = Vec::new();
+    // What a head's last draw reported, reused for input while it is not
+    // redrawn: viewport, chrome, area.
+    let mut head_rects: Vec<(Option<egui::Rect>, Option<egui::Rect>, Option<egui::Rect>)> =
+        Vec::new();
+    // The head set changed: every head draws once.
+    let mut redraw_all = true;
+    let mut last_log = std::time::Instant::now();
+    stats::set_heads(&heads);
+    stats::spawn();
 
     let limit = if cfg.frames == 0 { u32::MAX } else { cfg.frames };
     // The loop is wrapped so that an error still reaches shutdown(): DRM
@@ -213,6 +239,7 @@ pub fn run(
     // even when a flip times out because a VT switch took master away.
     let loop_result = (|| -> anyhow::Result<()> {
         for n in 0..limit {
+            let frame_t0 = std::time::Instant::now();
             if !vt::running() {
                 log::info!("signal received at frame {n}, shutting down cleanly");
                 break;
@@ -280,7 +307,6 @@ pub fn run(
                 )
             };
 
-            win_frames += 1;
             let wdt = win_t.elapsed().as_secs_f32();
             if wdt >= 0.5 {
                 fps_now = win_frames as f32 / wdt;
@@ -320,13 +346,96 @@ pub fn run(
                 );
             }
             let mut act = ui::Actions::default();
+            // `act` holds only the head being drawn - the next head's
+            // frame overwrites it - so what the user asked for is folded
+            // into this as each head is drawn. Reading the intents off
+            // `act` after the loop saw the LAST head only, which meant a
+            // tab clicked on any other monitor did nothing at all.
+            let mut intents = ui::Actions::default();
+            // Each head's left edge in combined host pixels. egui gives every
+            // head a canvas starting at (0,0), but the pointer we read from
+            // evdev is in combined host space, so it has to be rebased per
+            // head before it is handed to the UI. Without this, everything
+            // the UI decides from the pointer - is it over the guest, over
+            // the chrome, where to draw our arrow - is off by this head's
+            // origin, and an arrow drawn for a pointer on head 0 appears at
+            // the same place on head 1 as well.
+            let head_x: Vec<f32> = heads
+                .iter()
+                .scan(0.0f32, |acc, h| {
+                    let x = *acc;
+                    *acc += h.w as f32;
+                    Some(x)
+                })
+                .collect();
             // Where each head wants the guest drawn, collected here because
             // `act` is overwritten by the next head's frame.
             let mut viewports: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
+            // Same reason, for the chrome hot zone: it is per-head, and the
+            // one that matters is the head the pointer is actually on.
+            let mut chromes: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
             // The container, not the letterboxed image: see `Actions::area`.
             let mut areas_avail: Vec<Option<egui::Rect>> = Vec::with_capacity(heads.len());
+            // CRTCs that queued a flip this frame. A hotplug below can hand
+            // over a head set with a new head in it, and waiting for a flip
+            // that head never queued is a 3s timeout and a dead console.
+            let mut flipped: Vec<u32> = Vec::new();
+            if drawn_key.len() != heads.len() || std::mem::take(&mut redraw_all) {
+                drawn_key = vec![None; heads.len()];
+                repaint_at = vec![None; heads.len()];
+                head_rects = vec![(None, None, None); heads.len()];
+            }
+            // UI input other than pointer motion can change any head. Motion
+            // only matters on the head under the pointer, and its key has it.
+            let ui_input = ui_events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_)));
+            // Status text (rates, uptime) moves twice a second.
+            let status_tick = start.elapsed().as_millis() as u64 / 500;
+            let now = std::time::Instant::now();
+            let ui_key = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (show_node, active, vms.get(active).map(|v| v.id), fullscreen, node_page as u8).hash(&mut h);
+                (remote, focus == input::Focus::Guest, edit.is_some(), probe, vms.len(), cur_seq).hash(&mut h);
+                show_node.then(|| pillar.lock().unwrap().rev).hash(&mut h);
+                // Only where it is on screen: chrome hidden over a guest, it is not.
+                if !fullscreen || show_node {
+                    status_tick.hash(&mut h);
+                }
+                h.finish()
+            };
             for (hi, head) in heads.iter_mut().enumerate() {
                 let head_name = head.name.clone();
+                let (orphans, cursor_visible, has_cursor, relative) = match vms.get(active) {
+                    Some(vm) => {
+                        // Pointer mode is per guest, recorded on head 0.
+                        let relative = guest::frame(&vm.head(0).shared).pointer_relative;
+                        let g = guest::frame(&vm.head(hi).shared);
+                        (g.orphan_updates, g.cursor_visible, g.cursor.is_some(), relative)
+                    }
+                    None => (0, false, false, false),
+                };
+                let key = {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    ui_key.hash(&mut h);
+                    vms.get(active)
+                        .filter(|_| !show_node && !remote)
+                        .map(|vm| {
+                            let s = vm.head(hi);
+                            (s.seq, s.dma_id.is_some(), s.tex.is_some(), s.asleep)
+                        })
+                        .hash(&mut h);
+                    (orphans > 0, cursor_visible, has_cursor, relative).hash(&mut h);
+                    let here = cx >= head_x[hi] && cx < head_x[hi] + head.w as f32;
+                    here.then(|| (cx.to_bits(), cy.to_bits())).hash(&mut h);
+                    h.finish()
+                };
+                let due = repaint_at[hi].is_some_and(|t| now >= t);
+                if !ui_input && !due && drawn_key[hi] == Some(key) {
+                    let (v, c, a) = head_rects[hi];
+                    viewports.push(v);
+                    chromes.push(c);
+                    areas_avail.push(a);
+                    continue;
+                }
                 let (mut dmabuf, _age) = head.surface.next_buffer()?;
                 let size = (head.w, head.h).into();
                 let raw_input = egui::RawInput {
@@ -340,13 +449,6 @@ pub fn run(
 
                 let mut tabs: Vec<String> = vec!["Node".into()];
                 tabs.extend(vms.iter().map(|v| v.name.clone()));
-                let (orphans, cursor_visible, has_cursor) = match vms.get(active) {
-                    Some(vm) => {
-                        let g = guest::frame(&vm.head(hi).shared);
-                        (g.orphan_updates, g.cursor_visible, g.cursor.is_some())
-                    }
-                    None => (0, false, false),
-                };
                 let node = {
                     let p = pillar.lock().unwrap();
                     let d = p.device.clone();
@@ -375,6 +477,7 @@ pub fn run(
                     edit: edit.as_ref(),
                     probe,
                     remote,
+                    relative,
                     vmstat: vmstat_now,
                     node: ui::NodeView {
                         name: &node.0,
@@ -402,7 +505,10 @@ pub fn run(
                     tabs: &tabs,
                     active: if show_node { 0 } else { active + 1 },
                     focus,
-                    pointer: egui::pos2(cx / points_per_pixel(), cy / points_per_pixel()),
+                    pointer: egui::pos2(
+                        (cx - head_x[hi]) / points_per_pixel(),
+                        cy / points_per_pixel(),
+                    ),
                     guest: match vms.get(active).map(|vm| vm.head(hi)) {
                         Some(s) => ui::GuestView {
                             dma_id: s.dma_id,
@@ -436,7 +542,14 @@ pub fn run(
                 };
 
                 let out = egui_ctx.run(raw_input, |ctx| act = ui::draw(ctx, &view));
+                let delay = out
+                    .viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+                repaint_at[hi] = (delay < std::time::Duration::from_secs(1)).then(|| now + delay);
+                intents.absorb(&act);
                 viewports.push(act.viewport);
+                chromes.push(act.chrome);
                 areas_avail.push(act.area);
 
                 let mut prims = egui_ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -469,6 +582,18 @@ pub fn run(
                     log::error!("queue_buffer({}) failed: {e}", head.name);
                     continue;
                 }
+                flipped.push(head.crtc.into());
+                drawn_key[hi] = Some(key);
+                head_rects[hi] = (act.viewport, act.chrome, act.area);
+                let hs = stats::head(hi);
+                hs.flips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(vm) = vms.get(active).filter(|_| !show_node && !remote) {
+                    let seq = vm.head(hi).seq;
+                    if last_shown[hi.min(stats::MAX_HEADS - 1)] != seq {
+                        last_shown[hi.min(stats::MAX_HEADS - 1)] = seq;
+                        hs.shown.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
 
             // The hotkey wins over a tab-bar click.
@@ -476,6 +601,7 @@ pub fn run(
             // tab mean the same thing.
             // Cheap: one non-blocking recv that almost always says EAGAIN.
             if hotplug.as_ref().is_some_and(|w| w.drained_hotplug()) {
+                redraw_all = true;
                 let before: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
                 // Heads that stayed put hand their surfaces to the new set, so
                 // `heads` has to be surrendered for the call - which leaves
@@ -492,6 +618,7 @@ pub fn run(
                 if before != after {
                     log::info!("heads changed: {before:?} -> {after:?}");
                     head_geoms = head_geometries(&heads);
+                    stats::set_heads(&heads);
                     // The pointer travels across every head, so its area is
                     // set at startup from the whole set - and without this a
                     // monitor change leaves every click landing somewhere
@@ -505,19 +632,22 @@ pub fn run(
                     // A guest's scanout count is fixed when its listeners are
                     // registered, so a head appearing or going away needs the
                     // whole attach redone. reconcile_tabs rebuilds every tab
-                    // it still finds an app for.
+                    // it still finds an app for; GUI_VMS tabs are not
+                    // pillar's, so they are rebuilt here.
                     if before.len() != after.len() {
                         log::info!("head count changed; re-attaching guests");
                         for vm in vms.iter_mut() {
                             vm.release_gl();
                         }
                         vms.clear();
+                        vms = spawn_vms(&cfg.vms, &heads);
                         inp.clear_active();
                         show_node = true;
+                        pending_tab = start_on_guest.then_some(1);
                     }
                 }
             }
-            if hot_fs || act.toggle_fullscreen {
+            if hot_fs || intents.toggle_fullscreen {
                 fullscreen = !fullscreen;
                 log::info!("fullscreen -> {fullscreen}");
             }
@@ -554,6 +684,27 @@ pub fn run(
                         // than guess.
                         None => continue,
                     };
+                    // Ask only for a STANDARD mode, and scale into the
+                    // area we actually have.
+                    //
+                    // Asking for the exact container kept the guest 1:1, but
+                    // every distinct size is a mode change, and a guest that
+                    // does not repaint after one is black until something
+                    // makes it draw. A Linux framebuffer console is exactly
+                    // that: fbcon clears on the mode set and only redraws on
+                    // new output, so an idle server VM - no compositor, no
+                    // getty echoing - stays black for ever. Measured here:
+                    // 3840x2160 had content, the 3812x2088 we asked for to
+                    // fit a 28-point bar had 0 of 7959456 non-black pixels,
+                    // and fullscreen (no chrome, native mode) brought it
+                    // straight back.
+                    //
+                    // A standard mode is also one the guest is far more
+                    // likely to accept outright instead of snapping to its
+                    // own nearest, which is what the CHASE loop exists to
+                    // survive. And chrome appearing or going no longer
+                    // resizes anything: both layouts pick the same mode.
+                    let want = standard_mode(want, (head.w as u32, head.h as u32));
                     // Hysteresis: egui's layout wobbles by a point during a
                     // transition, and a resolution change per frame would
                     // have the guest re-allocating for ever.
@@ -614,15 +765,15 @@ pub fn run(
                     xoff += want.0 as i32;
                 }
             }
-            if let Some(on) = act.set_probe {
+            if let Some(on) = intents.set_probe {
                 probe = on;
                 log::info!("readback probe {}", if on { "on" } else { "off" });
                 save_gui_probe(&config_path, on);
             }
-            if let Some(p) = act.page {
+            if let Some(p) = intents.page {
                 node_page = p;
             }
-            if let Some(name) = act.edit_port.take() {
+            if let Some(name) = intents.edit_port.take() {
                 // Copy the port's current values into the dialog, and carry
                 // whatever it looked like before its last Apply so Undo works
                 // even across a reopen.
@@ -638,13 +789,13 @@ pub fn run(
                         previous: previous.get(&name).cloned().map(Box::new),
                     });
                 }
-            } else if let Some(e) = act.edit_update.take() {
+            } else if let Some(e) = intents.edit_update.take() {
                 edit = Some(e);
             }
-            if act.edit_cancel {
+            if intents.edit_cancel {
                 edit = None;
             }
-            if let Some(mut want) = act.apply_port.take() {
+            if let Some(mut want) = intents.apply_port.take() {
                 // What it was, for Undo, taken from the live port rather than
                 // from the dialog - the dialog already holds the new values.
                 if let Some(p) = ports.iter().find(|p| p.name == want.iface) {
@@ -680,7 +831,11 @@ pub fn run(
                 }
                 edit = None;
             }
-            let want = hot_tab.filter(|t| *t <= vms.len()).or(act.tab);
+            let pending = pending_tab.filter(|t| *t <= vms.len());
+            if pending.is_some() {
+                pending_tab = None;
+            }
+            let want = hot_tab.filter(|t| *t <= vms.len()).or(intents.tab).or(pending);
             if let Some(t) = want {
                 let (node, idx) = if t == 0 { (true, active) } else { (false, t - 1) };
                 if node != show_node || idx != active {
@@ -699,13 +854,13 @@ pub fn run(
                     );
                 }
             }
-            if act.send_wake {
+            if intents.send_wake {
                 if let Some(vm) = vms.get(active) {
                     send_keys(vm, &[(input::KEY_LEFTSHIFT, true), (input::KEY_LEFTSHIFT, false)]);
                     log::info!("sent wake keystroke to {}", vm.name);
                 }
             }
-            if act.send_cad {
+            if intents.send_cad {
                 if let Some(vm) = vms.get(active) {
                     send_keys(vm, input::CTRL_ALT_DEL);
                     log::info!("sent Ctrl+Alt+Del to {}", vm.name);
@@ -718,8 +873,31 @@ pub fn run(
                 let ppp = points_per_pixel();
                 let mut areas: Vec<input::GuestArea> = Vec::with_capacity(heads.len());
                 let mut hx = 0.0f32;
-                let mut gx = 0u32;
-                let mut desktop = (0u32, 0u32);
+                // Whatever the guest still keeps on heads we cannot see
+                // belongs in the desktop too: its single absolute pointer is
+                // spread across the lot, so leaving those out makes the
+                // pointer run off the visible screen.
+                //
+                // Assumed to sit BEFORE ours, because a guest that kept a
+                // head we disabled kept the one it had made primary, and a
+                // primary is placed at the origin. Ours are the ones after
+                // it. Nothing reports the guest's layout back, so this is an
+                // assumption, not a reading. It is the one that matches a
+                // Windows guest whose VNC head is primary: with ours assumed
+                // first we address the primary and every click lands on the
+                // screen nobody can see.
+                //
+                // It is ONE prefix for the whole desktop, so it shifts where
+                // our first head starts and nothing else. Adding it to every
+                // head instead gave every head the same origin - it is only
+                // ever written to head 0's slot (see guest.rs), so head 1
+                // read (0,0) and landed exactly where head 0 already was,
+                // and the pointer moved identically on both monitors.
+                let unseen = vms
+                    .get(active)
+                    .map_or((0, 0), |v| guest::frame(&v.head(0).shared).unseen);
+                let mut gx = unseen.0;
+                let mut desktop = (unseen.0, unseen.1);
                 for (hi, head) in heads.iter().enumerate() {
                     let size = vms.get(active).map_or((0, 0), |v| v.head(hi).size);
                     // The guest's own layout, which is the one we dictated:
@@ -746,21 +924,65 @@ pub fn run(
                 let mut st = inp.state.lock().unwrap();
                 st.areas = areas;
                 st.desktop = desktop;
-                st.chrome = act.chrome.map(|r| {
-                    (r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp)
-                });
+                st.relative = vms
+                    .get(active)
+                    .is_some_and(|v| guest::frame(&v.head(0).shared).pointer_relative);
+                // In combined host pixels, like every other rect published
+                // here, and taken from the head the pointer is on - each head
+                // draws its own chrome, and `act` only ever holds the last
+                // head's. Publishing that one unshifted put head 1's hot zone
+                // over head 0, so clicks near the top of head 0 were eaten as
+                // chrome while head 1's own tab was not protected at all.
+                let px = cx;
+                let py = cy;
+                st.chrome = chromes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(hi, c)| {
+                        let r = (*c)?;
+                        let hx = head_x.get(hi).copied().unwrap_or(0.0);
+                        let g = (
+                            hx + r.min.x * ppp,
+                            r.min.y * ppp,
+                            r.width() * ppp,
+                            r.height() * ppp,
+                        );
+                        (px >= g.0 && px < g.0 + g.2 && py >= g.1 && py < g.1 + g.3)
+                            .then_some(g)
+                    })
+                    .next();
             }
 
-            drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &heads, n)?;
-            for head in heads.iter_mut() {
+            // Only heads still in the set that queued a flip this frame.
+            let wait: Vec<u32> =
+                heads.iter().map(|h| h.crtc.into()).filter(|c| flipped.contains(c)).collect();
+            if !wait.is_empty() {
+                win_frames += 1;
+                stats::BUSY_NS.fetch_add(
+                    frame_t0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                stats::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &wait, n)?;
+            for head in heads.iter_mut().filter(|h| wait.contains(&h.crtc.into())) {
                 let _: Option<()> = head.surface.frame_submitted()?;
             }
             n_done = n + 1;
+            if wait.is_empty() {
+                // Nothing changed anywhere: sleep until something does, or
+                // the status text or an egui animation is due. Bounded, so a
+                // hotplug or a pillar update is never more than 0.5s late.
+                let tick = start + std::time::Duration::from_millis((status_tick + 1) * 500);
+                let until = repaint_at.iter().flatten().fold(tick, |a, t| a.min(*t));
+                wake::wait(until.saturating_duration_since(std::time::Instant::now()));
+            }
 
             // Every 30s, not every 2s. At 60fps a two-second heartbeat is
             // 43k lines a day, which pushed anything worth reading out of the
             // rotation long before anyone came to look for it.
-            if n > 0 && n % 1800 == 0 {
+            if last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                last_log = std::time::Instant::now();
                 // Report input latency from here, where a syscall is free.
                 let (sum, cnt, mx) = inp.stats.take();
                 let lat = if cnt > 0 {
@@ -773,8 +995,9 @@ pub fn run(
                     String::new()
                 };
                 log::info!(
-                    "frame {n}: {:.1} fps avg  guest {gfps_now:.1} fps{lat}",
-                    n as f64 / start.elapsed().as_secs_f64()
+                    "frame {n}: {:.1} fps drawn avg  guest {gfps_now:.1} fps{lat}",
+                    stats::FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / start.elapsed().as_secs_f64()
                 );
             }
         }
@@ -1041,6 +1264,51 @@ const CHASE_GAP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The host's whole drawing area: heads side by side in head order. The
 /// pointer lives in this space so it can cross from one monitor to the next.
+/// Modes a guest is likely to already know, smallest first.
+///
+/// Not a complete list and not meant to be: it only has to contain something
+/// close above any area this console can hand a guest, so that the guest is
+/// asked for a size it recognises rather than one derived from our own
+/// chrome layout.
+const STANDARD_MODES: &[(u32, u32)] = &[
+    (640, 480),
+    (800, 600),
+    (1024, 768),
+    (1280, 720),
+    (1280, 800),
+    (1280, 1024),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1600, 1200),
+    (1680, 1050),
+    (1920, 1080),
+    (1920, 1200),
+    (2048, 1152),
+    (2560, 1080),
+    (2560, 1440),
+    (2560, 1600),
+    (3440, 1440),
+    (3840, 1600),
+    (3840, 2160),
+];
+
+/// The mode to ask a guest for, given the area it will be drawn in.
+///
+/// The smallest standard mode that COVERS the area, so the image is only
+/// ever scaled down into place - never up, which would blur text - and never
+/// larger than the head's own mode, which is the most the panel can show.
+/// Falls back to the head's mode when nothing in the table fits, which is
+/// also the right answer for an unusual panel.
+fn standard_mode(want: (u32, u32), native: (u32, u32)) -> (u32, u32) {
+    STANDARD_MODES
+        .iter()
+        .copied()
+        .filter(|&(w, h)| w >= want.0 && h >= want.1 && w <= native.0 && h <= native.1)
+        .min_by_key(|&(w, h)| u64::from(w) * u64::from(h))
+        .unwrap_or(native)
+}
+
 fn host_extent(heads: &[drm::Head]) -> (i32, i32) {
     (
         heads.iter().map(|h| h.w).sum::<i32>().max(1),

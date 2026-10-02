@@ -206,6 +206,10 @@ pub struct Frame<'a> {
     pub vmstat: Option<&'a crate::gui::vmstat::Series>,
     /// A remote session owns the guest's display, so we are not drawing it.
     pub remote: bool,
+    /// The guest's pointer is relative (PS/2): it moves its own cursor from
+    /// our deltas, and while grabbed ours stays frozen where the grab click
+    /// was.
+    pub relative: bool,
 }
 
 #[derive(Default)]
@@ -232,6 +236,9 @@ pub struct Actions {
     /// while the guest holds the pointer, or the way out is unclickable
     /// exactly when it is needed.
     pub chrome: Option<egui::Rect>,
+    /// The guest's own cursor was painted this frame. When it was not,
+    /// somebody still has to draw one.
+    pub guest_cursor: bool,
     /// Where the guest image landed, in points. Input maps through this.
     pub viewport: Option<egui::Rect>,
     /// The whole area the guest may draw in, in points - the letterboxed
@@ -239,6 +246,33 @@ pub struct Actions {
     /// to render at: `viewport` is derived from the guest's current size, so
     /// asking for it feeds the guest's answer back into the next question.
     pub area: Option<egui::Rect>,
+}
+
+impl Actions {
+    /// Fold another head's frame into this one.
+    ///
+    /// `draw` runs once per head and returns that head's Actions, so a
+    /// button pressed on head 0 is in head 0's result and nowhere else.
+    /// Keeping only the last head's result threw those away: with two
+    /// monitors a tab click on the first one never took effect, because the
+    /// second head's frame - which saw no click - replaced it.
+    ///
+    /// Only the user's INTENTS are folded here. The geometry fields
+    /// (`chrome`, `viewport`, `area`, `guest_cursor`) are per-head by
+    /// nature and are collected per head by the caller; merging those would
+    /// put one head's rectangle in another head's coordinate space.
+    pub fn absorb(&mut self, other: &Actions) {
+        self.tab = self.tab.or(other.tab);
+        self.page = self.page.or(other.page);
+        self.edit_port = self.edit_port.take().or_else(|| other.edit_port.clone());
+        self.edit_update = self.edit_update.take().or_else(|| other.edit_update.clone());
+        self.apply_port = self.apply_port.take().or_else(|| other.apply_port.clone());
+        self.edit_cancel |= other.edit_cancel;
+        self.send_cad |= other.send_cad;
+        self.send_wake |= other.send_wake;
+        self.toggle_fullscreen |= other.toggle_fullscreen;
+        self.set_probe = self.set_probe.or(other.set_probe);
+    }
 }
 
 /// How close to the top edge, in points, reveals the chrome in fullscreen.
@@ -282,7 +316,22 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
     // when the guest holds the pointer - otherwise the operator is aiming at
     // the exit button with nothing visible to aim.
     let over_chrome = act.chrome.is_some_and(|r| r.contains(f.pointer));
-    if (f.focus == Focus::Gui && !over_guest) || over_chrome {
+    // Over the guest we normally let the guest's own cursor stand in, so it
+    // looks native. But a guest that publishes no hardware cursor - or
+    // hides it, which Windows does when it thinks the pointer is on another
+    // monitor - would otherwise leave the operator with no pointer at all
+    // and no way to tell a lost cursor from a wedged console.
+    let no_pointer_at_all = over_guest && !act.guest_cursor;
+    // A relative guest overrides all of that. Grabbed, ours is frozen at the
+    // grab click, and drawing it there is a second pointer that never moves.
+    // Ungrabbed, the guest's cursor cannot follow ours, so ours is the only
+    // one that means anything, over the guest or not.
+    let show = if f.relative {
+        f.focus == Focus::Gui
+    } else {
+        (f.focus == Focus::Gui && !over_guest) || over_chrome || no_pointer_at_all
+    };
+    if show {
         draw_arrow(ctx, f.pointer);
     }
     act
@@ -520,6 +569,7 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
     // our next frame, which is what made the pointer feel laggy.
     if let Some(c) = &f.cursor {
         if rect.contains(f.pointer) {
+            act.guest_cursor = true;
             let at = f.pointer - egui::vec2(c.hotspot.0 * k, c.hotspot.1 * k);
             ui.painter().image(
                 c.tex.id(),

@@ -355,18 +355,19 @@ pub fn rediscover_heads(
     Ok(heads)
 }
 
-/// Block until every CRTC has reported its page flip.
+/// Block until every CRTC in `crtcs` has reported its page flip. The caller
+/// passes only CRTCs that queued one: a head added by a hotplug mid-frame has
+/// not, and its flip would never arrive.
 ///
 /// Bounded by a deadline: losing DRM master (a VT switch) means the flip we are
 /// waiting for will never arrive, and hanging forever is worse than a frame.
 pub fn wait_for_flips(
     drm: &mut DrmDevice,
     raw_fd: RawFd,
-    heads: &[Head],
+    crtcs: &[u32],
     frame: u32,
 ) -> anyhow::Result<()> {
-    let mut pending: std::collections::HashSet<u32> =
-        heads.iter().map(|h| Into::<u32>::into(h.crtc)).collect();
+    let mut pending: std::collections::HashSet<u32> = crtcs.iter().copied().collect();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
 
     while !pending.is_empty() {

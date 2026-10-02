@@ -78,6 +78,10 @@ pub enum GuestAct {
     /// disable it and never get it back.
     ManageHeads(bool),
     AbsPos(u32, u32),
+    /// Raw motion for a guest whose pointer is relative (QEMU's IsAbsolute
+    /// is false, e.g. no usb-tablet, only the PS/2 mouse). The guest applies
+    /// its own acceleration and owns its monitor layout.
+    RelMotion(i32, i32),
     Btn(u32, bool),
     Key(u32, bool),
 }
@@ -124,6 +128,9 @@ pub struct State {
     pub x: f64,
     pub y: f64,
     pub focus_guest: bool,
+    /// The active guest's pointer is relative. Published by the render loop
+    /// from what the guest pump read off QEMU's IsAbsolute.
+    pub relative: bool,
     /// One per head, in head order. Empty until the render loop has drawn.
     pub areas: Vec<GuestArea>,
     /// The guest's whole desktop: the bounding box of every `area.off+size`.
@@ -212,6 +219,8 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
     let bnd = bounds.clone();
     let st = state.clone();
     let tx = active_tx.clone();
+    // Paste as keystrokes into whichever guest has the keyboard.
+    crate::gui::typist::spawn(active_tx.clone());
     let sts = stats.clone();
     // Wakes the poll() below on shutdown; libinput's own fd carries the real
     // events and an infinite poll timeout otherwise never notices a request
@@ -272,6 +281,14 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             }
             // publish what the render loop needs
             let mut s = st.lock().unwrap();
+            // The render loop sleeps until something changes; this is a
+            // change only if it moves something it draws. A grabbed relative
+            // pointer leaves x and y frozen, so guest motion wakes nothing.
+            if s.x != inp.x || s.y != inp.y || s.focus_guest != (inp.focus == Focus::Guest)
+                || !inp.egui_events.is_empty() || inp.want_tab.is_some() || inp.want_fullscreen
+            {
+                crate::gui::wake::wake();
+            }
             s.x = inp.x; s.y = inp.y;
             s.focus_guest = inp.focus == Focus::Guest;
             s.egui_events.append(&mut inp.egui_events);
@@ -282,6 +299,7 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             inp.areas.extend_from_slice(&s.areas);
             inp.desktop = s.desktop;
             inp.chrome = s.chrome;
+            inp.relative = s.relative;
         }
     })?;
     Ok(Handle { stats, bounds, state, active_tx, shutdown_fd, join })
@@ -304,6 +322,14 @@ pub struct Input {
     /// Devices that have sent absolute motion. Only THOSE devices get their
     /// relative events ignored - a global flag also killed the physical mouse.
     abs_devices: std::collections::HashSet<String>,
+    /// See `State::relative`. While grabbed into a relative guest, motion
+    /// goes out as raw deltas and the host pointer stays where it is.
+    relative: bool,
+    /// Sub-count remainder of scaled relative motion.
+    rel_acc: (f64, f64),
+    /// Last position from an absolute device, to turn it into deltas for a
+    /// relative guest.
+    abs_last: Option<(f64, f64)>,
     scale: f64,
     /// See `Handle::bounds`.
     bounds: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -383,6 +409,7 @@ impl Input {
         let mut me = Self {
             li, focus: Focus::Gui, x: w as f64 / 2.0, y: h as f64 / 2.0,
             w: w as f64, h: h as f64, ctrl: false, alt: false, last_toggle: None, swallow_release: None, scroll_acc: (0.0, 0.0), abs_devices: Default::default(),
+            relative: false, rel_acc: (0.0, 0.0), abs_last: None,
             scale: std::env::var("GUI_PTR_SCALE").ok()
                      .and_then(|v| v.parse().ok()).unwrap_or(1.0),
             bounds: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -562,6 +589,19 @@ impl Input {
                         self.stats.age_sum_us.fetch_add(age, Relaxed);
                         self.stats.age_n.fetch_add(1, Relaxed);
                         self.stats.age_max_us.fetch_max(age, Relaxed);
+                        if self.focus == Focus::Guest && self.relative {
+                            // The guest owns its layout: hand it the counts
+                            // and leave the host pointer where it is.
+                            self.rel_acc.0 += rdx * self.scale;
+                            self.rel_acc.1 += rdy * self.scale;
+                            let (ix, iy) = (self.rel_acc.0.trunc(), self.rel_acc.1.trunc());
+                            self.rel_acc.0 -= ix;
+                            self.rel_acc.1 -= iy;
+                            if ix != 0.0 || iy != 0.0 {
+                                self.guest.push(GuestAct::RelMotion(ix as i32, iy as i32));
+                            }
+                            continue;
+                        }
                         self.x = (self.x + rdx * self.scale).clamp(0.0, self.w - 1.0);
                         self.y = (self.y + rdy * self.scale).clamp(0.0, self.h - 1.0);
                         self.on_move(ppp);
@@ -571,8 +611,21 @@ impl Input {
                         if self.abs_devices.insert(id.clone()) {
                             log::debug!("pointer: {id} reports absolute; ignoring ITS relative events");
                         }
-                        self.x = m.absolute_x_transformed(self.w as u32);
-                        self.y = m.absolute_y_transformed(self.h as u32);
+                        let (nx, ny) = (m.absolute_x_transformed(self.w as u32),
+                                        m.absolute_y_transformed(self.h as u32));
+                        let last = self.abs_last.replace((nx, ny));
+                        if self.focus == Focus::Guest && self.relative {
+                            // A relative guest can only take deltas.
+                            if let Some((lx, ly)) = last {
+                                let (dx, dy) = ((nx - lx).round(), (ny - ly).round());
+                                if dx != 0.0 || dy != 0.0 {
+                                    self.guest.push(GuestAct::RelMotion(dx as i32, dy as i32));
+                                }
+                            }
+                            continue;
+                        }
+                        self.x = nx;
+                        self.y = ny;
                         self.on_move(ppp);
                     }
 
@@ -631,7 +684,10 @@ impl Input {
                             continue;
                         }
                         match self.focus {
-                            Focus::Guest if q.is_some() && !self.in_chrome() => {
+                            // A relative guest's host pointer is frozen and
+                            // invisible, so it must not be hit-tested against
+                            // the chrome: every click belongs to the guest.
+                            Focus::Guest if q.is_some() && (self.relative || !self.in_chrome()) => {
                                 self.guest.push(GuestAct::Btn(q.unwrap(), down))
                             }
                             _ => {

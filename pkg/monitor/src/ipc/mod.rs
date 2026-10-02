@@ -109,6 +109,24 @@ pub fn spawn(socket: &str) -> Client {
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENTS_CAPACITY);
     let (outbox_tx, outbox_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // A developer aid: off EVE there is no pillar, and the client would wait
+    // 30s for /run/monitor.sock, time out and retry for the life of the
+    // process. Drain the outbox so what the GUI sends does not pile up; no
+    // events ever arrive.
+    if std::env::var_os("GUI_NO_PILLAR").is_some() {
+        log::info!("pillar: IPC disabled (GUI_NO_PILLAR)");
+        let mut outbox_rx = outbox_rx;
+        let _ = std::thread::Builder::new()
+            .name("pillar".into())
+            .spawn(move || {
+                // Held, not dropped: a closed events channel would read as
+                // pillar having gone away.
+                let _events_tx = events_tx;
+                while outbox_rx.blocking_recv().is_some() {}
+            });
+        return Client { state, events: events_rx, outbox: outbox_tx };
+    }
+
     let (out, path) = (state.clone(), socket.to_string());
     let _ = std::thread::Builder::new()
         .name("pillar".into())

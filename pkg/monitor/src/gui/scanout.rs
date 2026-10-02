@@ -147,6 +147,11 @@ pub struct Scanout {
     /// stale pixels on screen, nothing logged, and nothing that recovers short
     /// of a resize.
     dma_cache: HashMap<BufferKey, (GlesTexture, Dmabuf)>,
+    /// The guest frame `dma_2d` holds, so the external->2D blit runs once per
+    /// guest frame rather than once per console frame: at 60 Hz with a 4K and
+    /// a 1080p head that was most of the console's GPU time with nothing on
+    /// screen changing. None after an import, which may be another buffer.
+    blitted: Option<u64>,
 }
 
 /// What QEMU said the scanout buffer is, for the status line.
@@ -248,6 +253,7 @@ impl Scanout {
             desc: None,
             probe_nonblack: None,
             dma_cache: HashMap::new(),
+            blitted: None,
         }
     }
 
@@ -378,6 +384,7 @@ impl Scanout {
             self.dma_size = new_size;
             self.dma_flip = d.y0_top;
             self.dma_tex = Some(t);
+            self.blitted = None;
             // The 2D blit target depends only on the SIZE, not on which buffer
             // we sample, so it only needs rebuilding on a resize.
             if resized {
@@ -484,6 +491,16 @@ impl Scanout {
             Some(t) => t,
             None => return,
         };
+        // Same buffer, same guest frame: the target already holds it.
+        // Implicit dma-buf fencing orders our read after QEMU's write, and
+        // every guest write is followed by an UpdateDMABUF, so the last
+        // frame always gets its own blit.
+        if self.blitted == Some(self.seq) && self.dma_id.is_some() {
+            if probe && frame % 600 == 1 {
+                self.probe_nonblack = probe_target(renderer, target, w, h);
+            }
+            return;
+        }
         let psz = smithay::utils::Size::<i32, smithay::utils::Physical>::from((w, h));
         let dst = Rectangle::from_size(psz);
         let src = Rectangle::from_size(smithay::utils::Size::<f64, smithay::utils::Buffer>::from(
@@ -514,6 +531,7 @@ impl Scanout {
             log::error!("blit ext->2d failed: {e}");
             return;
         }
+        self.blitted = Some(self.seq);
 
         if probe && frame % 600 == 1 {
             self.probe_nonblack = probe_target(renderer, target, w, h);
@@ -534,6 +552,7 @@ impl Scanout {
 
     /// Drop this scanout's GL objects, in the order the driver wants.
     fn release_gl(&mut self) {
+        self.blitted = None;
         drop(self.dma_2d.take());
         drop(self.dma_tex.take());
         self.dma_cache.clear();

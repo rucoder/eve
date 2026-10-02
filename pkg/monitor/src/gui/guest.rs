@@ -42,6 +42,9 @@ pub struct GuestFrame {
     /// imported dmabuf and the tab freezes - which is what a guest reboot into
     /// a dumb framebuffer looks like.
     pub copy_takeover: bool,
+    /// The guest's pointer is relative (QEMU's IsAbsolute is false): motion
+    /// must go out as RelMotion. Only written to head 0's frame.
+    pub pointer_relative: bool,
     /// QEMU called Listener.Disable: the guest turned its display off, so
     /// the scanout it was rendering into is gone. Distinct from `gone`,
     /// which is the guest itself going away, and from `orphan_updates`,
@@ -50,6 +53,12 @@ pub struct GuestFrame {
     /// Set rather than acted on here: releasing GL objects is the render
     /// thread's job, and this runs on the listener's.
     pub display_off: bool,
+    /// Scanouts the guest still has configured on heads we do NOT draw,
+    /// summed. A guest that keeps a monitor we disabled - Windows holds on
+    /// to its layout - has a desktop wider than anything we can see, and
+    /// its one absolute pointer is spread across all of it. Without this
+    /// the pointer runs off the visible screen and cannot be recovered.
+    pub unseen: (u32, u32),
 }
 
 /// A scanout buffer QEMU rendered on the host GPU. Importing this avoids the
@@ -77,12 +86,13 @@ pub struct GuestDmabuf {
 }
 pub type Shared = Arc<Mutex<GuestFrame>>;
 
-struct Listener { f: Shared, stride: u32, raw: Vec<u8>, n: u64, t0: Option<std::time::Instant>, have_scanout: bool }
+struct Listener { f: Shared, stride: u32, raw: Vec<u8>, n: u64, t0: Option<std::time::Instant>, have_scanout: bool, console: usize }
 
 impl Listener {
     /// Repack only the damaged rectangle. Rebuilding all 1M pixels for a
     /// cursor-sized damage region was a large part of the input latency.
     fn tick(&mut self, w: u32, h: u32) {
+        self.count(w, h);
         self.n += 1;
         let t0 = *self.t0.get_or_insert_with(std::time::Instant::now);
         if self.n % 120 == 0 {
@@ -90,6 +100,15 @@ impl Listener {
             log::trace!("{} updates in {:.1}s = {:.1}/s (last damage {w}x{h})",
                       self.n, secs, self.n as f64 / secs);
         }
+    }
+
+    /// A new guest frame: count it (console N is drawn on head N) and wake
+    /// the render loop, which draws nothing until something changes.
+    fn count(&self, w: u32, h: u32) {
+        let s = crate::gui::stats::head(self.console);
+        s.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        s.update_px.fetch_add(w as u64 * h as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::gui::wake::wake();
     }
 
     fn repack(&mut self, rx: u32, ry: u32, rw: u32, rh: u32) {
@@ -179,12 +198,14 @@ impl Listener {
                 self.have_scanout = true;
                 g.seq += 1;
                 log::debug!("ScanoutDMABUF {w}x{h} stride={stride} fourcc=0x{fourcc:08x} mod=0x{modifier:x} y0_top={y0_top}");
+                crate::gui::wake::wake();
             }
             Err(e) => log::error!("dmabuf dup failed: {e}"),
         }
     }
     #[zbus(name = "UpdateDMABUF")]
     async fn update_dmabuf(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.count(w.max(0) as u32, h.max(0) as u32);
         // Same underlying buffer: nothing to copy, just note there is new content.
         let mut g = self.f.lock().unwrap();
         // An update with no scanout is only worth reporting when we do not
@@ -227,10 +248,12 @@ impl Listener {
         g.cursor = Some(GuestCursor { w, h, hot_x, hot_y, rgba });
         g.cursor_seq += 1;
         log::debug!("CursorDefine {w}x{h} hot={hot_x},{hot_y}");
+        crate::gui::wake::wake();
     }
 
     async fn mouse_set(&mut self, _x: i32, _y: i32, on: i32) {
         self.f.lock().unwrap().cursor_visible = on != 0;
+        crate::gui::wake::wake();
     }
 
     /// The guest turned its display off - a screen blank, a DPMS timeout, a
@@ -249,6 +272,7 @@ impl Listener {
         g.cursor_visible = false;
         self.have_scanout = false;
         log::info!("display off: guest released its scanout");
+        crate::gui::wake::wake();
     }
     #[zbus(property)] fn interfaces(&self) -> Vec<String> { vec![] }
 }
@@ -327,6 +351,46 @@ async fn set_head(p: &ConsoleProxy<'_>, g: Option<HeadGeometry>) {
     }
 }
 
+/// What a remote session's own display is given when it takes ownership.
+///
+/// The VNC card is a SEPARATE virtio-vga device, deliberately: a second PCI
+/// GPU is a second guest desktop with its own absolute pointer range, so the
+/// remote operator's mouse stays on the remote screen instead of sharing one
+/// pointer with the local heads. That is the whole reason it is not just
+/// another scanout of video0.
+///
+/// The cost is that the guest only lights it if something tells it there is a
+/// monitor there. It cannot be one of our heads' geometries - a 4K local head
+/// made the remote display 3840x2160 - and it cannot be left at whatever the
+/// card booted with, which is QEMU's 640x480 VGA framebuffer that no guest
+/// ever draws on. So it is a fixed, ordinary size the guest will accept.
+const REMOTE_GEOMETRY: HeadGeometry = HeadGeometry {
+    w: 1920,
+    h: 1080,
+    // 16:9 at roughly 96 DPI, so the guest computes a sane scale factor
+    // rather than inheriting a local monitor's physical size.
+    mm_w: 509,
+    mm_h: 286,
+    xoff: 0,
+    yoff: 0,
+};
+
+/// Put a foreign console back to the size it had when we first saw it.
+///
+/// Deliberately not `set_head`: a foreign console is not one of our heads and
+/// must never be given one of their geometries. Its position stays at the
+/// origin, which is where the desktop-prefix assumption in `mod.rs` places
+/// the heads the guest kept.
+async fn restore_foreign(p: &ConsoleProxy<'_>, had: Option<(u32, u32)>) {
+    let Some((w, h)) = had else { return };
+    if w == 0 || h == 0 {
+        return;
+    }
+    if let Err(e) = p.set_ui_info(0, 0, 0, 0, w, h).await {
+        log::debug!("restore_foreign({w}x{h}) refused: {e}");
+    }
+}
+
 /// Linux evdev keycode -> QEMU "qnum", which is what the D-Bus Keyboard
 /// interface actually wants (`qemu_input_key_number_to_qcode`).
 ///
@@ -380,6 +444,11 @@ trait Mouse {
     #[zbus(no_reply)] fn press(&self, button: u32) -> zbus::Result<()>;
     #[zbus(no_reply)] fn release(&self, button: u32) -> zbus::Result<()>;
     #[zbus(no_reply)] fn set_abs_position(&self, x: u32, y: u32) -> zbus::Result<()>;
+    /// Refused by QEMU while IsAbsolute is true ("Mouse is not relative").
+    #[zbus(no_reply)] fn rel_motion(&self, dx: i32, dy: i32) -> zbus::Result<()>;
+    /// Whether the guest's current pointer handler is absolute (usb-tablet)
+    /// or relative (PS/2). QEMU updates it on every mouse-mode change.
+    #[zbus(property)] fn is_absolute(&self) -> zbus::Result<bool>;
 }
 
 /// Spawn a background thread running the D-Bus listener for `console`.
@@ -414,6 +483,7 @@ fn mark_gone(shared: &Shared) {
     if let Ok(mut f) = shared.lock() {
         f.gone = true;
     }
+    crate::gui::wake::wake();
 }
 
 /// How many input events may queue for one guest. The pump normally drains
@@ -508,6 +578,11 @@ pub fn spawn(
             // Consoles belonging to another display device. We do not draw
             // them, but we do own whether the guest can see them.
             let mut foreign: Vec<ConsoleProxy> = Vec::new();
+            // A Windows guest drives one monitor per virtio-gpu adapter
+            // (viogpudo has MAX_VIEWS 1), so multi-monitor Windows needs one
+            // adapter per head. With this set, a console on another adapter
+            // is the next head instead of a foreign one. Off by default.
+            let per_adapter = std::env::var_os("GUI_HEADS_PER_ADAPTER").is_some();
             for (console, (head, sink)) in heads.iter().zip(out.into_iter()).enumerate() {
                 let path = format!("/org/qemu/Display1/Console_{console}");
                 let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
@@ -522,6 +597,9 @@ pub fn spawn(
                         log::info!("console 0 is {l}");
                         device = Some(device_of(&l).to_string());
                     }
+                    (Some(l), Some(d)) if device_of(&l) != d && per_adapter => log::info!(
+                        "console {console} is {l}, another adapter: head {console} (GUI_HEADS_PER_ADAPTER)"
+                    ),
                     (Some(l), Some(d)) if device_of(&l) != d => {
                         // A console on another display device - the plain
                         // head that exists so VNC has something it can read.
@@ -577,7 +655,7 @@ pub fn spawn(
                 let builder = zbus::connection::Builder::unix_stream(ours)
                     .p2p()   // QEMU is the auth server on this socket
                     .serve_at("/org/qemu/Display1/Listener",
-                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false }).unwrap();
+                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false, console }).unwrap();
                 let task = tokio::spawn(async move { builder.build().await });
                 let ofd: OwnedFd = theirs.into();
                 if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {
@@ -613,14 +691,54 @@ pub fn spawn(
                     if device_of(&label) == d {
                         continue; // another of our own scanouts, already off
                     }
-                    // Take it away: a guest that can see a monitor nobody
-                    // is looking at extends its desktop onto it, spreads
-                    // its one absolute pointer across the union, and - on
-                    // Windows - remembers the layout afterwards, so windows
-                    // reopen on coordinates that no longer exist.
-                    match proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
-                        Ok(()) => log::info!("console {console} is {label}: disabled it"),
-                        Err(e) => log::warn!("console {console} is {label}: cannot disable: {e}"),
+                    // Try to take it away: a guest that can see a monitor
+                    // nobody is looking at extends its desktop onto it and
+                    // spreads its one absolute pointer across the union.
+                    //
+                    // But only if the guest actually gives it up. Windows'
+                    // display-only driver accepts a head and does not
+                    // return one - and if that head was its primary,
+                    // disabling it leaves the desktop nowhere, because it
+                    // will not fall back to ours either. Every restart of
+                    // this console would then blank the guest.
+                    //
+                    // So: ask, then check. The console's Width is what the
+                    // guest has configured there; still non-zero means the
+                    // guest kept it, and we put it back rather than leave
+                    // the guest short of the screen it is using.
+                    //
+                    // Read what it has BEFORE disabling it, because that is
+                    // what has to go back if the guest refuses. Restoring one
+                    // of our own heads' geometry instead hands this console a
+                    // size nobody asked for - with a 4K monitor on head 0 the
+                    // VNC head became 3840x2160, and the unseen-width poll
+                    // then read that back and shifted the whole pointer
+                    // prefix by 3840.
+                    let had = (
+                        proxy.width().await.unwrap_or(0),
+                        proxy.height().await.unwrap_or(0),
+                    );
+                    if let Err(e) = proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
+                        log::warn!("console {console} is {label}: cannot disable: {e}");
+                    }
+                    let mut gave_it_up = false;
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if proxy.width().await.unwrap_or(0) == 0 {
+                            gave_it_up = true;
+                            break;
+                        }
+                    }
+                    if gave_it_up {
+                        log::info!("console {console} is {label}: disabled it");
+                    } else {
+                        log::info!(
+                            "console {console} is {label}: guest kept it, putting back \
+                             {}x{} (its pointer range covers that head too)",
+                            had.0,
+                            had.1
+                        );
+                        restore_foreign(&proxy, Some(had)).await;
                     }
                     foreign.push(proxy);
                 }
@@ -644,6 +762,12 @@ pub fn spawn(
                 last[i] = *h;
             }
             let mut owner = Owner::Local;
+            // How often to ask the heads we do not draw whether the guest
+            // still has them. Cheap next to a frame, and the answer only
+            // changes when the guest reconfigures its displays.
+            let mut unseen_at = std::time::Instant::now();
+            let mut pointer_mode_logged = false;
+
             // input pump: drain the channel and drive QEMU's Keyboard/Mouse.
             // Console 0 only: the guest has one keyboard and one absolute
             // pointer whatever its monitor count, and both hang off the first
@@ -664,6 +788,13 @@ pub fn spawn(
                     if let (AbsPos(..), Some(AbsPos(..))) = (&a, batch.last()) {
                         batch.pop();
                     }
+                    // Relative motion is summed, not replaced: dropping a
+                    // delta loses distance.
+                    if let (RelMotion(dx, dy), Some(RelMotion(px, py))) = (&a, batch.last_mut()) {
+                        *px += *dx;
+                        *py += *dy;
+                        continue;
+                    }
                     batch.push(a);
                 }
                 let got = !batch.is_empty();
@@ -671,6 +802,8 @@ pub fn spawn(
                     match a {
                         AbsPos(x, y) => { if let Some(m) = &mouse {
                             if let Err(e) = m.set_abs_position(x, y).await { log::error!("abs {e}"); } } }
+                        RelMotion(dx, dy) => { if let Some(m) = &mouse {
+                            if let Err(e) = m.rel_motion(dx, dy).await { log::error!("rel {e}"); } } }
                         Btn(b, d) => { if let Some(m) = &mouse {
                             let r = if d { m.press(b).await } else { m.release(b).await };
                             if let Err(e) = r { log::error!("btn {b} down={d} ERR {e}"); } } }
@@ -702,8 +835,16 @@ pub fn spawn(
                             // Destination first, so there is no instant
                             // with no head at all.
                             if on {
+                                // A real monitor, so the guest actually
+                                // lights this card. Not one of our heads'
+                                // geometries (a 4K local head made the remote
+                                // display 3840x2160) and not what it booted
+                                // with (QEMU's 640x480 VGA framebuffer, which
+                                // no guest draws on - the remote session then
+                                // shows "display output not active" even
+                                // though the handover succeeded).
                                 for p in foreign.iter() {
-                                    set_head(p, hand).await;
+                                    set_head(p, Some(REMOTE_GEOMETRY)).await;
                                 }
                                 for p in consoles.iter() {
                                     set_head(p, None).await;
@@ -769,7 +910,7 @@ pub fn spawn(
                                     set_head(p, g).await;
                                 }
                                 for p in foreign.iter() {
-                                    set_head(p, hand).await;
+                                    set_head(p, Some(REMOTE_GEOMETRY)).await;
                                 }
                                 // Both up is wrong, but it is visible; one
                                 // head disabled and a guest that ignored the
@@ -807,6 +948,41 @@ pub fn spawn(
                         } }
                     }
                 }
+                // What the guest still has on heads we cannot see.
+                if unseen_at.elapsed() > std::time::Duration::from_secs(1) {
+                    unseen_at = std::time::Instant::now();
+                    let mut w = 0u32;
+                    let mut h = 0u32;
+                    for p in foreign.iter() {
+                        let (fw, fh) = (
+                            p.width().await.unwrap_or(0),
+                            p.height().await.unwrap_or(0),
+                        );
+                        if fw > 0 && fh > 0 {
+                            w += fw;
+                            h = h.max(fh);
+                        }
+                    }
+                    let mut g = shared_out[0].lock().unwrap();
+                    if g.unseen != (w, h) {
+                        log::info!("guest keeps {w}x{h} on heads we do not draw");
+                        g.unseen = (w, h);
+                    }
+                    drop(g);
+                    // Follow the guest's pointer mode. It changes at runtime:
+                    // with a usb-tablet present the PS/2 mouse is current
+                    // until the guest's tablet driver first polls.
+                    if let Some(m) = &mouse {
+                        let rel = matches!(m.is_absolute().await, Ok(false));
+                        let mut g = frame(&shared_out[0]);
+                        if g.pointer_relative != rel || !pointer_mode_logged {
+                            log::info!("guest pointer is {}", if rel { "relative (RelMotion)" } else { "absolute (SetAbsPosition)" });
+                            g.pointer_relative = rel;
+                            pointer_mode_logged = true;
+                        }
+                    }
+                }
+
                 // Block rather than poll: D-Bus costs 24us/event, so a
                 // poll+sleep here dominated the transport by >100x.
                 if !got {
