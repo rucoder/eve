@@ -20,6 +20,20 @@ lto = true          # Enable link-time optimization.
 # debug = "line-tables-only"
 # debuginfo = "packed"
 
+# Iteration profile. The release profile optimises for size and turns LTO on,
+# which relinks the whole program on every edit - fine for what ships, far too
+# slow for an edit/deploy loop against a device. Same musl target and the same
+# dynamic linking, so the binary is drop-in; it is just bigger and not
+# size-optimised. Do not ship it.
+[profile.quick]
+inherits = "release"
+lto = false
+opt-level = 2
+codegen-units = 16
+# Release profiles disable incremental compilation, which is right for what
+# ships and wrong here: without it every edit recompiles the whole crate.
+incremental = true
+
 [dependencies]
 crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", rev = "69249c88fed67ee917218dc7ccb8a866f391beed", version = "0.28.1", default-features = false, features = [
     "event-stream",
@@ -65,6 +79,22 @@ hex = "0.4.3"
 regex = "1.11.1"
 itertools = "0.14.0"
 thiserror = "2.0.12"
+
+# gui: egui on bare DRM/KMS. Used as a library only: DRM/KMS, GBM, EGL and
+# libinput, with no Wayland server and no seat manager. EVE has neither
+# logind nor udev-backed seats.
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_drm", "backend_gbm", "backend_egl", "backend_libinput",
+    "renderer_gl", "renderer_glow",
+] }
+egui = "0.33"
+egui_glow = { version = "0.33", default-features = false }
+glow = "0.16"
+# QEMU's D-Bus display is a peer-to-peer connection over a socket QEMU itself
+# authenticates, so no bus daemon and no session bus are involved.
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p", "blocking-api"] }
+zvariant = "5"
+
 [dev-dependencies]
 sha2 = "0.10.8"
 env_logger = "0.11.7"

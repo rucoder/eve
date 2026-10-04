@@ -1,0 +1,1017 @@
+// Copyright (c) 2026 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! QEMU D-Bus display listener feeding a shared RGBA frame.
+
+use std::os::fd::{AsFd, OwnedFd};
+#[allow(unused_imports)]
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex};
+use zbus::interface;
+use zvariant::Fd;
+
+#[derive(Default)]
+pub struct GuestFrame {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    pub seq: u64,
+    /// Region changed since the consumer last looked: x, y, w, h.
+    pub dirty: Option<(u32, u32, u32, u32)>,
+    /// Zero-copy path: a scanout dmabuf handed over by QEMU (virgl / gl=on).
+    pub dmabuf: Option<GuestDmabuf>,
+    /// Hardware cursor from QEMU (Windows uses one; it never appears in the
+    /// framebuffer, so we must draw it ourselves).
+    pub cursor: Option<GuestCursor>,
+    pub cursor_seq: u64,
+    pub cursor_visible: bool,
+    /// Updates that arrived while we have never been given a scanout. QEMU
+    /// only sends Scanout/ScanoutDMABUF when it has a live surface, so if the
+    /// guest's display is blanked at the moment our listener registers we get
+    /// none - and every later Update refers to a buffer we never received.
+    /// The screen then stays black forever while the update counter looks
+    /// healthy. Surfaced in the UI so it is diagnosable instead of mystifying.
+    pub orphan_updates: u64,
+    /// Set when the listener thread has exited: the D-Bus connection to QEMU
+    /// closed, or our input channel was dropped. The tab is dead from here on
+    /// and must be torn down - without this the last frame stays on screen
+    /// looking healthy, which is what a guest reboot used to look like.
+    pub gone: bool,
+    /// Set when a plain Scanout arrives, meaning the guest has gone back to
+    /// sending pixels. Without it the consumer keeps re-blitting the last
+    /// imported dmabuf and the tab freezes - which is what a guest reboot into
+    /// a dumb framebuffer looks like.
+    pub copy_takeover: bool,
+    /// The guest's pointer is relative (QEMU's IsAbsolute is false): motion
+    /// must go out as RelMotion. Only written to head 0's frame.
+    pub pointer_relative: bool,
+    /// QEMU called Listener.Disable: the guest turned its display off, so
+    /// the scanout it was rendering into is gone. Distinct from `gone`,
+    /// which is the guest itself going away, and from `orphan_updates`,
+    /// which is us having attached while it was already off.
+    ///
+    /// Set rather than acted on here: releasing GL objects is the render
+    /// thread's job, and this runs on the listener's.
+    pub display_off: bool,
+    /// Scanouts the guest still has configured on heads we do NOT draw,
+    /// summed. A guest that keeps a monitor we disabled - Windows holds on
+    /// to its layout - has a desktop wider than anything we can see, and
+    /// its one absolute pointer is spread across all of it. Without this
+    /// the pointer runs off the visible screen and cannot be recovered.
+    pub unseen: (u32, u32),
+}
+
+/// A scanout buffer QEMU rendered on the host GPU. Importing this avoids the
+/// per-frame RGBA copy entirely.
+pub struct GuestCursor {
+    pub w: u32,
+    pub h: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub rgba: Vec<u8>,
+}
+
+pub struct GuestDmabuf {
+    pub fd: std::os::fd::OwnedFd,
+    /// inode of the underlying dma-buf. Each ScanoutDMABUF carries a freshly
+    /// dup'd fd, but a compositor rotates a small set of buffers, so the inode
+    /// identifies which one this is and lets the importer reuse its texture.
+    pub ino: u64,
+    pub w: u32,
+    pub h: u32,
+    pub stride: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub y0_top: bool,
+}
+pub type Shared = Arc<Mutex<GuestFrame>>;
+
+struct Listener { f: Shared, stride: u32, raw: Vec<u8>, n: u64, t0: Option<std::time::Instant>, have_scanout: bool, console: usize }
+
+impl Listener {
+    /// Repack only the damaged rectangle. Rebuilding all 1M pixels for a
+    /// cursor-sized damage region was a large part of the input latency.
+    fn tick(&mut self, w: u32, h: u32) {
+        self.count(w, h);
+        self.n += 1;
+        let t0 = *self.t0.get_or_insert_with(std::time::Instant::now);
+        if self.n % 120 == 0 {
+            let secs = t0.elapsed().as_secs_f64();
+            log::trace!("{} updates in {:.1}s = {:.1}/s (last damage {w}x{h})",
+                      self.n, secs, self.n as f64 / secs);
+        }
+    }
+
+    /// A new guest frame: count it (console N is drawn on head N) and wake
+    /// the render loop, which draws nothing until something changes.
+    fn count(&self, w: u32, h: u32) {
+        let s = crate::gui::stats::head(self.console);
+        s.updates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        s.update_px.fetch_add(w as u64 * h as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::gui::wake::wake();
+    }
+
+    fn repack(&mut self, rx: u32, ry: u32, rw: u32, rh: u32) {
+        let mut g = self.f.lock().unwrap();
+        let (w, h) = (g.w as usize, g.h as usize);
+        if w == 0 || h == 0 { return; }
+        g.rgba.resize(w * h * 4, 0);
+        let x0 = rx as usize;
+        let y0 = ry as usize;
+        let x1 = (rx + rw).min(g.w) as usize;
+        let y1 = (ry + rh).min(g.h) as usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let s = y * self.stride as usize + x * 4;
+                let d = (y * w + x) * 4;
+                if s + 3 < self.raw.len() {
+                    // x8r8g8b8 little-endian => B,G,R,X in memory
+                    g.rgba[d] = self.raw[s + 2];
+                    g.rgba[d + 1] = self.raw[s + 1];
+                    g.rgba[d + 2] = self.raw[s];
+                    g.rgba[d + 3] = 255;
+                }
+            }
+        }
+        // union with any damage the consumer has not picked up yet
+        g.dirty = Some(match g.dirty {
+            None => (rx, ry, x1.saturating_sub(x0) as u32, y1.saturating_sub(y0) as u32),
+            Some((ox, oy, ow, oh)) => {
+                let nx = ox.min(rx); let ny = oy.min(ry);
+                let ex = (ox + ow).max(x1 as u32); let ey = (oy + oh).max(y1 as u32);
+                (nx, ny, ex.saturating_sub(nx), ey.saturating_sub(ny))
+            }
+        });
+        g.seq += 1;
+    }
+}
+
+#[interface(name = "org.qemu.Display1.Listener")]
+impl Listener {
+    async fn scanout(&mut self, width: u32, height: u32, stride: u32, _fmt: u32, data: Vec<u8>) {
+        {
+            let mut g = self.f.lock().unwrap();
+            g.w = width; g.h = height; g.dirty = None; g.orphan_updates = 0;
+            g.display_off = false;
+            g.dmabuf = None;
+            g.copy_takeover = true;
+        }
+        self.have_scanout = true;
+        self.stride = stride;
+        self.raw = data;
+        self.tick(width, height);
+        self.repack(0, 0, width, height);
+    }
+    async fn update(&mut self, x: i32, y: i32, w: i32, h: i32, stride: u32, _fmt: u32, data: Vec<u8>) {
+        let bpp = 4usize;
+        let (gw, gh) = { let g = self.f.lock().unwrap(); (g.w as usize, g.h as usize) };
+        if self.raw.is_empty() || gw == 0 { return; }
+        // Clamp before the cast: `x as usize` on a negative i32 is a huge
+        // number, and the bounds check below then wraps in release mode rather
+        // than rejecting it. The guest supplies these.
+        let (x0, y0) = (x.max(0) as usize, y.max(0) as usize);
+        for row in 0..h.max(0) as usize {
+            let dy = y0 + row;
+            if dy >= gh { break; }
+            let s = row * stride as usize;
+            let d = dy * self.stride as usize + x0 * bpp;
+            let len = (w.max(0) as usize * bpp).min(data.len().saturating_sub(s));
+            if d + len <= self.raw.len() && s + len <= data.len() {
+                self.raw[d..d + len].copy_from_slice(&data[s..s + len]);
+            }
+        }
+        self.tick(w.max(0) as u32, h.max(0) as u32);
+        self.repack(x0 as u32, y0 as u32, w.max(0) as u32, h.max(0) as u32);
+    }
+    #[zbus(name = "ScanoutDMABUF")]
+    async fn scanout_dmabuf(&mut self, fd: Fd<'_>, w: u32, h: u32, stride: u32,
+                            fourcc: u32, modifier: u64, y0_top: bool) {
+        match fd.as_fd().try_clone_to_owned() {
+            Ok(owned) => {
+                let mut g = self.f.lock().unwrap();
+                g.w = w; g.h = h;
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let ino = if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } == 0 { st.st_ino } else { 0 };
+                g.dmabuf = Some(GuestDmabuf { fd: owned, ino, w, h, stride, fourcc, modifier, y0_top });
+                g.orphan_updates = 0;
+                g.display_off = false;
+                self.have_scanout = true;
+                g.seq += 1;
+                log::debug!("ScanoutDMABUF {w}x{h} stride={stride} fourcc=0x{fourcc:08x} mod=0x{modifier:x} y0_top={y0_top}");
+                crate::gui::wake::wake();
+            }
+            Err(e) => log::error!("dmabuf dup failed: {e}"),
+        }
+    }
+    #[zbus(name = "UpdateDMABUF")]
+    async fn update_dmabuf(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        self.count(w.max(0) as u32, h.max(0) as u32);
+        // Same underlying buffer: nothing to copy, just note there is new content.
+        let mut g = self.f.lock().unwrap();
+        // An update with no scanout is only worth reporting when we do not
+        // already know why. `display_off` means the guest told us it
+        // released the scanout - because it blanked, or because we handed
+        // the display to a remote session - and in both cases there is
+        // nothing wrong and Wake is the wrong advice.
+        if !self.have_scanout && !g.display_off {
+            g.orphan_updates += 1;
+            if g.orphan_updates == 1 {
+                log::warn!(
+                    "UpdateDMABUF with no scanout - the guest's display was probably \
+                     asleep when we attached; nothing to draw until it wakes \
+                     (use the Wake button)"
+                );
+            }
+        }
+        g.seq += 1;
+        if g.seq % 60 == 0 {
+            log::trace!("UpdateDMABUF #{} +{x}+{y} {w}x{h}", g.seq);
+        }
+    }
+    async fn cursor_define(&mut self, width: i32, height: i32, hot_x: i32, hot_y: i32,
+                           data: Vec<u8>) {
+        if width <= 0 || height <= 0 { return; }
+        let (w, h) = (width as u32, height as u32);
+        let want = (w as usize) * (h as usize) * 4;
+        // Guest-controlled: a length that disagrees with the declared size
+        // would trip an assert in egui and take the whole console down.
+        if data.len() != want {
+            log::warn!("CursorDefine {w}x{h}: {} bytes, expected {want}; ignored", data.len());
+            return;
+        }
+        let mut rgba = Vec::with_capacity(want);
+        // QEMU sends ARGB32 little-endian => B,G,R,A in memory
+        for px in data.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+        let mut g = self.f.lock().unwrap();
+        g.cursor = Some(GuestCursor { w, h, hot_x, hot_y, rgba });
+        g.cursor_seq += 1;
+        log::debug!("CursorDefine {w}x{h} hot={hot_x},{hot_y}");
+        crate::gui::wake::wake();
+    }
+
+    async fn mouse_set(&mut self, _x: i32, _y: i32, on: i32) {
+        self.f.lock().unwrap().cursor_visible = on != 0;
+        crate::gui::wake::wake();
+    }
+
+    /// The guest turned its display off - a screen blank, a DPMS timeout, a
+    /// compositor releasing an output.
+    ///
+    /// The scanout resource is freed on the guest side, so the dmabuf we
+    /// hold is stale: nothing will ever be drawn into it again, and the next
+    /// wake allocates a new one and sends a fresh ScanoutDMABUF. Holding on
+    /// to it is worse than useless - our open fd keeps the memory alive and
+    /// charged to the app's cgroup after the guest has given it back, which
+    /// is memory an already tight GL guest cannot spare.
+    async fn disable(&mut self) {
+        let mut g = self.f.lock().unwrap();
+        g.display_off = true;
+        g.dmabuf = None;
+        g.cursor_visible = false;
+        self.have_scanout = false;
+        log::info!("display off: guest released its scanout");
+        crate::gui::wake::wake();
+    }
+    #[zbus(property)] fn interfaces(&self) -> Vec<String> { vec![] }
+}
+
+#[zbus::proxy(interface = "org.qemu.Display1.Console", default_service = "org.qemu")]
+trait Console {
+    fn register_listener(&self, listener: Fd<'_>) -> zbus::Result<()>;
+    /// QEMU's name for this console: the display device's id, with `.N`
+    /// appended for its Nth head. The only way to tell one device's extra
+    /// scanouts from a different device's first one.
+    #[zbus(property)]
+    fn label(&self) -> zbus::Result<String>;
+    /// The scanout size the guest has configured on this console. Non-zero
+    /// once the guest has actually put something on the head, which is the
+    /// only positive evidence available that it accepted one.
+    #[zbus(property)]
+    fn width(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn height(&self) -> zbus::Result<u32>;
+    /// Geometry of the monitor this scanout is being shown on. QEMU turns it
+    /// into the connector's EDID and preferred mode, and enables or disables
+    /// the scanout on a non-zero or zero size - which is how a guest learns a
+    /// monitor was plugged in or taken away.
+    #[zbus(name = "SetUIInfo")]
+    fn set_ui_info(
+        &self,
+        width_mm: u16,
+        height_mm: u16,
+        xoff: i32,
+        yoff: i32,
+        width: u32,
+        height: u32,
+    ) -> zbus::Result<()>;
+}
+
+
+/// What one physical monitor looks like, for the guest scanout shown on it.
+/// Millimetres travel too: without them the guest has resolution but no DPI,
+/// and scales its desktop wrongly on anything but a ~96dpi panel.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadGeometry {
+    pub w: u32,
+    pub h: u32,
+    pub mm_w: u16,
+    pub mm_h: u16,
+    pub xoff: i32,
+    pub yoff: i32,
+}
+
+/// Who currently has heads enabled on the guest.
+///
+/// Two states are not enough. A handover that the guest refuses to follow
+/// is rolled back to BOTH, which is neither of the others - and treating it
+/// as "local" means the next request to go local is skipped as a no-op, so
+/// the guest is left with a monitor nobody is looking at for as long as it
+/// runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Owner {
+    Local,
+    Remote,
+    Both,
+}
+
+/// Enable a head at this geometry, or take it away entirely with a zero
+/// size. Failure is logged and swallowed: a guest whose driver does not
+/// implement SetUIInfo - Windows' display-only one ignores the size,
+/// though it does act on a head appearing or going - must not take the
+/// pump down with it.
+async fn set_head(p: &ConsoleProxy<'_>, g: Option<HeadGeometry>) {
+    let (w, h, mw, mh, x, y) = match g {
+        Some(g) => (g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff),
+        None => (0, 0, 0, 0, 0, 0),
+    };
+    if let Err(e) = p.set_ui_info(mw, mh, x, y, w, h).await {
+        log::debug!("SetUIInfo({w}x{h}) refused: {e}");
+    }
+}
+
+/// What a remote session's own display is given when it takes ownership.
+///
+/// The VNC card is a SEPARATE virtio-vga device, deliberately: a second PCI
+/// GPU is a second guest desktop with its own absolute pointer range, so the
+/// remote operator's mouse stays on the remote screen instead of sharing one
+/// pointer with the local heads. That is the whole reason it is not just
+/// another scanout of video0.
+///
+/// The cost is that the guest only lights it if something tells it there is a
+/// monitor there. It cannot be one of our heads' geometries - a 4K local head
+/// made the remote display 3840x2160 - and it cannot be left at whatever the
+/// card booted with, which is QEMU's 640x480 VGA framebuffer that no guest
+/// ever draws on. So it is a fixed, ordinary size the guest will accept.
+const REMOTE_GEOMETRY: HeadGeometry = HeadGeometry {
+    w: 1920,
+    h: 1080,
+    // 16:9 at roughly 96 DPI, so the guest computes a sane scale factor
+    // rather than inheriting a local monitor's physical size.
+    mm_w: 509,
+    mm_h: 286,
+    xoff: 0,
+    yoff: 0,
+};
+
+/// Put a foreign console back to the size it had when we first saw it.
+///
+/// Deliberately not `set_head`: a foreign console is not one of our heads and
+/// must never be given one of their geometries. Its position stays at the
+/// origin, which is where the desktop-prefix assumption in `mod.rs` places
+/// the heads the guest kept.
+async fn restore_foreign(p: &ConsoleProxy<'_>, had: Option<(u32, u32)>) {
+    let Some((w, h)) = had else { return };
+    if w == 0 || h == 0 {
+        return;
+    }
+    if let Err(e) = p.set_ui_info(0, 0, 0, 0, w, h).await {
+        log::debug!("restore_foreign({w}x{h}) refused: {e}");
+    }
+}
+
+/// Linux evdev keycode -> QEMU "qnum", which is what the D-Bus Keyboard
+/// interface actually wants (`qemu_input_key_number_to_qcode`).
+///
+/// A qnum is the **PS/2 set-1 scancode**, with extended (0xE0-prefixed) keys
+/// encoded as `0x80 | low_byte`. For the main block the two numbering schemes
+/// are identical, because Linux derived its base keycodes from set 1 - which is
+/// why typing letters worked and hid this bug for a long time. Every extended
+/// key was wrong: we sent Delete as 111 when QEMU wanted 0xD3 = 211, so
+/// Ctrl+Alt+Del reached a Windows guest as Ctrl+Alt+nothing.
+fn evdev_to_qnum(code: u32) -> Option<u32> {
+    Some(match code {
+        // Base block: identity. 1 (Esc) .. 88 (F12), which covers the
+        // alphanumerics, both shifts, left ctrl/alt, the keypad and F1-F12.
+        1..=88 => code,
+        // Extended: 0xE0 <low>  ->  0x80 | low
+        96  => 0x9C,  // KPENTER
+        97  => 0x9D,  // RIGHTCTRL
+        98  => 0xB5,  // KPSLASH
+        99  => 0xB7,  // SYSRQ / PrintScreen
+        100 => 0xB8,  // RIGHTALT
+        102 => 0xC7,  // HOME
+        103 => 0xC8,  // UP
+        104 => 0xC9,  // PAGEUP
+        105 => 0xCB,  // LEFT
+        106 => 0xCD,  // RIGHT
+        107 => 0xCF,  // END
+        108 => 0xD0,  // DOWN
+        109 => 0xD1,  // PAGEDOWN
+        110 => 0xD2,  // INSERT
+        111 => 0xD3,  // DELETE   <- the one that started this
+        119 => 0xC6,  // PAUSE
+        125 => 0xDB,  // LEFTMETA  (Windows key)
+        126 => 0xDC,  // RIGHTMETA
+        127 => 0xDD,  // COMPOSE / Menu
+        113 => 0xA0,  // MUTE
+        114 => 0xAE,  // VOLUMEDOWN
+        115 => 0xB0,  // VOLUMEUP
+        116 => 0xDE,  // POWER
+        _ => return None,
+    })
+}
+
+#[zbus::proxy(interface = "org.qemu.Display1.Keyboard", default_service = "org.qemu")]
+trait Keyboard {
+    #[zbus(no_reply)] fn press(&self, keycode: u32) -> zbus::Result<()>;
+    #[zbus(no_reply)] fn release(&self, keycode: u32) -> zbus::Result<()>;
+}
+
+#[zbus::proxy(interface = "org.qemu.Display1.Mouse", default_service = "org.qemu")]
+trait Mouse {
+    #[zbus(no_reply)] fn press(&self, button: u32) -> zbus::Result<()>;
+    #[zbus(no_reply)] fn release(&self, button: u32) -> zbus::Result<()>;
+    #[zbus(no_reply)] fn set_abs_position(&self, x: u32, y: u32) -> zbus::Result<()>;
+    /// Refused by QEMU while IsAbsolute is true ("Mouse is not relative").
+    #[zbus(no_reply)] fn rel_motion(&self, dx: i32, dy: i32) -> zbus::Result<()>;
+    /// Whether the guest's current pointer handler is absolute (usb-tablet)
+    /// or relative (PS/2). QEMU updates it on every mouse-mode change.
+    #[zbus(property)] fn is_absolute(&self) -> zbus::Result<bool>;
+}
+
+/// Spawn a background thread running the D-Bus listener for `console`.
+/// How to reach a guest's D-Bus display.
+pub enum Transport {
+    /// A bus address. Needs a dbus-daemon, which only the development rig has.
+    Address(String),
+    /// A socket QEMU already accepted through QMP `add_client`. This is the
+    /// EVE path: no bus daemon exists or is needed.
+    Fd(std::os::fd::OwnedFd),
+}
+
+/// Lock a guest's frame from the render thread, tolerating poisoning.
+///
+/// A panic in one guest's listener poisons only that guest's mutex, but
+/// `.unwrap()` on the render side would turn it into a panic on the render
+/// thread - which skips shutdown(), leaves DRM master and the GL objects
+/// behind, and leaves the panel black until the box is rebooted. One guest
+/// must not be able to do that to the console.
+pub fn frame(shared: &Shared) -> std::sync::MutexGuard<'_, GuestFrame> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Mark the tab dead so the render loop tears it down and retries.
+fn mark_all_gone(shared: &[Shared]) {
+    for s in shared {
+        mark_gone(s);
+    }
+}
+
+fn mark_gone(shared: &Shared) {
+    if let Ok(mut f) = shared.lock() {
+        f.gone = true;
+    }
+    crate::gui::wake::wake();
+}
+
+/// How many input events may queue for one guest. The pump normally drains
+/// this every iteration; it only fills when QEMU has stopped reading, and an
+/// unbounded queue there grows at device rate (1 kHz mice exist) with nothing
+/// to stop it - the same shape as the scanout OOM.
+const INPUT_QUEUE: usize = 1024;
+
+/// Highest console index worth probing. VIRTIO_GPU_MAX_SCANOUTS is 16, and a
+/// domain may have a second display device after those, so this is a
+/// generous stop for the walk that looks for consoles we do not drive.
+const MAX_CONSOLES: usize = 24;
+
+/// The display DEVICE a console label names.
+///
+/// qemu labels a graphic console with the device's id and, once the device
+/// has more than one head, a `.N` suffix for the head - so `video0` with
+/// max_outputs=5 gives `video0.0` through `video0.4`, and the second device
+/// is `video1`. Comparing whole labels therefore makes every head of our own
+/// card look like a different card.
+fn device_of(label: &str) -> &str {
+    match label.rsplit_once('.') {
+        Some((dev, head)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => dev,
+        _ => label,
+    }
+}
+
+/// Attach to one guest and bring up `heads.len()` of its consoles.
+///
+/// One D-Bus connection carries them all - consoles are objects on it, not
+/// separate peers - so a second monitor costs a listener socket, not a second
+/// attach. The returned vector is in head order and is never longer than the
+/// number of consoles QEMU actually exposes: `max_outputs` is fixed when the
+/// domain starts, and monitors are not.
+pub fn spawn(
+    vm: &str,
+    transport: Transport,
+    heads: Vec<Option<HeadGeometry>>,
+) -> (Vec<Shared>, std::sync::mpsc::SyncSender<crate::gui::input::GuestAct>) {
+    let heads = if heads.is_empty() { vec![None] } else { heads };
+    let shared: Vec<Shared> = heads
+        .iter()
+        .map(|_| Arc::new(Mutex::new(GuestFrame::default())) as Shared)
+        .collect();
+    let out = shared.clone();
+    let shared_out = shared.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<crate::gui::input::GuestAct>(INPUT_QUEUE);
+    let vm = vm.to_string();
+    let tname = format!("guest:{vm}");
+    let _ = std::thread::Builder::new().name(tname).spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .thread_name(format!("guest:{vm}"))
+            .enable_all().build().unwrap();
+        rt.block_on(async move {
+            // The copy path carries whole framebuffers (8 MB at 1920x1080) per
+            // guest frame; unbounded queueing of those is an OOM. We only ever
+            // draw the newest frame, so dropping stale ones is correct. The
+            // dmabuf path sends an fd, not pixels.
+            let built = match transport {
+                Transport::Address(ref bus) => zbus::connection::Builder::address(bus.as_str())
+                    .map(|b| b.max_queued(4)),
+                Transport::Fd(fd) => {
+                    let std_sock = std::os::unix::net::UnixStream::from(fd);
+                    match std_sock.set_nonblocking(true)
+                        .and_then(|_| tokio::net::UnixStream::from_std(std_sock))
+                    {
+                        Ok(sock) => Ok(zbus::connection::Builder::unix_stream(sock)
+                            .p2p()
+                            .max_queued(4)),
+                        Err(e) => { log::error!("display socket: {e}"); mark_all_gone(&shared_out); return; }
+                    }
+                }
+            };
+            let conn = match built {
+                Ok(b) => match b.build().await {
+                    Ok(c) => c,
+                    Err(e) => { log::error!("connect display: {e}"); mark_all_gone(&shared_out); return; }
+                },
+                Err(e) => { log::error!("bad display transport: {e}"); mark_all_gone(&shared_out); return; }
+            };
+            // Bind rather than forget: a connection must outlive the pump
+            // loop, but it must also be dropped when the loop ends, or the
+            // thread's whole runtime leaks with it on every tab removal.
+            let mut consoles: Vec<ConsoleProxy> = Vec::new();
+            let mut listeners = Vec::new();
+            // The id of the device console 0 belongs to. Consoles are numbered
+            // across every display device QEMU has, so with VNC enabled the
+            // console after the GL device's last scanout is a different card
+            // entirely - drawing that on a second monitor would show the VNC
+            // head's contents, not the guest's second desktop.
+            let mut device: Option<String> = None;
+            // Consoles belonging to another display device. We do not draw
+            // them, but we do own whether the guest can see them.
+            let mut foreign: Vec<ConsoleProxy> = Vec::new();
+            // A Windows guest drives one monitor per virtio-gpu adapter
+            // (viogpudo has MAX_VIEWS 1), so multi-monitor Windows needs one
+            // adapter per head. With this set, a console on another adapter
+            // is the next head instead of a foreign one. Off by default.
+            let per_adapter = std::env::var_os("GUI_HEADS_PER_ADAPTER").is_some();
+            for (console, (head, sink)) in heads.iter().zip(out.into_iter()).enumerate() {
+                let path = format!("/org/qemu/Display1/Console_{console}");
+                let proxy = match ConsoleProxy::builder(&conn).path(path).unwrap().build().await {
+                    Ok(p) => p,
+                    Err(e) => { log::error!("no console {console}: {e}"); break; }
+                };
+                // A label QEMU will not give us is not a reason to refuse the
+                // console: an older QEMU without the property would otherwise
+                // lose its display entirely.
+                match (proxy.label().await.ok(), device.as_deref()) {
+                    (Some(l), None) => {
+                        log::info!("console 0 is {l}");
+                        device = Some(device_of(&l).to_string());
+                    }
+                    (Some(l), Some(d)) if device_of(&l) != d && per_adapter => log::info!(
+                        "console {console} is {l}, another adapter: head {console} (GUI_HEADS_PER_ADAPTER)"
+                    ),
+                    (Some(l), Some(d)) if device_of(&l) != d => {
+                        // A console on another display device - the plain
+                        // head that exists so VNC has something it can read.
+                        //
+                        // Its scanout is enabled from reset
+                        // (virtio_gpu_base_reset sets enabled_output_bitmask
+                        // to 1), so the guest sees it as a second monitor and
+                        // extends its desktop onto a screen nobody is looking
+                        // at. That desktop is then wider than anything we
+                        // draw, and since the guest's one absolute pointer is
+                        // scaled across the whole of it, the operator's cursor
+                        // runs ahead and eventually walks off onto the part
+                        // they cannot see.
+                        //
+                        // Zero size takes the monitor away: qemu's
+                        // virtio_gpu_ui_info clears the output's bit when
+                        // either dimension is zero and raises a display-change
+                        // event, so the guest is told the screen was unplugged
+                        // rather than blanked.
+                        match proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
+                            Ok(()) => log::info!(
+                                "console {console} is {l}, not a head of {d}: disabled it"
+                            ),
+                            Err(e) => log::warn!(
+                                "console {console} is {l}: could not disable it: {e}"
+                            ),
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                // Before registering: tell the guest what monitor this scanout
+                // is being shown on, so it configures that resolution rather
+                // than virtio-gpu's built-in default (1280x800 on a 1920x1080
+                // panel, which is how this was first noticed). Not fatal if the
+                // guest's driver does not implement it - Windows' display-only
+                // driver does not - so log and carry on.
+                if let Some(g) = head {
+                    match proxy.set_ui_info(g.mm_w, g.mm_h, g.xoff, g.yoff, g.w, g.h).await {
+                        Ok(()) => log::info!(
+                            "console {console}: told guest {}x{} ({}x{}mm) at +{}+{}",
+                            g.w, g.h, g.mm_w, g.mm_h, g.xoff, g.yoff
+                        ),
+                        Err(e) => log::warn!("console {console}: SetUIInfo refused: {e}"),
+                    }
+                }
+                let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+                ours.set_nonblocking(true).unwrap();
+                let ours = tokio::net::UnixStream::from_std(ours).unwrap();
+                // QEMU always calls the listener at this one path, so each
+                // console needs a socket - and therefore a connection - of
+                // its own; they cannot share one and be told apart.
+                let builder = zbus::connection::Builder::unix_stream(ours)
+                    .p2p()   // QEMU is the auth server on this socket
+                    .serve_at("/org/qemu/Display1/Listener",
+                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false, console }).unwrap();
+                let task = tokio::spawn(async move { builder.build().await });
+                let ofd: OwnedFd = theirs.into();
+                if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {
+                    log::error!("RegisterListener({console}) failed: {e}");
+                    break;
+                }
+                match task.await {
+                    Ok(Ok(c)) => { log::info!("console {console}: listener up"); listeners.push(c); }
+                    other => { log::error!("console {console}: listener build failed: {other:?}"); break; }
+                }
+                consoles.push(proxy);
+            }
+            // Our heads are up; now look PAST them. With max_outputs set
+            // from the host's connector count, video0 owns consoles 0..N-1
+            // and the plain head VNC reads sits after all of them - so with
+            // one monitor it is console 5, not console 1, and the loop above
+            // never reaches it.
+            //
+            // video0's own unused scanouts need no attention: virtio-gpu
+            // enables only scanout 0 at reset, so they are already invisible
+            // to the guest. A second DEVICE has its own bitmask and its own
+            // enabled scanout 0, which is the one that becomes a phantom
+            // monitor.
+            if let Some(d) = device.clone() {
+                for console in consoles.len()..MAX_CONSOLES {
+                    let path = format!("/org/qemu/Display1/Console_{console}");
+                    let Ok(proxy) = ConsoleProxy::builder(&conn).path(path).unwrap().build().await
+                    else {
+                        break;
+                    };
+                    // No label means no console: we have run off the end.
+                    let Ok(label) = proxy.label().await else { break };
+                    if device_of(&label) == d {
+                        continue; // another of our own scanouts, already off
+                    }
+                    // Try to take it away: a guest that can see a monitor
+                    // nobody is looking at extends its desktop onto it and
+                    // spreads its one absolute pointer across the union.
+                    //
+                    // But only if the guest actually gives it up. Windows'
+                    // display-only driver accepts a head and does not
+                    // return one - and if that head was its primary,
+                    // disabling it leaves the desktop nowhere, because it
+                    // will not fall back to ours either. Every restart of
+                    // this console would then blank the guest.
+                    //
+                    // So: ask, then check. The console's Width is what the
+                    // guest has configured there; still non-zero means the
+                    // guest kept it, and we put it back rather than leave
+                    // the guest short of the screen it is using.
+                    //
+                    // Read what it has BEFORE disabling it, because that is
+                    // what has to go back if the guest refuses. Restoring one
+                    // of our own heads' geometry instead hands this console a
+                    // size nobody asked for - with a 4K monitor on head 0 the
+                    // VNC head became 3840x2160, and the unseen-width poll
+                    // then read that back and shifted the whole pointer
+                    // prefix by 3840.
+                    let had = (
+                        proxy.width().await.unwrap_or(0),
+                        proxy.height().await.unwrap_or(0),
+                    );
+                    if let Err(e) = proxy.set_ui_info(0, 0, 0, 0, 0, 0).await {
+                        log::warn!("console {console} is {label}: cannot disable: {e}");
+                    }
+                    let mut gave_it_up = false;
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if proxy.width().await.unwrap_or(0) == 0 {
+                            gave_it_up = true;
+                            break;
+                        }
+                    }
+                    if gave_it_up {
+                        log::info!("console {console} is {label}: disabled it");
+                    } else {
+                        log::info!(
+                            "console {console} is {label}: guest kept it, putting back \
+                             {}x{} (its pointer range covers that head too)",
+                            had.0,
+                            had.1
+                        );
+                        restore_foreign(&proxy, Some(had)).await;
+                    }
+                    foreign.push(proxy);
+                }
+            }
+
+            if consoles.is_empty() {
+                log::error!("no usable console on this guest");
+                mark_all_gone(&shared_out);
+                return;
+            }
+            // A console we asked for but could not bring up will never produce
+            // a frame; say so rather than leaving a head waiting for ever.
+            for s in shared_out.iter().skip(consoles.len()) {
+                mark_gone(s);
+            }
+            let _listeners = listeners;
+            // Geometry last given to each of our consoles, so it can be
+            // restored when a remote session hands the display back.
+            let mut last: Vec<Option<HeadGeometry>> = vec![None; consoles.len()];
+            for (i, h) in heads.iter().enumerate().take(consoles.len()) {
+                last[i] = *h;
+            }
+            let mut owner = Owner::Local;
+            // How often to ask the heads we do not draw whether the guest
+            // still has them. Cheap next to a frame, and the answer only
+            // changes when the guest reconfigures its displays.
+            let mut unseen_at = std::time::Instant::now();
+            let mut pointer_mode_logged = false;
+
+            // input pump: drain the channel and drive QEMU's Keyboard/Mouse.
+            // Console 0 only: the guest has one keyboard and one absolute
+            // pointer whatever its monitor count, and both hang off the first
+            // console of the device.
+            let mut pending: Vec<crate::gui::input::GuestAct> = Vec::new();
+            let path = "/org/qemu/Display1/Console_0".to_string();
+            let kbd = KeyboardProxy::builder(&conn).path(path.clone()).unwrap()
+                .build().await.ok();
+            let mouse = MouseProxy::builder(&conn).path(path).unwrap()
+                .build().await.ok();
+            if kbd.is_some() && mouse.is_some() { log::info!("input proxies ready"); }
+            loop {
+                use crate::gui::input::GuestAct::*;
+                // Collapse runs of motion into the last position; buttons and
+                // keys keep their order. Awaiting a reply per motion lags.
+                let mut batch: Vec<crate::gui::input::GuestAct> = std::mem::take(&mut pending);
+                while let Ok(a) = rx.try_recv() {
+                    if let (AbsPos(..), Some(AbsPos(..))) = (&a, batch.last()) {
+                        batch.pop();
+                    }
+                    // Relative motion is summed, not replaced: dropping a
+                    // delta loses distance.
+                    if let (RelMotion(dx, dy), Some(RelMotion(px, py))) = (&a, batch.last_mut()) {
+                        *px += *dx;
+                        *py += *dy;
+                        continue;
+                    }
+                    batch.push(a);
+                }
+                let got = !batch.is_empty();
+                for a in batch {
+                    match a {
+                        AbsPos(x, y) => { if let Some(m) = &mouse {
+                            if let Err(e) = m.set_abs_position(x, y).await { log::error!("abs {e}"); } } }
+                        RelMotion(dx, dy) => { if let Some(m) = &mouse {
+                            if let Err(e) = m.rel_motion(dx, dy).await { log::error!("rel {e}"); } } }
+                        Btn(b, d) => { if let Some(m) = &mouse {
+                            let r = if d { m.press(b).await } else { m.release(b).await };
+                            if let Err(e) = r { log::error!("btn {b} down={d} ERR {e}"); } } }
+                        ManageHeads(_) => {}
+                        Remote(on) => {
+                            // Exactly one consumer owns the guest's
+                            // monitors. The guest has ONE absolute pointer
+                            // whose range is spread across whatever desktop
+                            // it has, so while two consumers each hold a
+                            // head neither can place a cursor - and Windows
+                            // additionally remembers the second monitor's
+                            // geometry long after it is gone, reopening
+                            // windows on coordinates that no longer exist.
+                            //
+                            // Done as a transaction. The guest only moves
+                            // BECAUSE the source goes away, so there is no
+                            // "wait for it to move, then take the old one"
+                            // ordering that works: we have to make the
+                            // change and then check it landed. If the guest
+                            // ends up drawing nowhere - which is how a
+                            // Windows guest was left with a black screen on
+                            // both heads - put it back the way it was.
+                            let want = if on { Owner::Remote } else { Owner::Local };
+                            if owner == want {
+                                continue;
+                            }
+                            let hand = last.first().copied().flatten();
+
+                            // Destination first, so there is no instant
+                            // with no head at all.
+                            if on {
+                                // A real monitor, so the guest actually
+                                // lights this card. Not one of our heads'
+                                // geometries (a 4K local head made the remote
+                                // display 3840x2160) and not what it booted
+                                // with (QEMU's 640x480 VGA framebuffer, which
+                                // no guest draws on - the remote session then
+                                // shows "display output not active" even
+                                // though the handover succeeded).
+                                for p in foreign.iter() {
+                                    set_head(p, Some(REMOTE_GEOMETRY)).await;
+                                }
+                                for p in consoles.iter() {
+                                    set_head(p, None).await;
+                                }
+                            } else {
+                                for (i, p) in consoles.iter().enumerate() {
+                                    set_head(p, last.get(i).copied().flatten()).await;
+                                }
+                                for p in foreign.iter() {
+                                    set_head(p, None).await;
+                                }
+                            }
+                            owner = want;
+                            log::info!("display owner -> {owner:?}");
+
+                            // Did it land?
+                            //
+                            // Ask the DESTINATION, not the source. The
+                            // obvious test - wait for our own head to go
+                            // quiet - only fires when the guest RELEASES
+                            // the scanout resource, and a guest may simply
+                            // stop drawing to a disabled output without
+                            // releasing it. QEMU then never calls Disable
+                            // on us, we see nothing, and a handover that
+                            // worked gets undone.
+                            //
+                            // A console's Width/Height is what the guest
+                            // has configured there, so non-zero on the head
+                            // we just handed over is the guest saying yes.
+                            let mut ok = false;
+                            for _ in 0..40 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                let live = if on {
+                                    let mut any = false;
+                                    for p in foreign.iter() {
+                                        if p.width().await.unwrap_or(0) > 0 {
+                                            any = true;
+                                        }
+                                    }
+                                    any
+                                } else {
+                                    consoles
+                                        .first()
+                                        .map(|p| p.width())
+                                        .unwrap()
+                                        .await
+                                        .unwrap_or(0)
+                                        > 0
+                                };
+                                if live {
+                                    ok = true;
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                log::warn!(
+                                    "the guest did not follow the display to the {}; \
+                                     putting both heads back",
+                                    if on { "remote session" } else { "local console" }
+                                );
+                                for (i, p) in consoles.iter().enumerate() {
+                                    let g = last.get(i).copied().flatten().or(hand);
+                                    set_head(p, g).await;
+                                }
+                                for p in foreign.iter() {
+                                    set_head(p, Some(REMOTE_GEOMETRY)).await;
+                                }
+                                // Both up is wrong, but it is visible; one
+                                // head disabled and a guest that ignored the
+                                // other is a black screen with no way back.
+                                // Recorded as its own state so that the next
+                                // request is not mistaken for a no-op.
+                                owner = Owner::Both;
+                            }
+                        }
+                        // While a remote session owns the display our heads
+                        // are gone; re-enabling one behind its back would put
+                        // the guest back into the two-owner state. Both is
+                        // different: our head IS up, so it may be resized.
+                        Ui(..) if owner == Owner::Remote => {}
+                        Ui(console, g) => {
+                            // Resolution follows the area we draw in, so a
+                            // guest is never scaled: fullscreen and windowed
+                            // are simply two different monitor sizes.
+                            let Some(p) = consoles.get(console) else { continue };
+                            if let Some(slot) = last.get_mut(console) {
+                                *slot = Some(g);
+                            }
+                            match p.set_ui_info(g.mm_w, g.mm_h, g.xoff, g.yoff, g.w, g.h).await {
+                                Ok(()) => log::info!("console {console}: viewport now {}x{}", g.w, g.h),
+                                Err(e) => log::debug!("console {console}: SetUIInfo refused: {e}"),
+                            }
+                        }
+                        Key(k, d) => { match (evdev_to_qnum(k), &kbd) {
+                            (Some(q), Some(kb)) => {
+                                let r = if d { kb.press(q).await } else { kb.release(q).await };
+                                if let Err(e) = r { log::error!("key {k}->{q} down={d} ERR {e}"); }
+                            }
+                            (None, _) => log::debug!("key {k}: no qnum mapping, dropped"),
+                            _ => {}
+                        } }
+                    }
+                }
+                // What the guest still has on heads we cannot see.
+                if unseen_at.elapsed() > std::time::Duration::from_secs(1) {
+                    unseen_at = std::time::Instant::now();
+                    let mut w = 0u32;
+                    let mut h = 0u32;
+                    for p in foreign.iter() {
+                        let (fw, fh) = (
+                            p.width().await.unwrap_or(0),
+                            p.height().await.unwrap_or(0),
+                        );
+                        if fw > 0 && fh > 0 {
+                            w += fw;
+                            h = h.max(fh);
+                        }
+                    }
+                    let mut g = shared_out[0].lock().unwrap();
+                    if g.unseen != (w, h) {
+                        log::info!("guest keeps {w}x{h} on heads we do not draw");
+                        g.unseen = (w, h);
+                    }
+                    drop(g);
+                    // Follow the guest's pointer mode. It changes at runtime:
+                    // with a usb-tablet present the PS/2 mouse is current
+                    // until the guest's tablet driver first polls.
+                    if let Some(m) = &mouse {
+                        let rel = matches!(m.is_absolute().await, Ok(false));
+                        let mut g = frame(&shared_out[0]);
+                        if g.pointer_relative != rel || !pointer_mode_logged {
+                            log::info!("guest pointer is {}", if rel { "relative (RelMotion)" } else { "absolute (SetAbsPosition)" });
+                            g.pointer_relative = rel;
+                            pointer_mode_logged = true;
+                        }
+                    }
+                }
+
+                // Block rather than poll: D-Bus costs 24us/event, so a
+                // poll+sleep here dominated the transport by >100x.
+                if !got {
+                    use std::sync::mpsc::RecvTimeoutError::*;
+                    match tokio::task::block_in_place(|| {
+                        rx.recv_timeout(std::time::Duration::from_millis(100))
+                    }) {
+                        Ok(a) => pending.push(a),
+                        Err(Timeout) => {}
+                        // The Vm was dropped, so the only Sender is gone.
+                        // recv_timeout returns Disconnected *immediately*, so
+                        // treating it as a timeout spins this thread on a core
+                        // for the life of the process.
+                        Err(Disconnected) => {
+                            log::info!("guest pump: input channel closed, stopping");
+                            break;
+                        }
+                    }
+                }
+                // QEMU went away: the socket closed or errored. Nothing will
+                // ever arrive again, so end the thread and let reconcile_tabs
+                // rebuild the tab when the guest comes back.
+                if conn.is_closed() {
+                    log::info!("guest pump: display connection closed, stopping");
+                    break;
+                }
+            }
+            mark_all_gone(&shared_out);
+        });
+    });
+    (shared, tx)
+}

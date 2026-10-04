@@ -19,6 +19,15 @@ ENV CARGO_BUILD_TARGET="riscv64gc-unknown-linux-musl"
 # target-$TARGETARCH is a build stage, not an image
 # hadolint ignore=DL3006
 FROM target-$TARGETARCH AS toolchain
+# The gui frontend links against the graphics and input stack: libgbm and
+# libEGL for the scanout, libdrm for KMS, libinput for evdev.
+# hadolint ignore=DL3018
+RUN apk add --no-cache mesa-dev libdrm-dev libinput-dev libxkbcommon-dev eudev-dev pkgconf
+# Link dynamically against musl. The Rust musl target defaults to a static
+# binary, and there is no static libgbm or libinput to link against - mesa does
+# not ship one - so a static build fails with "library not found: gbm". The
+# shared libraries are installed into the runtime image below.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN echo "Cargo target: $CARGO_BUILD_TARGET"
 
 FROM toolchain AS planer
@@ -53,9 +62,47 @@ RUN cp "/app/target/$CARGO_BUILD_TARGET/release/monitor" /app/target/
 RUN awk -F'"' '/^version = / {print $2; exit}' Cargo.toml > /app/monitor-version.txt
 
 
+FROM lfedge/eve-mesa:b834a0cffbd661686550be6390f60933f1d22996 AS mesa
+
 FROM lfedge/eve-alpine:080e2b4c683508649d72d2ae9b166153d819ca5d AS runtime
-ENV PKGS="kbd pciutils usbutils"
+# Mesa comes from pkg/mesa, built without LLVM, for iris (Gen9+ Intel, which
+# the gui frontend's EGL/GBM path drives) plus virgl for EVE running as a VM.
+# Its libraries need libdrm, expat, zlib, zstd and libstdc++ from Alpine.
+# libxkbcommon is pulled in through smithay. The release profile's LTO was
+# eliding the reference, so the runtime got away without it; any build that
+# does not do whole-program LTO - the quick profile, for one - leaves a real
+# DT_NEEDED on libxkbcommon.so.0 and the console dies at startup with a
+# missing shared library. Ship it rather than depend on an optimisation to
+# make the dependency disappear.
+ENV PKGS="kbd pciutils usbutils libdrm libexpat zlib zstd-libs libstdc++ libinput-libs libxkbcommon eudev-libs"
 RUN eve-alpine-deploy.sh
+
+# The Mesa runtime, and only the parts the console uses: libgallium, GBM and
+# the dri_gbm backend libgbm loads through GBM_BACKENDS_PATH, glvnd's EGL and
+# GLES dispatch, Mesa's EGL vendor library, the JSON that makes glvnd find it
+# (without it libEGL.so.1 loads and reports no display), and driconf defaults.
+COPY --from=mesa /usr/ /mesa/usr/
+RUN cp -a /mesa/usr/lib/libgallium-*.so /mesa/usr/lib/libgbm.so.* /mesa/usr/lib/libEGL.so.* \
+          /mesa/usr/lib/libEGL_mesa.so.* /mesa/usr/lib/libGLESv2.so.* \
+          /mesa/usr/lib/libGLdispatch.so.* /out/usr/lib/ && \
+    mkdir -p /out/usr/lib/gbm /out/usr/share && \
+    cp -a /mesa/usr/lib/gbm/dri_gbm.so /out/usr/lib/gbm/ && \
+    cp -a /mesa/usr/share/glvnd /mesa/usr/share/drirc.d /out/usr/share/
+
+# The stage below copies /out/usr/lib (and part of /out/usr/share) wholesale,
+# so anything a package drags in ships. Each removal here was checked against
+# the actual link closure of the binaries we run plus the libraries mesa
+# dlopens - not guessed from names.
+#
+# NOT removed, though it looks unused: usr/share/hwdata/pci.ids, which
+# libpciaccess (lspci) reads at run time.
+RUN set -e; \
+    # apk's library has no business in a runtime image, and it is the only
+    # thing here that pulls in the TLS stack.
+    rm -f /out/usr/lib/libapk.so.* /out/usr/lib/libcrypto.so.* /out/usr/lib/libssl.so.*; \
+    rm -rf /out/usr/lib/engines-3 /out/usr/lib/ossl-modules; \
+    # libdrm's per-vendor helpers: pkg/mesa's libgallium links libdrm.so.2 only.
+    rm -f /out/usr/lib/libdrm_*.so*
 
 # Register the monitor TUI in the APK DB (mandatory for SBOM inclusion). The
 # version comes from the crate manifest (Cargo.toml) — the single source of
@@ -70,6 +117,18 @@ COPY --from=runtime /out/bin/dmesg /usr/bin/dmesg
 COPY --from=runtime /out/usr/bin/lsusb /usr/bin/lsusb
 COPY --from=runtime /out/usr/bin/lspci /usr/bin/lspci
 COPY --from=runtime /out/usr/share/keymaps/xkb/us.map.gz /usr/share/keymaps/xkb/us.map.gz
+# libpciaccess (mesa) reads this at run time; see the prune block above.
+COPY --from=runtime /out/usr/share/hwdata /usr/share/hwdata
+# libinput reads its device-quirks data at runtime and complains loudly
+# ("failed to find data files") without it. The quirks are part of
+# libinput-libs, alongside the shared library - the separate libinput package
+# is the CLI tools, ships nothing under /usr/share, and is not in the
+# eve-alpine mirror anyway. Taking both from one package is also what keeps
+# them in step: a quirks file from a newer libinput than the .so on the
+# device makes the parser reject the whole set.
+COPY --from=runtime /out/usr/share/libinput /usr/share/libinput
+COPY --from=runtime /out/usr/share/glvnd /usr/share/glvnd
+COPY --from=runtime /out/usr/share/drirc.d /usr/share/drirc.d
 COPY --from=runtime /out/lib /lib
 COPY --from=runtime /out/usr/lib /usr/lib
 

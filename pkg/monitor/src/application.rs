@@ -24,25 +24,47 @@ use log::LevelFilter;
 use log::{debug, info, trace, warn};
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{FutureExt, StreamExt};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::ipc::ipc_client::IpcClient;
 use crate::ipc::message::{IpcMessage, Request};
 use crate::ipc::monitorapi::{IpMode, SetInterfaceConfig, StaticIpConfig, RevertManualConfig};
 use crate::terminal::TerminalWrapper;
 use crate::ui::action::{Action, UiActions};
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// Graphical-console settings, persisted in the same config.json the TUI
+/// already uses. Everything here is optional so an existing config that
+/// predates the gui frontend still loads unchanged.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct GuiConfig {
+    /// Pin the DRM mode, e.g. "1920x1080". Unset means choose automatically:
+    /// the connector's preferred mode when it has an EDID to express one, and
+    /// the largest mode offered when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Read the blitted guest image back each probe interval and count its
+    /// non-black pixels. The only way to tell "the guest sent us nothing"
+    /// from "we lost the pixels" once the scanout is a dmabuf, because QMP
+    /// `screendump` answers "no surface" on that path. Off by default: it is
+    /// a full GPU readback and it stalls the pipeline.
+    #[serde(default)]
+    pub probe: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
     #[serde(skip)]
     config_path: PathBuf,
     pub log_level: String,
+    #[serde(default)]
+    pub gui: GuiConfig,
 }
 
 impl AppConfig {
@@ -53,6 +75,7 @@ impl AppConfig {
         Self {
             config_path: path.as_ref().to_path_buf(),
             log_level: "info".to_string(),
+            gui: GuiConfig::default(),
         }
     }
 
@@ -88,12 +111,17 @@ impl AppConfig {
     }
 }
 
-pub struct Application {
+pub struct Application<'a> {
     terminal_rx: UnboundedReceiver<Event>,
     terminal_tx: UnboundedSender<Event>,
     action_rx: UnboundedReceiver<Action>,
     action_tx: UnboundedSender<Action>,
-    ipc_tx: Option<UnboundedSender<IpcMessage>>,
+    // The single pillar connection is owned by main.rs (see crate::ipc) and
+    // survives a switch to the GUI and back; this frontend only borrows its
+    // receiving end for as long as it is the one running, so main.rs gets it
+    // back - unbroken, not re-created - the next time the TUI runs.
+    ipc_rx: &'a mut Receiver<IpcMessage>,
+    ipc_tx: UnboundedSender<IpcMessage>,
     ui: Ui,
     // this is our model :)
     model: Rc<Model>,
@@ -103,8 +131,12 @@ pub struct Application {
     config: AppConfig,
 }
 
-impl Application {
-    pub fn new(config: AppConfig) -> Result<Self> {
+impl<'a> Application<'a> {
+    pub fn new(
+        config: AppConfig,
+        ipc_rx: &'a mut Receiver<IpcMessage>,
+        ipc_tx: UnboundedSender<IpcMessage>,
+    ) -> Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel::<Event>();
         let terminal = TerminalWrapper::open_terminal()?;
@@ -120,7 +152,8 @@ impl Application {
             action_rx,
             action_tx,
             ui,
-            ipc_tx: None,
+            ipc_rx,
+            ipc_tx,
             model,
             pending_requests,
             config,
@@ -137,30 +170,18 @@ impl Application {
             );
             return;
         }
-        if let Some(ipc_tx) = &self.ipc_tx {
-            if let IpcMessage::Request { request, id } = &msg {
-                debug!("Pending response for: {:?}", request);
-                self.pending_requests.insert(*id, Rc::new(handle_response));
-            }
-
-            match ipc_tx.send(msg) {
-                Ok(_) => {
-                    debug!("Sent IPC message");
-                }
-                Err(e) => {
-                    error!("Error sending IPC message: {:?}", e);
-                }
-            }
+        if let IpcMessage::Request { request, id } = &msg {
+            debug!("Pending response for: {:?}", request);
+            self.pending_requests.insert(*id, Rc::new(handle_response));
         }
-    }
 
-    fn get_socket_path() -> String {
-        // try to get XDG_RUNTIME_DIR first if we run a standalone app on development host
-        if let Ok(xdg_runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            format!("{}/monitor.sock", xdg_runtime_dir)
-        } else {
-            // EVE path
-            "/run/monitor.sock".to_string()
+        match self.ipc_tx.send(msg) {
+            Ok(_) => {
+                debug!("Sent IPC message");
+            }
+            Err(e) => {
+                error!("Error sending IPC message: {:?}", e);
+            }
         }
     }
 
@@ -240,7 +261,7 @@ impl Application {
                         warn!("Invalid log level: {}", e);
                     },
                     |log_level| {
-                        log::set_max_level(log_level);
+                        crate::gui::logger::set_ours(log_level);
                         info!("Log level set to: {:?}", log::max_level());
                     },
                 );
@@ -329,7 +350,7 @@ impl Application {
         let cancel_token = CancellationToken::new();
         let cancel_token_child = cancel_token.clone();
         let (dmesg_tx, dmesg_rx) = mpsc::unbounded_channel::<rmesg::entry::Entry>();
-        let is_desktop = Application::is_desktop();
+        let is_desktop = Self::is_desktop();
 
         let kmsg_task: JoinHandle<Result<()>> = tokio::spawn(async move {
             if is_desktop {
@@ -410,130 +431,6 @@ impl Application {
         (timer_task, cancellation_token, timer_rx)
     }
 
-    fn create_ipc_task(
-        &mut self,
-    ) -> (
-        JoinHandle<()>,
-        CancellationToken,
-        UnboundedReceiver<IpcMessage>,
-    ) {
-        let (ipc_tx, ipc_rx) = mpsc::unbounded_channel::<IpcMessage>();
-        let (ipc_cmd_tx, mut ipc_cmd_rx) = mpsc::unbounded_channel::<IpcMessage>();
-        let ipc_cancel_token = CancellationToken::new();
-        let ipc_cancel_token_clone = ipc_cancel_token.clone();
-        self.ipc_tx = Some(ipc_cmd_tx);
-
-        let ipc_task = tokio::spawn(async move {
-            let socket_path = Application::get_socket_path();
-            let mut has_connected = false;
-
-            loop {
-                if ipc_cancel_token_clone.is_cancelled() {
-                    info!("IPC task was cancelled before connect attempt");
-                    return;
-                }
-
-                ipc_tx.send(IpcMessage::Connecting).unwrap();
-                info!("Connecting to IPC socket {} ", &socket_path);
-
-                let stream = match IpcClient::connect(&socket_path).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!("Failed to connect to IPC socket: {}", e);
-                        ipc_tx
-                            .send(if has_connected {
-                                IpcMessage::ConnectionLost
-                            } else {
-                                IpcMessage::ConnectionFailed
-                            })
-                            .unwrap();
-                        // Wait before retrying, but respect cancellation
-                        tokio::select! {
-                            _ = ipc_cancel_token_clone.cancelled() => {
-                                info!("IPC task was cancelled while waiting to retry");
-                                return;
-                            }
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-                        }
-                        continue;
-                    }
-                };
-
-                let (mut sink, mut stream) = stream.split();
-                info!("IPC connection established");
-                has_connected = true;
-                ipc_tx.send(IpcMessage::Ready).unwrap();
-
-                // Drain any stale commands that were queued while disconnected
-                while ipc_cmd_rx.try_recv().is_ok() {}
-
-                let disconnected = loop {
-                    if ipc_cancel_token_clone.is_cancelled() {
-                        info!("IPC task was cancelled");
-                        return;
-                    }
-
-                    let ipc_event = stream.next().fuse();
-
-                    tokio::select! {
-                        _ = ipc_cancel_token_clone.cancelled() => {
-                            info!("IPC task was cancelled");
-                            return;
-                        }
-                        msg = ipc_cmd_rx.recv() => {
-                            match msg {
-                                Some(msg) => {
-                                    if let Err(e) = sink.send(msg.into()).await {
-                                        warn!("Error sending IPC message: {:?}", e);
-                                        break true;
-                                    }
-                                }
-                                None => {
-                                    warn!("IPC command channel closed");
-                                    break false;
-                                }
-                            }
-                        },
-                        msg = ipc_event => {
-                            match msg {
-                                Some(Ok(msg)) => {
-                                    ipc_tx.send(IpcMessage::from(msg)).unwrap();
-                                }
-                                Some(Err(e)) => {
-                                    warn!("Error reading IPC message: {:?}", e);
-                                    break true;
-                                }
-                                None => {
-                                    warn!("IPC message stream ended (server closed connection)");
-                                    break true;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                if disconnected {
-                    warn!("IPC connection lost, will retry...");
-                    ipc_tx.send(IpcMessage::ConnectionLost).unwrap();
-                    // Brief pause before reconnecting
-                    tokio::select! {
-                        _ = ipc_cancel_token_clone.cancelled() => {
-                            info!("IPC task was cancelled while waiting to reconnect");
-                            return;
-                        }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-                    }
-                    // Loop back to reconnect
-                } else {
-                    // Command channel closed — application is shutting down
-                    return;
-                }
-            }
-        });
-
-        (ipc_task, ipc_cancel_token, ipc_rx)
-    }
-
     fn create_terminal_task(&mut self) -> (JoinHandle<()>, CancellationToken) {
         let mut terminal_event_stream = TerminalWrapper::get_stream();
         let terminal_tx_clone = self.terminal_tx.clone();
@@ -551,10 +448,15 @@ impl Application {
                     event = terminal_event => {
                         match event {
                             Some(Ok(crossterm::event::Event::Key(key))) => {
-                                terminal_tx_clone.send(Event::Key(key)).unwrap();
+                                // The receiver (owned by `Application`) outlives this
+                                // task in the ordinary shutdown path (cancel, then
+                                // join, then drop `self`), but this task must never
+                                // panic a switch on a race instead of just dropping
+                                // one stale event.
+                                let _ = terminal_tx_clone.send(Event::Key(key));
                             }
                             Some(Ok(crossterm::event::Event::Resize(w, h))) => {
-                                terminal_tx_clone.send(Event::TerminalResize(w,h)).unwrap();
+                                let _ = terminal_tx_clone.send(Event::TerminalResize(w,h));
                             }
                             Some(Ok(_)) => {}
                             Some(Err(e)) => {
@@ -572,11 +474,15 @@ impl Application {
         (terminal_task, terminal_cancel_token)
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        let (ipc_task, ipc_cancellation_token, mut ipc_rx) = self.create_ipc_task();
-
-        // TODO: handle suspend/resume for the case when we give away /dev/tty
-        // because we passed through the GPU to a guest VM
+    /// Run until the user quits or `switch` fires - e.g. pillar has given the
+    /// GPU back to the console and `main` wants this to hand off to the GUI.
+    /// `switch` drives the same `app_cancel_token` the Quit action already
+    /// uses, so a switch tears everything down exactly like a normal quit:
+    /// this is the suspend/resume this loop used to have no answer for when
+    /// the GPU was passed through to a guest.
+    pub async fn run(&mut self, switch: CancellationToken) -> Result<()> {
+        // The pillar connection itself is owned by main.rs (see crate::ipc);
+        // self.ipc_rx/self.ipc_tx are just this frontend's ends of it.
         let (terminal_task, terminal_cancel_token) = self.create_terminal_task();
 
         // spawn a timer to send tick events
@@ -602,6 +508,10 @@ impl Application {
                 _ = app_cancel_token.cancelled() => {
                     info!("Application cancelled");
                     break;
+                }
+                _ = switch.cancelled() => {
+                    info!("Switch requested; handing the console back");
+                    app_cancel_token.cancel();
                 }
                 tick = timer_rx.recv() => {
                     match tick {
@@ -638,7 +548,7 @@ impl Application {
                     }
 
                 }
-                ipc_event = ipc_rx.recv() => {
+                ipc_event = self.ipc_rx.recv() => {
                     match ipc_event {
                         Some(msg) => {
                             // handle IPC message
@@ -693,16 +603,12 @@ impl Application {
         timer_cancellation_token.cancel();
         kmsg_cancellation_token.cancel();
         terminal_cancel_token.cancel();
-        ipc_cancellation_token.cancel();
         info!("Waiting for tasks to finish");
         let _ = kmsg_task.await;
         info!("Kmsg task ended");
         terminal_task.await?;
         info!("Terminal task ended");
-        //TODO: rewrite the task so we can cancel it
-        ipc_task.abort();
-        _ = ipc_task.await;
-        info!("IPC task ended");
+        // The pillar connection outlives this frontend; main.rs owns it.
         timer_task.await?;
         info!("Timer task ended");
         info!("run() ended");
@@ -802,5 +708,37 @@ impl Application {
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// A config.json written before the gui frontend existed has no "gui" key
+    /// at all. It must still load, with the mode unset, or an upgrade would
+    /// drop the operator's log level and start from defaults.
+    #[test]
+    fn a_config_without_the_gui_section_still_loads() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"log_level":"debug"}"#).unwrap();
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.gui.mode, None);
+    }
+
+    /// And one that pins a mode round-trips it.
+    #[test]
+    fn a_pinned_mode_is_read_back() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"log_level":"info","gui":{"mode":"1920x1080"}}"#).unwrap();
+        assert_eq!(cfg.gui.mode.as_deref(), Some("1920x1080"));
+    }
+
+    /// An unset mode is not written back as an explicit null, so the file stays
+    /// readable by a build that predates this field.
+    #[test]
+    fn an_unset_mode_is_not_serialised() {
+        let cfg = AppConfig::new("/tmp/does-not-matter");
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("mode"), "got {json}");
     }
 }
