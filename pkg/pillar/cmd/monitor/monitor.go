@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,8 +38,13 @@ type monitor struct {
 
 	subscriptions       map[string]pubsub.Subscription
 	pubDevicePortConfig pubsub.Publication
+	pubGPUConsoleStatus pubsub.Publication
 	clientConnected     chan bool
 	serverNameAndPort   string
+	// subsActivated guards Activate(): it starts a watcher goroutine per
+	// subscription and is not idempotent, so calling it once per client
+	// connection leaks an inotify watcher every time.
+	subsActivated bool
 
 	// latest of each input feeding the aggregated DeviceStatus snapshot
 	lastOnboarding   types.OnboardingStatus
@@ -50,6 +56,14 @@ type monitor struct {
 	// lastDPCList is the device's current port config, used as the base the
 	// write path (SetInterfaceConfig) patches.
 	lastDPCList *types.DevicePortConfigList
+
+	// pendingGPURequestID is the RequestID of the last GPUConsoleConfig
+	// forwarded to an attached console. GPUAck (console -> pillar) only
+	// echoes Domain, not the ID, so handleGPUAck stamps this remembered
+	// value onto the status it publishes. Written from the pubsub dispatch
+	// goroutine (handleGPUConsoleConfig), read from the IPC server's
+	// connection goroutine (handleGPUAck) - hence atomic.
+	pendingGPURequestID atomic.Uint64
 
 	IPCServer *monitorIPCServer
 }

@@ -95,6 +95,14 @@ func handleAppInstanceStatusUpdate(_ interface{}, ctxArg interface{}) {
 	ctx.sendAppsList()
 }
 
+func handleAssignableAdaptersCreate(ctxArg interface{}, _ string, _ interface{}) {
+	ctxArg.(*monitor).sendAppsList()
+}
+
+func handleAssignableAdaptersModify(ctxArg interface{}, _ string, _ interface{}, _ interface{}) {
+	ctxArg.(*monitor).sendAppsList()
+}
+
 func handleOnboardingStatusCreate(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	handleOnboardingStatusUpdate(statusArg, ctxArg)
@@ -126,6 +134,22 @@ func handleOnboardingStatusUpdate(statusArg interface{}, ctxArg interface{}) {
 	ctx := ctxArg.(*monitor)
 	ctx.lastOnboarding = statusArg.(types.OnboardingStatus)
 	ctx.sendDeviceStatus()
+}
+
+func handleGPUConsoleConfigCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleGPUConsoleConfigUpdate(statusArg, ctxArg)
+}
+
+func handleGPUConsoleConfigModify(ctxArg interface{}, key string,
+	statusArg interface{}, _ interface{}) {
+	handleGPUConsoleConfigUpdate(statusArg, ctxArg)
+}
+
+func handleGPUConsoleConfigUpdate(statusArg interface{}, ctxArg interface{}) {
+	cfg := statusArg.(types.GPUConsoleConfig)
+	ctx := ctxArg.(*monitor)
+	ctx.handleGPUConsoleConfig(cfg)
 }
 
 func handleVaultStatusCreate(ctxArg interface{}, key string,
@@ -223,6 +247,32 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 	}
 	if err = ctx.pubDevicePortConfig.ClearRestarted(); err != nil {
 		log.Error("Cannot clear restarted for DevicePortConfig publication")
+		return err
+	}
+
+	ctx.pubGPUConsoleStatus, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.GPUConsoleStatus{},
+		})
+	if err != nil {
+		log.Error("Cannot create GPUConsoleStatus publication")
+		return err
+	}
+
+	subGPUConsoleConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "domainmgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.GPUConsoleConfig{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleGPUConsoleConfigCreate,
+		ModifyHandler: handleGPUConsoleConfigModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for GPUConsoleConfig")
 		return err
 	}
 
@@ -377,6 +427,26 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 		return err
 	}
 
+	// Which adapters are virtual GPUs, so AppsList reports a QMP socket only
+	// for an app with a display behind it.
+	subAssignableAdapters, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "domainmgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.AssignableAdapters{},
+		Activate:      false,
+		Ctx:           ctx,
+		CreateHandler: handleAssignableAdaptersCreate,
+		ModifyHandler: handleAssignableAdaptersModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Error("Cannot create subscription for AssignableAdapters")
+		return err
+	}
+
+	ctx.subscriptions["GPUConsoleConfig"] = subGPUConsoleConfig
+	ctx.subscriptions["AssignableAdapters"] = subAssignableAdapters
 	ctx.subscriptions["VaultStatus"] = subVaultStatus
 	ctx.subscriptions["OnboardingStatus"] = subOnboardStatus
 	ctx.subscriptions["NetworkStatus"] = subDeviceNetworkStatus
@@ -390,17 +460,40 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 }
 
 func (ctx *monitor) handleClientConnected() {
-	// go over all the subscriptions and process the current state
-	log.Noticef("Client connected. Activating subscriptions")
+	log.Noticef("Client connected")
 
+	// A new client needs the current state, every time. Everything below is
+	// pushed from a pubsub handler the rest of the time, so a console that
+	// connects between changes - which is every console restart on an idle
+	// device - would otherwise show an empty node page until something
+	// upstream happened to change.
+	//
+	// sendDeviceStatus dedups against the last snapshot it sent, and that
+	// dedup is for the change-driven path only: a reconnecting client holds
+	// no state, so the snapshot it needs is by definition "changed" for it.
+	// Clear the dedup first or the resend below is silently dropped.
+	ctx.lastDeviceStatus = nil
 	ctx.sendDeviceStatus()
 	ctx.sendAppsList()
+	ctx.sendNetworkStatus()
 
+	// Activating, on the other hand, happens once for the life of the agent.
+	// Subscription.Activate() ends in Subscriber.Start(), which spawns a fresh
+	// watch.WatchStatus goroutine - and so a fresh inotify watcher - without
+	// stopping the previous one. Doing that per connection leaks a descriptor
+	// per subscription per connect, and a client that reconnects on a timer
+	// walks the agent into "too many open files: NewWatcher". The agent then
+	// dies and the watchdog reboots the device, which is what it did here: a
+	// console reconnecting every two seconds rebooted the box in a loop.
+	if ctx.subsActivated {
+		return
+	}
 	for _, sub := range ctx.subscriptions {
 		if err := sub.Activate(); err != nil {
 			log.Errorf("Failed to activate subscription %s", err)
 		}
 	}
+	ctx.subsActivated = true
 }
 
 func (ctx *monitor) process(ps *pubsub.PubSub) {

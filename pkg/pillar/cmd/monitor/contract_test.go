@@ -5,10 +5,13 @@ package monitor
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/types/monitorapi"
+	uuid "github.com/satori/go.uuid"
 )
 
 func TestDeviceNetworkStatusToContract_NestsVLANs(t *testing.T) {
@@ -98,5 +101,112 @@ func TestProxyToContract_ManualByScheme(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected ProxyManual, got %T", p)
+	}
+}
+
+// A name is not a monitor. Under Xen, or for an instance that never got a
+// QEMU, the reconstructed path does not exist; reporting it anyway has the
+// console dial a socket that can never answer, once per app, forever.
+//
+// These call qmpSocketAt against qmpKvmStateDir - the production constant -
+// rather than the deleted qmpSocketFor wrapper, so they exercise the same
+// path appsListToContract actually runs.
+func TestQmpSocketAtOnlyReportsAPathThatExists(t *testing.T) {
+	if got := qmpSocketAt(qmpKvmStateDir, "", true); got != "" {
+		t.Errorf("no domain name should report no socket, got %q", got)
+	}
+	if got := qmpSocketAt(qmpKvmStateDir, "6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1", true); got != "" {
+		t.Errorf("a domain with no socket on disk should report none, got %q", got)
+	}
+}
+
+// An app with no virtual GPU has no display behind its QMP socket, so the
+// console must not be told to dial it.
+func TestQMPSocketOnlyForVirtualGPUApps(t *testing.T) {
+	if got := qmpSocketAt(qmpKvmStateDir, "vm1.1.1", false); got != "" {
+		t.Errorf("an app without a virtual GPU must report no socket, got %q", got)
+	}
+}
+
+// The positive case: an app that does have a virtual GPU, and whose socket
+// exists on disk, must still be reported so the console can dial it. Without
+// this, an implementation that ignored hasVirtualGPU entirely (or always
+// returned "") would pass every other test in this file.
+func TestQMPSocketReportedForVirtualGPUAppWithSocket(t *testing.T) {
+	domainName := "6ba7b810-9dad-11d1-80b4-00c04fd430c8.1.1"
+	dir := filepath.Join(t.TempDir(), domainName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sock := filepath.Join(dir, "qmp")
+	if err := os.WriteFile(sock, nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if got := qmpSocketAt(filepath.Dir(dir), domainName, true); got != sock {
+		t.Errorf("expected %q, got %q", sock, got)
+	}
+}
+
+// appsListToContract itself - not just qmpSocketAt - must decide from the
+// app's adapters: only an app holding a virtual GPU has a display behind
+// its QMP socket. The qmpSocketAt tests above pass that decision in by hand.
+func appInstanceWithAdapter(uuidStr, domainName, adapter string) types.AppInstanceStatus {
+	appUUID, err := uuid.FromString(uuidStr)
+	if err != nil {
+		panic(err)
+	}
+	var a types.AppInstanceStatus
+	a.UUIDandVersion.UUID = appUUID
+	a.DomainName = domainName
+	a.IoAdapterList = []types.IoAdapter{{Type: types.IoHDMI, Name: adapter}}
+	return a
+}
+
+// gpuAdapters has the two kinds of display adapter a model can describe: the
+// iGPU, which is passed through, and a virtual GPU, which has no address.
+func gpuAdapters() *types.AssignableAdapters {
+	return &types.AssignableAdapters{IoBundleList: []types.IoBundle{
+		{Type: types.IoHDMI, Phylabel: "VGA", Logicallabel: "VGA", AssignmentGroup: "VGA", PciLong: "0000:00:02.0"},
+		{Type: types.IoHDMI, Phylabel: "VGPU", Logicallabel: "VGPU", AssignmentGroup: "vgpu"},
+	}}
+}
+
+func qmpSocketIn(t *testing.T, domainName string) (dir, sock string) {
+	dir = t.TempDir()
+	sockDir := filepath.Join(dir, domainName)
+	if err := os.MkdirAll(sockDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sock = filepath.Join(sockDir, "qmp")
+	if err := os.WriteFile(sock, nil, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return dir, sock
+}
+
+func TestAppsListToContractReportsSocketForVirtualGPUApp(t *testing.T) {
+	const appUUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	domainName := appUUID + ".1.1"
+	qmpDir, sock := qmpSocketIn(t, domainName)
+
+	apps := []types.AppInstanceStatus{appInstanceWithAdapter(appUUID, domainName, "VGPU")}
+	got := appsListToContractAt(apps, gpuAdapters(), qmpDir)
+	if len(got.Instances) != 1 || got.Instances[0].QMPSocket != sock {
+		t.Fatalf("expected socket %q reported, got %+v", sock, got.Instances)
+	}
+}
+
+// An app with the iGPU passed through drives a real display of its own and
+// has nothing for the console to show, socket or not.
+func TestAppsListToContractNoSocketForPassthroughGPU(t *testing.T) {
+	const appUUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	domainName := appUUID + ".1.1"
+	qmpDir, _ := qmpSocketIn(t, domainName)
+
+	apps := []types.AppInstanceStatus{appInstanceWithAdapter(appUUID, domainName, "VGA")}
+	got := appsListToContractAt(apps, gpuAdapters(), qmpDir)
+	if len(got.Instances) != 1 || got.Instances[0].QMPSocket != "" {
+		t.Fatalf("a passthrough app must report no socket, got %+v", got.Instances)
 	}
 }

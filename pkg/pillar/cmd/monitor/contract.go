@@ -15,6 +15,8 @@ package monitor
 import (
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,18 +50,71 @@ func deviceStatusToContract(server string, ob types.OnboardingStatus, enInfo typ
 	}
 }
 
-func appsListToContract(apps []types.AppInstanceStatus) monitorapi.AppsList {
+// qmpKvmStateDir mirrors hypervisor.kvmStateDir, which is not imported
+// directly because importing hypervisor here would pull kvm, xen and
+// containerd into an agent that is deliberately dependency-lean. Keep in step
+// with kvmStateDir in hypervisor/kvm.go.
+const qmpKvmStateDir = "/run/hypervisor/kvm"
+
+// qmpSocketAt has the kvm state directory as a parameter so tests can point
+// it elsewhere; appsListToContract (the only production caller, via
+// appsListToContractAt) always passes qmpKvmStateDir.
+//
+// The path is reported only if the app has a virtual GPU behind it and the
+// socket exists. A name alone says nothing about whether the instance has a
+// monitor to reach: under Xen there is none, a container's shim VM has no
+// display behind it, and an app with no GPU at all - the common case - has
+// nothing for the console to show even when QEMU is running. Reporting a
+// socket regardless would have the console dial one that can never answer,
+// for every such app, for the life of the device.
+func qmpSocketAt(dir, domainName string, hasVirtualGPU bool) string {
+	if domainName == "" || !hasVirtualGPU {
+		return ""
+	}
+	sock := filepath.Join(dir, domainName, "qmp")
+	if _, err := os.Stat(sock); err != nil {
+		return ""
+	}
+	return sock
+}
+
+// appsListToContract is appsListToContractAt against the production kvm
+// state directory.
+func appsListToContract(apps []types.AppInstanceStatus, aa *types.AssignableAdapters) monitorapi.AppsList {
+	return appsListToContractAt(apps, aa, qmpKvmStateDir)
+}
+
+// appsListToContractAt is appsListToContract with the kvm state directory
+// overridable for tests.
+func appsListToContractAt(apps []types.AppInstanceStatus, aa *types.AssignableAdapters, qmpDir string) monitorapi.AppsList {
 	out := monitorapi.AppsList{Instances: make([]monitorapi.AppInstance, 0, len(apps))}
 	for _, a := range apps {
 		out.Instances = append(out.Instances, monitorapi.AppInstance{
-			UUID:    a.UUIDandVersion.UUID,
-			Name:    a.DisplayName,
-			Version: a.UUIDandVersion.Version,
-			State:   swStateToContract(a.State),
-			Error:   a.ErrorAndTimeWithSource.Error,
+			UUID:      a.UUIDandVersion.UUID,
+			Name:      a.DisplayName,
+			Version:   a.UUIDandVersion.Version,
+			State:     swStateToContract(a.State),
+			Error:     a.ErrorAndTimeWithSource.Error,
+			QMPSocket: qmpSocketAt(qmpDir, a.DomainName, holdsVirtualGPU(a.IoAdapterList, aa)),
 		})
 	}
 	return out
+}
+
+// holdsVirtualGPU reports whether any of adapters is a virtual GPU, the
+// only kind of app with a display for the console to show.
+func holdsVirtualGPU(adapters []types.IoAdapter, aa *types.AssignableAdapters) bool {
+	if aa == nil {
+		return false
+	}
+	for _, adapter := range adapters {
+		for _, ib := range aa.LookupIoBundleAny(adapter.Name) {
+			if ib != nil && ib.IsVirtualGPU() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func swStateToContract(s types.SwState) monitorapi.SwState {

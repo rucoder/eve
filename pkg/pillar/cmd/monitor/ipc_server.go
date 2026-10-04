@@ -50,7 +50,7 @@ func (r *request) validate() error {
 	}
 	// check supported request types
 	switch r.RequestType {
-	case "SetInterfaceConfig", "SetServer", "RevertManualConfig":
+	case "SetInterfaceConfig", "SetServer", "RevertManualConfig", monitorapi.GPUAckTag:
 	default:
 		return errors.New("Unsupported RequestType " + r.RequestType)
 	}
@@ -88,6 +88,13 @@ func newIPCServer(ctx *monitor) *monitorIPCServer {
 
 func (s *monitorIPCServer) c() chan bool {
 	return s.clientConnected
+}
+
+// hasClient reports whether a console is currently connected.
+func (s *monitorIPCServer) hasClient() bool {
+	s.Lock()
+	defer s.Unlock()
+	return s.conn != nil
 }
 
 func (s *monitorIPCServer) handleConnection(conn net.Conn) {
@@ -282,6 +289,14 @@ func (r *request) handleRequest(ctx *monitor) *response {
 		if err := ctx.pubDevicePortConfig.Unpublish(types.ManualDPCKey); err != nil {
 			return r.errResponse("Failed to revert manual network config", err)
 		}
+		return r.okResponse()
+
+	case monitorapi.GPUAckTag:
+		var ack monitorapi.GPUAck
+		if err := json.Unmarshal(r.RequestData, &ack); err != nil {
+			return r.malformedRequestResponse(err)
+		}
+		ctx.handleGPUAck(ack)
 		return r.okResponse()
 
 	default:

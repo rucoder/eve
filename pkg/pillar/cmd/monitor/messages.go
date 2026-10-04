@@ -47,6 +47,24 @@ func (ctx *monitor) sendDeviceStatus() {
 	ctx.IPCServer.sendIpcMessage("DeviceStatus", ds)
 }
 
+// sendNetworkStatus emits the current network snapshot straight from the
+// subscription's cache. handleNetworStatusUpdate only fires on change, so
+// without this a client that connects between changes never learns the
+// network state at all.
+func (ctx *monitor) sendNetworkStatus() {
+	sub, ok := ctx.subscriptions["NetworkStatus"]
+	if !ok || sub == nil {
+		return
+	}
+	for _, item := range sub.GetAll() {
+		status, ok := item.(types.DeviceNetworkStatus)
+		if !ok {
+			continue
+		}
+		ctx.IPCServer.sendIpcMessage("NetworkStatus", deviceNetworkStatusToContract(status))
+	}
+}
+
 func (ctx *monitor) getAppInstancesStatus() []types.AppInstanceStatus {
 	sub := ctx.subscriptions["AppStatus"]
 	items := sub.GetAll()
@@ -58,11 +76,26 @@ func (ctx *monitor) getAppInstancesStatus() []types.AppInstanceStatus {
 	return apps
 }
 
+// assignableAdapters is domainmgr's adapter list, or nil before it has
+// published one.
+func (ctx *monitor) assignableAdapters() *types.AssignableAdapters {
+	sub, ok := ctx.subscriptions["AssignableAdapters"]
+	if !ok || sub == nil {
+		return nil
+	}
+	item, err := sub.Get("global")
+	if err != nil {
+		return nil
+	}
+	aa := item.(types.AssignableAdapters)
+	return &aa
+}
+
 func (ctx *monitor) sendAppsList() {
 	// send the application list to the client
 	// empty list is allowed
 	appStatus := ctx.getAppInstancesStatus()
-	ctx.IPCServer.sendIpcMessage("AppsList", appsListToContract(appStatus))
+	ctx.IPCServer.sendIpcMessage("AppsList", appsListToContract(appStatus, ctx.assignableAdapters()))
 }
 
 func readEfiVars(fsys fs.FS) ([]monitorapi.EFIVariable, error) {
