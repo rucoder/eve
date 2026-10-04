@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Fri, 2 Oct 2026 16:09:04 +0000
+Subject: [PATCH 01/10] hw/isa/lpc_ich9: add x-device-id property to spoof PCH
+ ID
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an x-device-id property on the QEMU ICH9-LPC device that
+overrides the PCI device-ID register at config offset 0x02 when set.
+Default 0 means "leave at class default 0x2918".
+
+Set on the QEMU command line via:
+
+    -global ICH9-LPC.x-device-id=0xa082
+
+Why:  the proprietary IntelGopDriver in OEM firmware (vendor
+option-ROMs we deploy via /persist/vault/gop/<rom>) does PCH
+detection by reading the LPC bridge device ID at PCI 00:1f.0 and
+refuses to bind to the iGPU if the value isn't on its real-hardware
+allow-list.  q35's emulated ICH9 default 0x2918 is never on that
+allow-list, so without this spoof the proprietary GOP path silently
+refuses to initialise and the physical monitor stays dark during
+the UEFI phase.
+
+The OSS path (bundled IgdAssignmentDxe in VfioIgdPkg) does not need
+this — it has no PCH whitelist.  In fact applying the spoof on the
+OSS path actively confuses the Windows display driver on at least
+RPL-P (different PCH ID changes its quirk-table path → tile-mode
+mismatch on scanout), so the kvm.go side that emits this -global
+gates the spoof to only fire when a proprietary GOP ROM is in use.
+
+Implementation:
+
+  - struct ICH9LPCState gains a uint32_t device_id_override.
+  - DEFINE_PROP_UINT32 "x-device-id" exposes it on the QOM type,
+    default 0 (= use class default).
+  - ich9_lpc_realize() applies the override via
+    pci_config_set_device_id() when non-zero, before any other code
+    consults the device-ID field.
+
+Risks: spoofing a PCH that disagrees with QEMU's q35 ACPI tables /
+emulated power-management may upset guest ACPI / SMI / power
+management.  Operator-supplied per-platform — see id.json schema
+on the EVE side.
+
+Rebased onto QEMU 11.1.2.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ hw/isa/lpc_ich9.c             | 6 ++++++
+ include/hw/southbridge/ich9.h | 6 ++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/hw/isa/lpc_ich9.c b/hw/isa/lpc_ich9.c
+index edf9783ec..024c20735 100644
+--- a/hw/isa/lpc_ich9.c
++++ b/hw/isa/lpc_ich9.c
+@@ -712,6 +712,10 @@ static void ich9_lpc_realize(PCIDevice *d, Error **errp)
+     ISABus *isa_bus;
+     uint32_t irq;
+ 
++    if (lpc->device_id_override != 0) {
++        pci_config_set_device_id(d->config, lpc->device_id_override);
++    }
++
+     if ((lpc->smi_host_features & BIT_ULL(ICH9_LPC_SMI_F_CPU_HOT_UNPLUG_BIT)) &&
+         !(lpc->smi_host_features & BIT_ULL(ICH9_LPC_SMI_F_CPU_HOTPLUG_BIT))) {
+         /*
+@@ -845,6 +849,8 @@ static const Property ich9_lpc_properties[] = {
+                      pm.swsmi_timer_enabled, true),
+     DEFINE_PROP_BOOL("x-smi-periodic-timer", ICH9LPCState,
+                      pm.periodic_timer_enabled, true),
++    /* EVE patch 13: spoof a real PCH model; see device_id_override. */
++    DEFINE_PROP_UINT32("x-device-id", ICH9LPCState, device_id_override, 0),
+ };
+ 
+ static void ich9_send_gpe(AcpiDeviceIf *adev, AcpiEventStatusBits ev)
+diff --git a/include/hw/southbridge/ich9.h b/include/hw/southbridge/ich9.h
+index 2c35dd048..81cdf0e1e 100644
+--- a/include/hw/southbridge/ich9.h
++++ b/include/hw/southbridge/ich9.h
+@@ -54,6 +54,12 @@ struct ICH9LPCState {
+     uint8_t rst_cnt;
+     MemoryRegion rst_cnt_mem;
+ 
++    /*
++     * Optional override for the LPC's PCI device ID (x-device-id), to show
++     * the guest a real PCH model. 0 = class default (0x2918).
++     */
++    uint32_t device_id_override;
++
+     /* SMI feature negotiation via fw_cfg */
+     uint64_t smi_host_features;       /* guest-invisible, host endian */
+     uint8_t smi_host_features_le[8];  /* guest-visible, read-only, little

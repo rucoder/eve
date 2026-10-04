@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marc-Andr=C3=A9=20Lureau?= <marcandre.lureau@redhat.com>
+Date: Mon, 24 Aug 2026 13:14:42 +0400
+Subject: [PATCH 09/10] virtio-gpu: disable blob scanouts on mapping cleanup
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a blob resource backing is cleaned up (for ex via detach_backing),
+any scanouts referencing it must be disabled first to prevent the
+dmabuf from outliving its backing memory.
+
+Fixes: CVE-2026-66020
+Fixes: 32db3c63ae11 ("virtio-gpu: Add virtio_gpu_set_scanout_blob")
+Reported-by: Akihiko Odaki <odaki@rsg.ci.i.u-tokyo.ac.jp>
+Reviewed-by: Akihiko Odaki <odaki@rsg.ci.i.u-tokyo.ac.jp>
+Signed-off-by: Marc-André Lureau <marcandre.lureau@redhat.com>
+---
+ hw/display/virtio-gpu.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index f991baf85..d479595dd 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -999,6 +999,16 @@ void virtio_gpu_cleanup_mapping_iov(VirtIOGPU *g,
+ void virtio_gpu_cleanup_mapping(VirtIOGPU *g,
+                                 struct virtio_gpu_simple_resource *res)
+ {
++    if (res->blob) {
++        int i, max_outputs = g->parent_obj.conf.max_outputs;
++
++        for (i = 0; i < max_outputs; i++) {
++            if (g->parent_obj.scanout[i].resource_id == res->resource_id) {
++                virtio_gpu_disable_scanout(g, i);
++            }
++        }
++    }
++
+     virtio_gpu_cleanup_mapping_iov(g, res->iov, res->iov_cnt);
+     res->iov = NULL;
+     res->iov_cnt = 0;

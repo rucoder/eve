@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Fri, 2 Oct 2026 16:10:13 +0000
+Subject: [PATCH 06/10] ui/dbus: let QEMU_DBUS_REFRESH_MS set the GL listener's
+ refresh interval
+
+A GL D-Bus listener showing a 2D console (a virtio-gpu-pci head next to a
+virtio-vga-gl one) does not forward that console's damage as it arrives:
+dbus_gl_gfx_update() accumulates it and dbus_gl_refresh() sends it on the
+GUI refresh timer, GUI_REFRESH_INTERVAL_DEFAULT (30 ms), which the D-Bus
+display never changes. The 2D head is capped at about 33 frames/s.
+
+Measured with a 1080p60 clip in a Windows guest: the guest flushed 42-43
+frames/s and the console received 30-32. With QEMU_DBUS_REFRESH_MS=16 the
+two match.
+
+An environment variable is a stopgap. Upstream, this wants to be a
+-display dbus option, or better, the 2D damage sent from a bottom half as
+it arrives.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ ui/dbus-listener.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/ui/dbus-listener.c b/ui/dbus-listener.c
+index dc7ad0992..f23b9abc3 100644
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -1290,5 +1290,17 @@ dbus_display_listener_new(const char *bus_name,
+ #endif
+     qemu_console_register_listener(con, &ddl->dcl, ops);
+ 
++    /*
++     * A 2D console's damage reaches the listener only on the refresh timer,
++     * and its default (GUI_REFRESH_INTERVAL_DEFAULT, 30 ms) caps that console
++     * at 33 Hz however fast the guest draws. QEMU_DBUS_REFRESH_MS overrides it.
++     */
++    {
++        const char *r = g_getenv("QEMU_DBUS_REFRESH_MS");
++        if (r && atoi(r) > 0) {
++            qemu_console_listener_set_refresh(&ddl->dcl, atoi(r));
++        }
++    }
++
+     return ddl;
+ }

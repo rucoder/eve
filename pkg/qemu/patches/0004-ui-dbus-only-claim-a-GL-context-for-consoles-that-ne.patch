@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Fri, 2 Oct 2026 16:09:55 +0000
+Subject: [PATCH 04/10] ui/dbus: only claim a GL context for consoles that need
+ one
+
+The D-Bus display attaches its GL context to every graphic console it
+finds, whether or not the device behind that console has anything to do
+with GL:
+
+    if (qemu_console_is_graphic(con) && dd->gl_mode != DISPLAY_GL_MODE_OFF)
+        qemu_console_set_display_gl_ctx(con, &dd->glctx);
+
+Only its own listeners are ever compatible with that context
+(dbus_is_compatible_dcl), so once "-display dbus,gl=on" is in use, no
+other display backend can attach to any console of that machine. A VM
+with a virtio-vga-gl head for the D-Bus client and a plain virtio-vga
+head for a VNC server fails to start:
+
+    qemu-system-x86_64: Display vnc is incompatible with the GL context
+
+even though VNC asked for the plain head by name with
+"-vnc :1,display=video1,head=0", and that head's device never requested
+GL.
+
+Devices already state whether they need a GL context: virtio-gpu sets
+GRAPHIC_FLAGS_GL only when virgl is enabled (virtio_gpu_virgl_enabled),
+and console_compatible_with() consumes the same flag to decide whether a
+console *requires* GL. Use it here too, so the D-Bus display takes
+ownership of exactly the consoles that asked for it and leaves the rest
+available to other backends.
+
+The GL head keeps its zero-copy dmabuf scanout; the plain head becomes
+usable by VNC, SPICE or any other listener at the same time.
+
+Rebased onto QEMU 11.1.2.
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ include/ui/console.h |  1 +
+ ui/console.c         | 14 ++++++++++++++
+ ui/dbus.c            |  1 +
+ 3 files changed, 16 insertions(+)
+
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 363495694..4156a3b54 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -369,6 +369,7 @@ QemuConsole *qemu_console_lookup_by_device_name(const char *device_id,
+                                                 uint32_t head, Error **errp);
+ QEMUCursor *qemu_console_get_cursor(QemuConsole *con);
+ bool qemu_console_is_graphic(QemuConsole *con);
++bool qemu_console_requires_gl(QemuConsole *con);
+ bool qemu_console_is_fixedsize(QemuConsole *con);
+ bool qemu_console_is_gl_blocked(QemuConsole *con);
+ char *qemu_console_get_label(QemuConsole *con);
+diff --git a/ui/console.c b/ui/console.c
+index a8a2a247d..14e753213 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1284,6 +1284,20 @@ bool qemu_console_is_graphic(QemuConsole *con)
+     return con && QEMU_IS_GRAPHIC_CONSOLE(con);
+ }
+ 
++/*
++ * Whether the device behind this console needs a GL context to be
++ * displayed at all, as opposed to merely being able to use one. Only a
++ * virtio-gpu with virgl enabled sets GRAPHIC_FLAGS_GL; a plain VGA or
++ * virtio-vga does not.
++ */
++bool qemu_console_requires_gl(QemuConsole *con)
++{
++    if (!con || !con->hw_ops || !con->hw_ops->get_flags) {
++        return false;
++    }
++    return con->hw_ops->get_flags(con->hw) & GRAPHIC_FLAGS_GL;
++}
++
+ bool qemu_console_is_fixedsize(QemuConsole *con)
+ {
+     return con && (QEMU_IS_GRAPHIC_CONSOLE(con) || QEMU_IS_FIXED_TEXT_CONSOLE(con));
+diff --git a/ui/dbus.c b/ui/dbus.c
+index 7be0f8e26..721426027 100644
+--- a/ui/dbus.c
++++ b/ui/dbus.c
+@@ -198,6 +198,7 @@ dbus_display_add_console(DBusDisplay *dd, QemuConsole *con, Error **errp)
+     }
+ 
+     if (qemu_console_is_graphic(con) &&
++        qemu_console_requires_gl(con) &&
+         dd->gl_mode != DISPLAY_GL_MODE_OFF) {
+         qemu_console_set_display_gl_ctx(con, &dd->glctx);
+     }
