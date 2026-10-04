@@ -185,6 +185,36 @@ In this case it would make sense to try with:
     }
 ```
 
+## Virtual GPU
+
+A device with a GPU the host can render on, typically an Intel iGPU, can give
+apps a virtual GPU instead of passing the GPU through. The model describes it
+as an HDMI adapter with no hardware address at all:
+
+```json
+    {
+      "ztype": "IO_TYPE_HDMI",
+      "phylabel": "VGPU",
+      "logicallabel": "VGPU",
+      "assigngrp": "vgpu",
+      "phyaddrs": {}
+    }
+```
+
+An app assigned this adapter gets a GL-accelerated virtio GPU, rendered on the
+host GPU and shown by the graphical console. Unlike any other adapter it is not
+exclusive: any number of apps may hold it at once.
+
+A virtual GPU and a passthrough of the host GPU it renders on (the boot VGA
+device) exclude each other. While any app holds the virtual GPU, an app that
+passes the host GPU through waits with an error, and it starts by itself once
+the last virtual GPU app stops. The same holds the other way round. One app
+cannot hold both.
+
+The host GPU stays with the host driver until an app passes it through,
+whatever `debug.enable.vga` says: that setting only decides whether EVE shows
+its console on the display.
+
 ## Container Device Interface support for GPUs
 
 Some devices, specially those integrated to a System on a Chip (SoC), might require complex setup in order to be exposed

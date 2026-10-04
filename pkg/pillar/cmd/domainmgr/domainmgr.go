@@ -126,9 +126,18 @@ type domainContext struct {
 	pubCipherBlockStatus   pubsub.Publication
 	pubCapabilities        pubsub.Publication
 	subNodeAgentStatus     pubsub.Subscription
-	cipherMetrics          *cipher.AgentMetrics
-	createSema             *sema.Semaphore
-	GCComplete             bool
+	pubGPUConsoleConfig    pubsub.Publication
+	subGPUConsoleStatus    pubsub.Subscription
+	// gpuLock serializes the GPU conflict check with the reservation it
+	// guards: every domain is activated on its own goroutine.
+	gpuLock sync.Mutex
+	// vgpuHolders are the domains holding a virtual GPU, from a successful
+	// reserveAdapters until releaseAdapters. Guarded by vgpuMu, a leaf lock.
+	vgpuMu        sync.Mutex
+	vgpuHolders   map[uuid.UUID]struct{}
+	cipherMetrics *cipher.AgentMetrics
+	createSema    *sema.Semaphore
+	GCComplete    bool
 
 	usbAccess               bool
 	setInitialUsbAccess     bool
@@ -340,6 +349,29 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Fatal(err)
 	}
 	domainCtx.pubCapabilities = capabilitiesInfoPub
+
+	pubGPUConsoleConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.GPUConsoleConfig{},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	domainCtx.pubGPUConsoleConfig = pubGPUConsoleConfig
+
+	subGPUConsoleStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "monitor",
+		MyAgentName: agentName,
+		TopicImpl:   types.GPUConsoleStatus{},
+		Activate:    true,
+		Ctx:         &domainCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	domainCtx.subGPUConsoleStatus = subGPUConsoleStatus
 
 	// Look for nodeagent status
 	subNodeAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -580,6 +612,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case change := <-subZFSPoolStatus.MsgChan():
 			subZFSPoolStatus.ProcessChange(change)
 
+		case change := <-subGPUConsoleStatus.MsgChan():
+			subGPUConsoleStatus.ProcessChange(change)
+
 		case <-domainCtx.publishTicker.C:
 			publishProcessesHandler(&domainCtx)
 
@@ -802,6 +837,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 		case change := <-subZFSPoolStatus.MsgChan():
 			subZFSPoolStatus.ProcessChange(change)
+
+		case change := <-subGPUConsoleStatus.MsgChan():
+			subGPUConsoleStatus.ProcessChange(change)
 
 		case change := <-subPhysicalIOAdapter.MsgChan():
 			subPhysicalIOAdapter.ProcessChange(change)
@@ -1726,6 +1764,7 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 	publishAssignableAdapters := false
 	var assignmentsPci []string
 	var assignmentsUsb []string
+	hasBootVga := false
 	for _, adapter := range config.IoAdapterList {
 		log.Functionf("doAssignIoAdaptersToDomain processing adapter %d %s",
 			adapter.Type, adapter.Name)
@@ -1743,6 +1782,11 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 			}
 			log.Functionf("doAssignIoAdaptersToDomain processing adapter %d %s phylabel %s",
 				adapter.Type, adapter.Name, ib.Phylabel)
+			if ib.IsVirtualGPU() {
+				// Never reserved and nothing to assign: the hypervisor gives
+				// the domain a virtio GPU for it.
+				continue
+			}
 			if ib.UsedByUUID != config.UUIDandVersion.UUID {
 				log.Fatalf("doAssignIoAdaptersToDomain IoBundle stolen by %s: %d %s for %s",
 					ib.UsedByUUID, adapter.Type, adapter.Name,
@@ -1807,41 +1851,66 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 				log.Noticef("doAssignIoAdaptersToDomain: skip PCI assign for NOHYPE IoNetEth %s (%s)",
 					ib.Phylabel, ib.PciLong)
 			} else if ib.PciLong != "" && !ib.IsPCIBack {
+				isBoot := isBootVGA(ib)
 				log.Functionf("Assigning %s (%s) to %s",
 					ib.Phylabel, ib.PciLong, status.DomainName)
 				assignmentsPci = addNoDuplicate(assignmentsPci, ib.PciLong)
 				ib.IsPCIBack = true
+				if isBoot {
+					hasBootVga = true
+				}
 			}
 		}
 		publishAssignableAdapters = publishAssignableAdapters || len(assignmentsUsb) > 0 || len(assignmentsPci) > 0
 	}
 
+	// The boot VGA device sits with the host driver until an app takes it.
+	// i915 will not unbind while the console holds DRM master, so ask it to
+	// let go first. On
+	// timeout releaseGPUForDomain proceeds anyway - the app wins - and a
+	// failed reserve below hands the GPU straight back.
+	//
 	// The host framebuffer drivers keep the boot framebuffer - which for an
 	// iGPU lives in its stolen memory - mapped and in use. Detach the console
 	// from the display before the adapter is bound to vfio-pci, no matter what
-	// debug.enable.vga says; updateVgaAccess brings it back once the app
-	// releases the adapter.
-	if bootVgaAssignedToApp(ctx) {
-		log.Noticef("doAssignIoAdaptersToDomain: boot VGA assigned to %s, "+
-			"detaching the host console framebuffer", status.DomainName)
-		vgaConsoleOff()
+	// debug.enable.vga says, and only once the console is off DRM master;
+	// updateVgaAccess brings it back once the app releases the adapter.
+	release := func() {}
+	restore := func() {}
+	if hasBootVga {
+		release = func() { releaseGPUForDomain(ctx, status.DomainName, gpuReleaseTimeout) }
+		restore = func() { restoreGPUToConsole(ctx, status.DomainName) }
+	}
+	detach := func() {
+		release()
+		if bootVgaAssignedToApp(ctx) {
+			log.Noticef("doAssignIoAdaptersToDomain: boot VGA assigned to %s, "+
+				"detaching the host console framebuffer", status.DomainName)
+			vgaConsoleOff()
+		}
 	}
 
-	for i, long := range assignmentsPci {
-		err := hyper.PCIReserve(long)
-		if err != nil {
-			// Undo what we assigned
-			for j, long := range assignmentsPci {
-				if j >= i {
-					break
+	err := assignWithGPU(detach, func() error {
+		for i, long := range assignmentsPci {
+			err := hyper.PCIReserve(long)
+			if err != nil {
+				// Undo what we assigned
+				for j, long := range assignmentsPci {
+					if j >= i {
+						break
+					}
+					hyper.PCIRelease(long)
 				}
-				hyper.PCIRelease(long)
+				return err
 			}
-			if publishAssignableAdapters {
-				ctx.publishAssignableAdapters()
-			}
-			return err
 		}
+		return nil
+	}, restore)
+	if err != nil {
+		if publishAssignableAdapters {
+			ctx.publishAssignableAdapters()
+		}
+		return err
 	}
 	checkIoBundleAll(ctx)
 	if publishAssignableAdapters {
@@ -2467,8 +2536,14 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 	myUUID uuid.UUID, status *types.DomainStatus) {
 
 	log.Functionf("releaseAdapters(%s)", myUUID)
+	ctx.setVirtualGPUHolder(myUUID, false)
 	ignoreErrors := (status == nil)
+	domain := ""
+	if status != nil {
+		domain = status.DomainName
+	}
 	var assignments []string
+	bootVgaPciLong := ""
 	for _, adapter := range ioAdapterList {
 		log.Tracef("releaseAdapters processing adapter %d %s",
 			adapter.Type, adapter.Name)
@@ -2483,7 +2558,8 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 				adapter.Type, adapter.Name, myUUID)
 		}
 		for _, ib := range list {
-			if ib == nil {
+			if ib == nil || ib.IsVirtualGPU() {
+				// A virtual GPU is never reserved, so there is nothing to give back.
 				continue
 			}
 			if status != nil && status.VirtualizationMode == types.NOHYPER && ib.Type == types.IoNetEth {
@@ -2520,6 +2596,9 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 					ib.Phylabel, ib.PciLong, myUUID)
 				assignments = addNoDuplicate(assignments, ib.PciLong)
 				ib.IsPCIBack = false
+				if isBootVGA(ib) {
+					bootVgaPciLong = ib.PciLong
+				}
 			}
 			ib.UsedByUUID = nilUUID
 		}
@@ -2529,6 +2608,12 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 		err := hyper.PCIRelease(long)
 		if err != nil && !ignoreErrors {
 			status.SetErrorNow(err.Error())
+		}
+		// Only tell the console it can reclaim the GPU once it is actually
+		// back with the host driver, not merely marked so, and only if the
+		// host is to show a console at all (debug.enable.vga).
+		if err == nil && long == bootVgaPciLong && ctx.vgaAccess {
+			restoreGPUToConsole(ctx, domain)
 		}
 	}
 	ctx.publishAssignableAdapters()
@@ -2706,6 +2791,19 @@ func reserveAdapters(ctx *domainContext, config types.DomainConfig) *types.Error
 		hasIOVirtualization = capabilities.IOVirtualization
 	}
 
+	ctx.gpuLock.Lock()
+	defer ctx.gpuLock.Unlock()
+	wantsVirtual, conflict := checkGPUConflicts(ctx, config)
+	if conflict != nil {
+		return conflict
+	}
+	if wantsVirtual {
+		// Recorded before the loop below, under gpuLock, so a passthrough
+		// app checked right after this one sees it. A failure below is
+		// followed by releaseAdapters, which drops it again.
+		ctx.setVirtualGPUHolder(config.UUIDandVersion.UUID, true)
+	}
+
 	for _, adapter := range config.IoAdapterList {
 		log.Functionf("reserveAdapters processing adapter %d %s",
 			adapter.Type, adapter.Name)
@@ -2736,6 +2834,11 @@ func reserveAdapters(ctx *domainContext, config types.DomainConfig) *types.Error
 				description.Error = fmt.Sprintf("adapter %d %s phylabel %s is not assignable",
 					adapter.Type, adapter.Name, ibp.Phylabel)
 				return &description
+			}
+			if ibp.IsVirtualGPU() {
+				// Shared by any number of apps, so it is never reserved;
+				// checkGPUConflicts has already ruled on the host GPU.
+				continue
 			}
 			if ibp.UsedByUUID != config.UUIDandVersion.UUID &&
 				ibp.UsedByUUID != nilUUID {
@@ -2773,6 +2876,9 @@ func reserveAdapters(ctx *domainContext, config types.DomainConfig) *types.Error
 		}
 		for _, ibp := range list {
 			if ibp == nil {
+				continue
+			}
+			if ibp.IsVirtualGPU() {
 				continue
 			}
 			if ibp.PciLong != "" && !hasIOVirtualization {
@@ -4018,16 +4124,13 @@ func updatePortAndPciBackIoBundle(ctx *domainContext, ib *types.IoBundle) (chang
 		if ctx.usbAccess && (ib.Type == types.IoUSB || ib.Type == types.IoUSBController) {
 			keepInHost = true
 		}
-		if ctx.vgaAccess && ib.Type == types.IoHDMI {
-			// only return VGA devices that were marked as boot devices.
-			// console output won't be visible on others anyway
-			// it allows us to debug issues with GPUs assigned to applications
-			if keep, err := isBootVga(ib.PciLong); err == nil {
-				keepInHost = keep
-			} else {
-				log.Errorf("Couldn't get boot_vga statues for VGA device %s", ib.PciLong)
-				log.Error(err)
-			}
+		if isBootVGA(ib) {
+			// The boot VGA device stays with the host driver until an app
+			// passes it through, whatever debug.enable.vga says: the host
+			// renders virtual GPUs on it, and the knob only decides whether
+			// the host shows a console on the display (updateVgaAccess).
+			// Other GPUs go to pciback; the console never uses them.
+			keepInHost = true
 		}
 		if ib.Type == types.IoNVME && zfsutil.NVMEIsUsed(log, ctx.subZFSPoolStatus.GetAll(), ib.PciLong) {
 			keepInHost = true
@@ -4466,10 +4569,24 @@ func updateVgaAccess(ctx *domainContext) {
 		// If VGA is disabled, we need to first bring any VGA PCIe adapter back
 		updatePortAndPciBackIoBundleAll(ctx)
 		checkIoBundleAll(ctx)
+		wasOff := vgaSwitch
 		vgaConsoleOn()
+		if wasOff {
+			// The framebuffer console is back in a usable state; let the
+			// graphical console reclaim the GPU too. No need to wait for it.
+			restoreGPUToConsole(ctx, "")
+		}
 		return
 	}
 
+	if !vgaSwitch {
+		// Ask the console to give up DRM master before the screen is blanked
+		// and the framebuffer driver pulled out from under it - i915 will not
+		// unbind while it still holds the card. On timeout proceed anyway:
+		// the operator asked for VGA access off, and a console that does not
+		// answer must not block that.
+		releaseGPUForDomain(ctx, "", gpuReleaseTimeout)
+	}
 	vgaConsoleOff()
 
 	updatePortAndPciBackIoBundleAll(ctx)

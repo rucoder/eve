@@ -42,7 +42,7 @@ This document mirrors the key names, types, defaults, and ranges defined there.
 | downloader.transport.handlers | integer | 11 | 1 | 1024 | number of workers of the downloader's zedUpload transport, which is also the depth of the request queue in front of them; a download whose request finds the queue full retries the submission for up to timer.download.stalled. The transport is sized once, when the downloader starts, so a change takes effect at the next reboot |
 | debug.disable.dhcp.all-ones.netmask | boolean | false | - | - | deprecated; retained only to avoid reporting errors for older deployments where this option is still configured |
 | debug.enable.usb | boolean | true | - | - | allow USB e.g. keyboards on device (controller by default overrides to false) |
-| debug.enable.vga | boolean | true | - | - | allow VGA console on device (controller by default overrides to false) |
+| debug.enable.vga | boolean | true | - | - | show the EVE console on the device's display (controller by default overrides to false); the boot GPU stays with the host driver either way, for virtual GPUs, until an app passes it through |
 | debug.enable.ssh | authorized ssh key | "" | - | - | allow ssh to EVE; empty string disables SSH |
 | debug.enable.console | boolean | true | - | - | allow console access to EVE, reboot required to disable (controller by default overrides to false) |
 | debug.enable.vnc.shim.vm | boolean | false | - | - | allow VNC access to the container application shim VM (reboot required to disable) |
