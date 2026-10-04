@@ -19,6 +19,12 @@ type AppInstance struct {
 	State   SwState   `json:"state"`
 	// Error is the current error for the instance, empty if none.
 	Error string `json:"error"`
+	// QMPSocket locates the instance's QEMU monitor, through which a console
+	// client attaches to the guest's display. Empty when there is no such
+	// socket on this device - under Xen, or for an instance that never got a
+	// QEMU. Its presence does not promise a display behind it: the console
+	// finds that out by attaching, and drops the tab when it cannot.
+	QMPSocket string `json:"qmpSocket,omitempty"`
 }
 
 // SwState is the lifecycle state of a downloadable/runnable object

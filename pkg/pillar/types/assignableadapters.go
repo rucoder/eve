@@ -403,6 +403,18 @@ func (ib IoBundle) IsUSBController() bool {
 	return false
 }
 
+// IsVirtualGPU reports whether the IoBundle is a virtual GPU: a display
+// adapter with no hardware address and no CDI description. There is nothing
+// to pass through; an app holding it gets a GL-backed virtio GPU rendered on
+// the host GPU, and any number of apps may hold it at once. A SoC GPU exposed
+// through CDI (see docs/HARDWARE-MODEL.md) has no address either, but carries
+// its device in Cbattr and is an ordinary exclusive adapter.
+func (ib IoBundle) IsVirtualGPU() bool {
+	return ib.Type == IoHDMI && ib.PciLong == "" && ib.Ifname == "" &&
+		ib.Serial == "" && ib.UsbAddr == "" && ib.UsbProduct == "" &&
+		ib.Irq == "" && ib.Ioports == "" && len(ib.Cbattr) == 0
+}
+
 // HasAdapterChanged - We store each Physical Adapter using the IoBundle object.
 // Compares IoBundle with Physical adapter and returns if they are the Same
 // or the Physical Adapter has changed.

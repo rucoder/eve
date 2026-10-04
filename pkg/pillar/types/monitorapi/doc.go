@@ -5,7 +5,7 @@ package monitorapi
 
 // The generator reads this package and emits both the Go union codec
 // (union_json.gen.go, required for this package to compile) and the Rust
-// contract types (into the colocated TUI crate at pkg/monitor/src/ipc).
+// contract types (into the colocated console crate at pkg/monitor/src/ipc).
 // Run `go generate ./types/monitorapi/...` before committing; CI verifies the
 // committed output matches.
 //
