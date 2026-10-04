@@ -4,6 +4,10 @@
 package hypervisor
 
 import (
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
@@ -54,9 +58,72 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 			domainName, err)
 	}
 	overhead = undefinedVMMOverhead() + ramVMMOverhead(domainRAMSize) +
-		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead
+		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead +
+		virtualGPUVMMOverhead(aa, domainAdapterList)
 
 	return overhead, nil
+}
+
+// overhead for a GL-backed virtual GPU.
+//
+// virglrenderer and Mesa run inside qemu, and on an integrated GPU the
+// textures and scanout buffers they allocate are ordinary system memory,
+// charged to the app instance's cgroup like anything else qemu touches.
+// None of the other terms cover it: mmioVMMOverhead counts only PASSTHROUGH
+// devices, so a virtual GPU contributes nothing there, and a guest that is
+// actually rendering was therefore sized as though it had no GPU at all.
+// Observed as an OOM kill of a 4GiB guest once its desktop started using
+// the GL path.
+//
+// These numbers are a budget, not a bound: nothing enforces them. qemu
+// accounts host memory for 2D resources and refuses them past max_hostmem
+// (hw/display/virtio-gpu.c), but once virgl is enabled resource creation is
+// dispatched to virgl_cmd_create_resource_2d/_3d in
+// hw/display/virtio-gpu-virgl.c, which compute no size, consult no limit and
+// do not even check whether the allocation succeeded. A GL guest can
+// therefore allocate until the cgroup kills it, and no value chosen here can
+// prevent that - it only decides how much warning there is. Capping it
+// properly needs a change in qemu.
+func virtualGPUVMMOverhead(aa *types.AssignableAdapters, domainAdapterList []types.IoAdapter) int64 {
+	// Only a domain that holds a virtual GPU runs virglrenderer at all.
+	if virtualGPUBundle(aa, domainAdapterList) == nil || !hostHasRenderNode() {
+		return 0
+	}
+	// Only where the GPU has no memory of its own. A discrete card puts
+	// these objects in its local region - real VRAM, not system memory, and
+	// charged to no cgroup - so reserving host RAM for them would be so
+	// much lost capacity. An integrated GPU has only the `system` region,
+	// which is shmem and is charged to whoever allocated it: measured on a
+	// Tiger Lake iGPU, qemu's entire GPU footprint was in system0, with
+	// zero bytes in stolen-system0 and no local region existing at all.
+	if hostGPUHasLocalMemory() {
+		return 0
+	}
+	// Measured on a Tiger Lake iGPU running a GNOME desktop, by reading
+	// drm-resident-system0 from qemu's DRM fdinfo and cross-checking it
+	// against the cgroup's own shmem counter, which tracked it to within a
+	// megabyte: 44 MiB while the guest was still booting, 224 MiB with the
+	// desktop idle, and 321 MiB peak under glmark2. The bulk is
+	// virglrenderer, Mesa and the guest's GL working set rather than the
+	// scanout buffers, so most of the budget belongs in the base.
+	//
+	// Transients go higher - 971 MiB was seen while an operator cycled the
+	// guest through several modes including 4K - but GEM release is lazy:
+	// disabling a head freed nothing, and re-applying the display config
+	// halved the figure, so most of that peak is buffers awaiting purge
+	// rather than memory the guest needs. Steady state after a reconfigure
+	// was 372 MiB with two heads mirrored at 1080p.
+	//
+	// 512 MiB is roughly 1.6x the measured steady peak. Erring high is
+	// deliberate: the failure it prevents is the memcg OOM killer taking
+	// the guest down, while over-estimating only means fewer app instances
+	// are admitted. A guest that picks a mode far larger than anything the
+	// host can display can still exceed it; memory.vmm.limit.MiB is the
+	// documented override for that.
+	base := int64(512) << 20
+	// Per scanout, roughly a 1080p framebuffer triple-buffered.
+	perScanout := int64(32) << 20
+	return base + int64(hostMaxOutputs())*perScanout
 }
 
 func ramVMMOverhead(ramMemory int64) int64 {
@@ -171,4 +238,29 @@ func cpuVMMOverhead(maxCpus int64, vcpus int64) int64 {
 // it requires more investigation.
 func undefinedVMMOverhead() int64 {
 	return 350 << 20 // Mb in bytes
+}
+
+// hostGPUHasLocalMemory reports whether any render-capable GPU has a memory
+// region of its own. i915 and xe publish lmem_total_bytes for a card with
+// local memory and omit it entirely for an integrated one.
+func hostGPUHasLocalMemory() bool {
+	ents, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		name := e.Name()
+		// "card0", not "card0-HDMI-A-1" and not "renderD128".
+		if !strings.HasPrefix(name, "card") || strings.Contains(name, "-") {
+			continue
+		}
+		b, err := os.ReadFile("/sys/class/drm/" + name + "/lmem_total_bytes")
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil && n > 0 {
+			return true
+		}
+	}
+	return false
 }
