@@ -770,7 +770,7 @@ func newKvm() Hypervisor {
 		return KvmContext{
 			ctrdContext:  *ctrdCtx,
 			devicemodel:  "virt",
-			dmExec:       "/usr/lib/xen/bin/qemu-system-aarch64",
+			dmExec:       "/usr/bin/qemu-system-aarch64",
 			dmArgs:       []string{"-display", "none", "-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0"},
 			dmCPUArgs:    []string{"-cpu", "host"},
 			dmFmlCPUArgs: []string{"-cpu", "host"},
@@ -778,8 +778,8 @@ func newKvm() Hypervisor {
 	case "amd64":
 		return KvmContext{
 			ctrdContext:  *ctrdCtx,
-			devicemodel:  "pc-q35-3.1",
-			dmExec:       "/usr/lib/xen/bin/qemu-system-x86_64",
+			devicemodel:  "pc-q35-11.1",
+			dmExec:       "/usr/bin/qemu-system-x86_64",
 			dmArgs:       []string{"-display", "none", "-S", "-no-user-config", "-nodefaults", "-no-shutdown", "-serial", "chardev:charserial0", "-machine", "hpet=off"},
 			dmCPUArgs:    []string{"-cpu", "host"},
 			dmFmlCPUArgs: []string{"-cpu", "host,hv_time,hv_relaxed,hv_vendor_id=eveitis,hypervisor=off,kvm=off,vmx=off"},

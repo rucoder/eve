@@ -31,7 +31,7 @@ var swtpmCtrlSock = ""
 // these ones are very much handcrafted just for the tests
 func init() {
 	kvmIntel = KvmContext{
-		devicemodel: "pc-q35-3.1",
+		devicemodel: "pc-q35-11.1",
 		dmExec:      "",
 		dmArgs:      []string{},
 	}
@@ -123,7 +123,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -379,7 +379,7 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -1503,7 +1503,7 @@ func domConfigAmd64FML() string {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -1806,7 +1806,7 @@ func domConfigAmd64Legacy() string {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -2086,7 +2086,7 @@ func domConfigAmd64() string {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -2362,7 +2362,7 @@ func domConfigContainerVNC() string {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   dump-guest-core = "off"
   accel = "kvm"
   vmport = "off"
@@ -2676,7 +2676,7 @@ func TestCreateDom(t *testing.T) {
   timestamp = "on"
 
 [machine]
-  type = "pc-q35-3.1"
+  type = "pc-q35-11.1"
   vmport = "off"
   dump-guest-core = "off"
 
