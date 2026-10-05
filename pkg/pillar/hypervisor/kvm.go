@@ -1080,6 +1080,13 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 	spec.AdjustMemLimit(config, overhead)
 	spec.Get().Process.Args = args
 	logrus.Infof("Hypervisor args: %v", args)
+	if ctx.virtualGPUFor(config, aa) {
+		// TEMPORARY: iris in Mesa 26.2 exports a render-compressed scanout
+		// texture as its bare main surface, which the console then imports
+		// as all-black. Keep compression off for the virtual GPU's renderer
+		// until the export is fixed (or the console takes ScanoutDMABUF2).
+		spec.Get().Process.Env = append(spec.Get().Process.Env, "INTEL_DEBUG=noccs")
+	}
 
 	// Enable a bounded kernel core dump of the qemu process on a fatal signal
 	// (SIGBUS/SIGSEGV/SIGABRT — the "mode B" class).  The host
