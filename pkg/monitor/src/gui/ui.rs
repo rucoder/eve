@@ -922,7 +922,13 @@ fn node_page(
                     format!("{name} (0x{:08x}) -> {mapped}", desc.fourcc),
                 ));
                 rows.push(("Modifier".to_string(), format!("0x{:x}", desc.modifier)));
+                rows.push(("Planes".to_string(), desc.planes.to_string()));
                 rows.push(("Stride".to_string(), format!("{} bytes", desc.stride)));
+                let (x, y, _, _) = desc.rect;
+                rows.push((
+                    "Buffer".to_string(),
+                    format!("{}x{}, this head at +{x}+{y}", desc.backing.0, desc.backing.1),
+                ));
                 rows.push((
                     "Origin".to_string(),
                     if desc.y0_top { "top-left" } else { "bottom-left" }.to_string(),

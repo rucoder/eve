@@ -72,19 +72,47 @@ pub struct GuestCursor {
 }
 
 pub struct GuestDmabuf {
-    pub fd: std::os::fd::OwnedFd,
-    /// inode of the underlying dma-buf. Each ScanoutDMABUF carries a freshly
-    /// dup'd fd, but a compositor rotates a small set of buffers, so the inode
-    /// identifies which one this is and lets the importer reuse its texture.
+    /// Every plane of the buffer. A compressed (CCS) or multi-planar buffer
+    /// cannot be imported from its first plane alone.
+    pub planes: Vec<GuestPlane>,
+    /// inode of plane 0's dma-buf. Each scanout carries freshly dup'd fds, but
+    /// a compositor rotates a small set of buffers, so the inode identifies
+    /// which one this is and lets the importer reuse its texture.
     pub ino: u64,
+    /// The rectangle of the buffer this head shows, and the size of the whole
+    /// buffer. A guest with several heads may give them one framebuffer, each
+    /// at its own offset, so the two differ.
+    pub x: u32,
+    pub y: u32,
     pub w: u32,
     pub h: u32,
-    pub stride: u32,
+    pub backing_w: u32,
+    pub backing_h: u32,
     pub fourcc: u32,
     pub modifier: u64,
     pub y0_top: bool,
+    /// The listener method that delivered it, for the log.
+    pub method: &'static str,
+}
+
+pub struct GuestPlane {
+    pub fd: OwnedFd,
+    pub offset: u32,
+    pub stride: u32,
 }
 pub type Shared = Arc<Mutex<GuestFrame>>;
+
+/// Where QEMU calls every listener interface, whichever console it is for.
+const LISTENER_PATH: &str = "/org/qemu/Display1/Listener";
+
+/// The listener interfaces we serve beyond the base one. QEMU only calls an
+/// optional interface that the base one lists in its `Interfaces` property.
+const LISTENER_INTERFACES: &[&str] = &["org.qemu.Display1.Listener.Unix.ScanoutDMABUF2"];
+
+fn inode(fd: &OwnedFd) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0 { st.st_ino } else { 0 }
+}
 
 struct Listener { f: Shared, stride: u32, raw: Vec<u8>, n: u64, t0: Option<std::time::Instant>, have_scanout: bool, console: usize }
 
@@ -144,6 +172,18 @@ impl Listener {
         });
         g.seq += 1;
     }
+
+    /// Hand a scanout dmabuf to the render thread, from either scanout method.
+    fn set_dmabuf(&mut self, d: GuestDmabuf) {
+        let mut g = self.f.lock().unwrap();
+        g.w = d.w; g.h = d.h;
+        g.dmabuf = Some(d);
+        g.orphan_updates = 0;
+        g.display_off = false;
+        self.have_scanout = true;
+        g.seq += 1;
+        crate::gui::wake::wake();
+    }
 }
 
 #[interface(name = "org.qemu.Display1.Listener")]
@@ -183,22 +223,23 @@ impl Listener {
         self.tick(w.max(0) as u32, h.max(0) as u32);
         self.repack(x0 as u32, y0 as u32, w.max(0) as u32, h.max(0) as u32);
     }
+    /// Single plane, and always the whole buffer: QEMU drops the x/y offset
+    /// of a scanout that is part of a larger one, and refuses multi-plane
+    /// buffers outright. Only called when we are talking to a QEMU that does
+    /// not know ScanoutDMABUF2.
     #[zbus(name = "ScanoutDMABUF")]
     async fn scanout_dmabuf(&mut self, fd: Fd<'_>, w: u32, h: u32, stride: u32,
                             fourcc: u32, modifier: u64, y0_top: bool) {
         match fd.as_fd().try_clone_to_owned() {
             Ok(owned) => {
-                let mut g = self.f.lock().unwrap();
-                g.w = w; g.h = h;
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                let ino = if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } == 0 { st.st_ino } else { 0 };
-                g.dmabuf = Some(GuestDmabuf { fd: owned, ino, w, h, stride, fourcc, modifier, y0_top });
-                g.orphan_updates = 0;
-                g.display_off = false;
-                self.have_scanout = true;
-                g.seq += 1;
                 log::debug!("ScanoutDMABUF {w}x{h} stride={stride} fourcc=0x{fourcc:08x} mod=0x{modifier:x} y0_top={y0_top}");
-                crate::gui::wake::wake();
+                self.set_dmabuf(GuestDmabuf {
+                    ino: inode(&owned),
+                    planes: vec![GuestPlane { fd: owned, offset: 0, stride }],
+                    x: 0, y: 0, w, h, backing_w: w, backing_h: h,
+                    fourcc, modifier, y0_top,
+                    method: "ScanoutDMABUF",
+                });
             }
             Err(e) => log::error!("dmabuf dup failed: {e}"),
         }
@@ -274,7 +315,81 @@ impl Listener {
         log::info!("display off: guest released its scanout");
         crate::gui::wake::wake();
     }
-    #[zbus(property)] fn interfaces(&self) -> Vec<String> { vec![] }
+    #[zbus(property)] fn interfaces(&self) -> Vec<String> {
+        LISTENER_INTERFACES.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+/// QEMU's multi-plane scanout, which is also the only one that says where in
+/// a larger buffer this head's picture is.
+///
+/// It is a separate D-Bus interface on the listener's object, and zbus serves
+/// one interface per type, so this only unpacks the call and hands it to the
+/// `Listener` beside it, which owns the state.
+///
+/// Dispatched inline rather than in a task of its own, so that the
+/// UpdateDMABUF QEMU sends right after it cannot reach the `Listener` first.
+struct ScanoutV2;
+
+#[interface(name = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2", spawn = false)]
+impl ScanoutV2 {
+    #[zbus(name = "ScanoutDMABUF2")]
+    async fn scanout_dmabuf2(
+        &self,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
+        dmabuf: Vec<Fd<'_>>,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        offset: Vec<u32>,
+        stride: Vec<u32>,
+        num_planes: u32,
+        fourcc: u32,
+        backing_width: u32,
+        backing_height: u32,
+        modifier: u64,
+        y0_top: bool,
+    ) {
+        let n = num_planes as usize;
+        let max = smithay::backend::allocator::dmabuf::MAX_PLANES;
+        if n == 0 || n > max || dmabuf.is_empty() || offset.len() < n || stride.len() < n {
+            log::error!(
+                "ScanoutDMABUF2: {num_planes} plane(s) with {} fd(s), {} offset(s), {} stride(s); ignored",
+                dmabuf.len(), offset.len(), stride.len()
+            );
+            return;
+        }
+        let mut planes = Vec::with_capacity(n);
+        for i in 0..n {
+            // QEMU stops sending fds at the first plane without one of its
+            // own: those planes live in the first plane's buffer.
+            let fd = dmabuf.get(i).unwrap_or(&dmabuf[0]);
+            match fd.as_fd().try_clone_to_owned() {
+                Ok(fd) => planes.push(GuestPlane { fd, offset: offset[i], stride: stride[i] }),
+                Err(e) => {
+                    log::error!("dmabuf dup failed: {e}");
+                    return;
+                }
+            }
+        }
+        log::debug!(
+            "ScanoutDMABUF2 {width}x{height}+{x}+{y} of {backing_width}x{backing_height} \
+             planes={n} fourcc=0x{fourcc:08x} mod=0x{modifier:x} y0_top={y0_top}"
+        );
+        let d = GuestDmabuf {
+            ino: inode(&planes[0].fd),
+            planes,
+            x, y, w: width, h: height,
+            backing_w: backing_width, backing_h: backing_height,
+            fourcc, modifier, y0_top,
+            method: "ScanoutDMABUF2",
+        };
+        match server.interface::<_, Listener>(LISTENER_PATH).await {
+            Ok(l) => l.get_mut().await.set_dmabuf(d),
+            Err(e) => log::error!("ScanoutDMABUF2: no listener to take it: {e}"),
+        }
+    }
 }
 
 #[zbus::proxy(interface = "org.qemu.Display1.Console", default_service = "org.qemu")]
@@ -654,8 +769,9 @@ pub fn spawn(
                 // its own; they cannot share one and be told apart.
                 let builder = zbus::connection::Builder::unix_stream(ours)
                     .p2p()   // QEMU is the auth server on this socket
-                    .serve_at("/org/qemu/Display1/Listener",
-                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false, console }).unwrap();
+                    .serve_at(LISTENER_PATH,
+                              Listener { f: sink, stride: 0, raw: Vec::new(), n: 0, t0: None, have_scanout: false, console }).unwrap()
+                    .serve_at(LISTENER_PATH, ScanoutV2).unwrap();
                 let task = tokio::spawn(async move { builder.build().await });
                 let ofd: OwnedFd = theirs.into();
                 if let Err(e) = proxy.register_listener(Fd::from(ofd.as_fd())).await {

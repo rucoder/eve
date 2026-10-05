@@ -6,15 +6,16 @@
 //! QEMU offers two shapes over the D-Bus display, and which one arrives depends
 //! on how the guest's GPU was configured, not on anything we choose:
 //!
-//! * **dmabuf** (`ScanoutDMABUF`) - an fd for a buffer the host GPU already
-//!   holds. Zero copy: we import it as a texture. Needs `gl=on`.
+//! * **dmabuf** (`ScanoutDMABUF2`, or `ScanoutDMABUF` from an older QEMU) -
+//!   fds for a buffer the host GPU already holds. Zero copy: we import it as a
+//!   texture and draw the head's rectangle of it. Needs `gl=on`.
 //! * **copy** (`Scanout`/`Update`) - the pixels themselves, in the message.
 //!   Costs a full framebuffer per frame and cannot keep up with a busy guest,
 //!   so prefer the dmabuf path for every guest that can do it.
 
 use std::collections::HashMap;
 
-use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags, MAX_PLANES};
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::glow::GlowRenderer;
@@ -99,6 +100,8 @@ pub struct Scanout {
     pub shared: guest::Shared,
 
     /// Framebuffer size in guest pixels, from whichever path delivered it.
+    /// On the dmabuf path this is the head's rectangle, not the buffer
+    /// behind it.
     ///
     /// Owned per VM because input needs it to map host -> guest and it must
     /// survive tab switches. It was once published only when a scanout message
@@ -116,15 +119,17 @@ pub struct Scanout {
     pub dma_id: Option<egui::TextureId>,
     pub dma_size: egui::Vec2,
     pub dma_flip: bool,
+    /// The part of `dma_tex` this head shows, in its buffer coordinates.
+    dma_src: Rectangle<f64, smithay::utils::Buffer>,
     dma_tex: Option<GlesTexture>,
     dma_2d: Option<GlesTexture>,
-    /// The `(fourcc, modifier)` of the last buffer we imported, so a guest
-    /// that switches format mid-session - starting a real GUI on top of
-    /// fbcon, a compositor moving to a tiled modifier - says so in the log
-    /// once, instead of either never or on every frame. A guest that rotates
-    /// buffers imports constantly (see `dma_cache`), so this cannot be logged
-    /// per import.
-    dma_format: Option<(u32, u64)>,
+    /// The last scanout we took, so a guest that switches format or layout
+    /// mid-session - starting a real GUI on top of fbcon, a compositor moving
+    /// to a tiled modifier, a second head moving within a shared framebuffer -
+    /// says so in the log once, instead of either never or on every frame. A
+    /// guest that rotates buffers sends a scanout per frame (see
+    /// `dma_cache`), so this cannot be logged per scanout.
+    dma_format: Option<GuestDesc>,
     /// What QEMU last described, and what the readback last found, for the
     /// status line. Kept here because a log level is set by pillar at runtime
     /// (`TUIConfig`) and can hide a `debug!` exactly when it is needed.
@@ -155,12 +160,18 @@ pub struct Scanout {
 }
 
 /// What QEMU said the scanout buffer is, for the status line.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct GuestDesc {
     pub fourcc: u32,
     pub modifier: u64,
+    /// Of plane 0.
     pub stride: u32,
     pub y0_top: bool,
+    pub planes: usize,
+    /// This head's x, y, w, h within the buffer, and the buffer's size.
+    pub rect: (u32, u32, u32, u32),
+    pub backing: (u32, u32),
+    pub method: &'static str,
 }
 
 /// More buffers than any sane compositor rotates; a resize also clears it.
@@ -169,12 +180,17 @@ const DMA_CACHE_MAX: usize = 8;
 /// What makes one imported scanout buffer the same as another. The inode alone
 /// is not enough even with the fd pinned: a guest may hand back the same buffer
 /// re-described, and sampling it through the old geometry would tear.
+///
+/// The head's rectangle is not part of it: that is chosen at the blit, so a
+/// buffer imported for one rectangle serves any other.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct BufferKey {
     ino: u64,
     w: u32,
     h: u32,
-    stride: u32,
+    /// Offset and stride of each plane, zero past the last. The offset
+    /// matters: a guest may flip between framebuffers in one buffer.
+    layout: [(u32, u32); MAX_PLANES],
     fourcc: u32,
     modifier: u64,
 }
@@ -247,6 +263,7 @@ impl Scanout {
             dma_id: None,
             dma_size: egui::vec2(1.0, 1.0),
             dma_flip: false,
+            dma_src: Rectangle::default(),
             dma_tex: None,
             dma_2d: None,
             dma_format: None,
@@ -303,18 +320,27 @@ impl Scanout {
         let new_size = egui::vec2(d.w as f32, d.h as f32);
         let resized = self.dma_size != new_size;
 
-        self.desc = Some(GuestDesc {
+        let desc = GuestDesc {
             fourcc: d.fourcc,
             modifier: d.modifier,
-            stride: d.stride,
+            stride: d.planes.first().map_or(0, |p| p.stride),
             y0_top: d.y0_top,
-        });
+            planes: d.planes.len(),
+            rect: (d.x, d.y, d.w, d.h),
+            backing: (d.backing_w, d.backing_h),
+            method: d.method,
+        };
+        self.desc = Some(desc);
 
+        let mut layout = [(0, 0); MAX_PLANES];
+        for (l, p) in layout.iter_mut().zip(&d.planes) {
+            *l = (p.offset, p.stride);
+        }
         let key = BufferKey {
             ino: d.ino,
-            w: d.w,
-            h: d.h,
-            stride: d.stride,
+            w: d.backing_w,
+            h: d.backing_h,
+            layout,
             fourcc: d.fourcc,
             modifier: d.modifier,
         };
@@ -324,14 +350,18 @@ impl Scanout {
         let tex = match cached {
             Some(t) => Some(t),
             None => {
+                // The whole buffer, every plane: smithay passes each plane's
+                // fd, offset and pitch to EGL, and the modifier on all of them.
                 let built = Fourcc::try_from(d.fourcc).ok().and_then(|fc| {
                     let mut b = Dmabuf::builder(
-                        (d.w as i32, d.h as i32),
+                        (d.backing_w as i32, d.backing_h as i32),
                         opaque(fc),
                         Modifier::from(d.modifier),
                         DmabufFlags::empty(),
                     );
-                    b.add_plane(d.fd, 0, 0, d.stride);
+                    for (i, p) in d.planes.into_iter().enumerate() {
+                        b.add_plane(p.fd, i as u32, p.offset, p.stride);
+                    }
                     b.build()
                 });
                 let imported = built.and_then(|buf| {
@@ -339,19 +369,6 @@ impl Scanout {
                 });
                 match imported {
                     Some((t, buf)) => {
-                        let fmt = (d.fourcc, d.modifier);
-                        if self.dma_format != Some(fmt) {
-                            self.dma_format = Some(fmt);
-                            // Both the declared fourcc and what we import it
-                            // as: they differ whenever `opaque` rewrote an
-                            // alpha format, and that rewrite is the whole
-                            // reason a guest's pixels are visible at all.
-                            let as_ = Fourcc::try_from(d.fourcc).map(opaque);
-                            log::info!(
-                                "scanout format {}x{} fourcc=0x{:08x} -> {:?} mod=0x{:x}",
-                                d.w, d.h, d.fourcc, as_, d.modifier
-                            );
-                        }
                         if resized || self.dma_cache.is_empty() {
                             log::info!("imported scanout dmabuf {}x{} zero-copy", d.w, d.h);
                         } else {
@@ -370,9 +387,10 @@ impl Scanout {
                     }
                     None => {
                         log::error!(
-                            "dmabuf import FAILED (fourcc=0x{:08x} mod=0x{:x})",
+                            "dmabuf import FAILED (fourcc=0x{:08x} mod=0x{:x} planes={})",
                             d.fourcc,
-                            d.modifier
+                            d.modifier,
+                            desc.planes
                         );
                         None
                     }
@@ -381,7 +399,26 @@ impl Scanout {
         };
 
         if let Some(t) = tex {
+            if self.dma_format != Some(desc) {
+                self.dma_format = Some(desc);
+                // Both the declared fourcc and what we import it as: they
+                // differ whenever `opaque` rewrote an alpha format, and that
+                // rewrite is the whole reason a guest's pixels are visible at
+                // all.
+                let as_ = Fourcc::try_from(desc.fourcc).map(opaque);
+                let (x, y, w, h) = desc.rect;
+                log::info!(
+                    "{}: scanout format {w}x{h}+{x}+{y} of {}x{} fourcc=0x{:08x} -> {:?} \
+                     mod=0x{:x} planes={} ({})",
+                    self.label, desc.backing.0, desc.backing.1, desc.fourcc, as_,
+                    desc.modifier, desc.planes, desc.method
+                );
+            }
             self.dma_size = new_size;
+            self.dma_src = Rectangle::new(
+                (d.x as f64, d.y as f64).into(),
+                (d.w as f64, d.h as f64).into(),
+            );
             self.dma_flip = d.y0_top;
             self.dma_tex = Some(t);
             self.blitted = None;
@@ -503,9 +540,10 @@ impl Scanout {
         }
         let psz = smithay::utils::Size::<i32, smithay::utils::Physical>::from((w, h));
         let dst = Rectangle::from_size(psz);
-        let src = Rectangle::from_size(smithay::utils::Size::<f64, smithay::utils::Buffer>::from(
-            (w as f64, h as f64),
-        ));
+        // Only this head's rectangle of the imported buffer. Its y counts
+        // from the buffer's first row whichever way up the image is, as in
+        // QEMU's own egl_fb_blit; the flip is applied when it is drawn.
+        let src = self.dma_src;
         // Keep the target's alpha at the opaque value it was cleared to.
         //
         // The scanout's fourth byte is an X, not an A: virtio-gpu declares
