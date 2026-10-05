@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -64,6 +65,11 @@ type monitor struct {
 	// goroutine (handleGPUConsoleConfig), read from the IPC server's
 	// connection goroutine (handleGPUAck) - hence atomic.
 	pendingGPURequestID atomic.Uint64
+
+	// pubDebugOptionValues holds the debug options set from the console.
+	// debugMu serializes SetDebugOption's read-modify-write of it.
+	pubDebugOptionValues pubsub.Publication
+	debugMu              sync.Mutex
 
 	IPCServer *monitorIPCServer
 }

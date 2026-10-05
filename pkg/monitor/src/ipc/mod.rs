@@ -26,7 +26,7 @@ mod monitorapi_tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use message::IpcMessage;
-use monitorapi::{AppInstance, DeviceStatus, GpuRequest, NetworkStatus};
+use monitorapi::{AppInstance, DebugOption, DeviceStatus, GpuRequest, NetworkStatus};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 /// Capacity of the `events` channel (see `Client::events`). Deliberately
@@ -35,6 +35,13 @@ const EVENTS_CAPACITY: usize = 256;
 
 /// The default socket pillar serves the monitor contract on.
 pub const MONITOR_SOCKET: &str = "/run/monitor.sock";
+
+/// Keys of the debug options the console applies itself. Pillar's catalogue
+/// (pkg/pillar/types/debugoptions.go) is the source of truth; the console
+/// shows every option it is sent and only needs to know these three.
+pub const DEBUG_PROBE: &str = "console.probe";
+pub const DEBUG_LOG_LEVEL: &str = "console.log_level";
+pub const DEBUG_ZBUS_LOG: &str = "console.zbus_log";
 
 /// The latest of each message pillar sends. The render loop reads it, the
 /// client thread writes it; neither waits for the other, because the console
@@ -63,6 +70,18 @@ pub struct PillarState {
     /// never acked, which is fine, because pillar would have dropped that
     /// ack as stale anyway.
     pub pending_gpu_ack: Option<GpuRequest>,
+    /// Pillar's debug options, empty until it sends them.
+    pub debug: Vec<DebugOption>,
+    /// Bumped by DebugOptions alone, so the frame loop can apply them when
+    /// they arrive rather than on every message.
+    pub debug_rev: u64,
+}
+
+impl PillarState {
+    /// A debug option's value, if pillar has sent it.
+    pub fn debug_value(&self, key: &str) -> Option<&str> {
+        self.debug.iter().find(|o| o.key == key).map(|o| o.value.as_str())
+    }
 }
 
 impl Default for PillarState {
@@ -76,6 +95,8 @@ impl Default for PillarState {
             // Nobody has taken the GPU until pillar says so.
             gpu_available: true,
             pending_gpu_ack: None,
+            debug: Vec::new(),
+            debug_rev: 0,
         }
     }
 }
@@ -274,11 +295,11 @@ async fn pump(
 /// the read loop in `pump` so the GPU handover can be unit-tested without a
 /// socket - see `gui_client_tests` below.
 ///
-/// Every variant is returned, including the four `state` also stores into -
+/// Every variant is returned, including the ones `state` also stores into -
 /// this is not a filter, it's what lets `pump` forward the same message to
-/// `events` without cloning it first: the four below are cheaply
-/// reconstructed from what was stored (or, for `GPURequest`, from a second
-/// clone of the small request itself), while everything else - including
+/// `events` without cloning it first: those below are cheaply reconstructed
+/// from what was stored (or, for `GPURequest` and `DebugOptions`, stored as
+/// a clone of the small message itself), while everything else - including
 /// arbitrarily large variants like `TpmLogs` - passes straight through with
 /// no copy at all.
 pub fn apply(state: &mut PillarState, msg: IpcMessage) -> IpcMessage {
@@ -306,6 +327,17 @@ pub fn apply(state: &mut PillarState, msg: IpcMessage) -> IpcMessage {
             state.gpu_available = !r.release;
             state.pending_gpu_ack = Some(r.clone());
             IpcMessage::GPURequest(r)
+        }
+        // The logging options take effect here, whichever frontend runs;
+        // the probe is the GUI frame loop's, which watches `debug_rev`.
+        IpcMessage::DebugOptions(d) => {
+            state.debug = d.options.clone();
+            state.debug_rev = state.debug_rev.wrapping_add(1);
+            if let Some(level) = state.debug_value(DEBUG_LOG_LEVEL).and_then(|v| v.parse().ok()) {
+                crate::gui::logger::set_debug_level(level);
+            }
+            crate::gui::logger::set_zbus(state.debug_value(DEBUG_ZBUS_LOG) == Some("true"));
+            IpcMessage::DebugOptions(d)
         }
         other => other,
     }

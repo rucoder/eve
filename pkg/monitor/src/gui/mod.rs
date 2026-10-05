@@ -171,12 +171,11 @@ pub fn run(
     switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mode: Option<&str>,
     gui_cfg: crate::application::GuiConfig,
-    config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let cfg = Config::from_env();
-    // The env var forces it on for a one-off run; otherwise the checkbox on
-    // the Node page owns it, and that choice is persisted.
+    // Until pillar's console.probe arrives; from then on, pillar's value.
     let mut probe = cfg.probe || gui_cfg.probe;
+    let mut debug_rev = 0u64;
     // Held for the whole run; Drop puts the VT keyboard back.
     let _cad = vt::CtrlAltDelGuard::take();
     vt::install_signal_handlers();
@@ -242,6 +241,7 @@ pub fn run(
     let mut node_rev = u64::MAX;
     let mut ports: Vec<ui::PortView> = Vec::new();
     let mut apps: Vec<ui::AppView> = Vec::new();
+    let mut debug_opts: Vec<crate::ipc::monitorapi::DebugOption> = Vec::new();
 
     // Before anything converts coordinates or lays out a frame. The input
     // head's, because that is where the controls are.
@@ -321,6 +321,19 @@ pub fn run(
                     }
                 }
                 cur_seq = u64::MAX; // reload this guest's cursor
+            }
+
+            {
+                let p = pillar.lock().unwrap();
+                if p.debug_rev != debug_rev {
+                    debug_rev = p.debug_rev;
+                    if let Some(on) = p.debug_value(crate::ipc::DEBUG_PROBE).map(|v| v == "true") {
+                        if on != probe {
+                            probe = on;
+                            log::info!("readback probe {}", if on { "on" } else { "off" });
+                        }
+                    }
+                }
             }
 
             // Guest framebuffer: once per frame, not once per head.
@@ -516,6 +529,7 @@ pub fn run(
                     let p = pillar.lock().unwrap();
                     ports = ports_of(&p);
                     apps = apps_of(&p);
+                    debug_opts = p.debug.clone();
                     node_rev = node.6;
                 }
                 let view = ui::Frame {
@@ -524,6 +538,7 @@ pub fn run(
                     page: node_page,
                     ports: &ports,
                     apps: &apps,
+                    debug: &debug_opts,
                     edit: edit.as_ref(),
                     probe,
                     remote,
@@ -815,10 +830,14 @@ pub fn run(
                     xoff += want.0 as i32;
                 }
             }
-            if let Some(on) = intents.set_probe {
-                probe = on;
-                log::info!("readback probe {}", if on { "on" } else { "off" });
-                save_gui_probe(&config_path, on);
+            if let Some((key, value)) = intents.set_debug.take() {
+                use crate::ipc::message::{IpcMessage, Request};
+                use crate::ipc::monitorapi::SetDebugOption;
+                log::info!("debug option {key}={value:?}: asking pillar");
+                let req = Request::SetDebugOption(SetDebugOption { key, value });
+                if outbox.send(IpcMessage::new_request(req)).is_err() {
+                    log::error!("debug option: pillar connection is gone");
+                }
             }
             if let Some(p) = intents.page {
                 node_page = p;
@@ -1265,37 +1284,6 @@ fn head_geometry(heads: &[drm::Head], idx: usize) -> Option<guest::HeadGeometry>
         xoff: heads[..idx].iter().map(|p| p.w).sum(),
         yoff: 0,
     })
-}
-
-/// Persist one gui setting without disturbing the rest of config.json.
-///
-/// Read-modify-write of the raw JSON rather than serialising our own struct:
-/// the file is shared with the TUI frontend and with pillar's log-level
-/// handling, and rewriting it wholesale would drop any key this build does
-/// not know about.
-fn save_gui_probe(path: &std::path::Path, on: bool) {
-    let write = || -> anyhow::Result<()> {
-        let mut v: serde_json::Value = match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s)?,
-            Err(_) => serde_json::json!({}),
-        };
-        v.as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("config.json is not an object"))?
-            .entry("gui")
-            .or_insert_with(|| serde_json::json!({}))
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("config.json \"gui\" is not an object"))?
-            .insert("probe".into(), serde_json::Value::Bool(on));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
-        // Rename, so a crash mid-write cannot leave a config that will not
-        // parse and take the console down on its next boot.
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        log::error!("saving the probe setting to {}: {e}", path.display());
-    }
 }
 
 /// The geometry last asked of one head's guest.

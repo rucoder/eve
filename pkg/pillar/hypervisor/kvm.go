@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1036,17 +1037,20 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 		"-readconfig", file.Name(),
 		"-pidfile", kvmStateDir+domainName+"/pid")
 
+	debugOpts := currentDebugOptions()
+	var traceEvents string
 	if globalConfig != nil {
-		if events := globalConfig.GlobalValueString(types.QemuTraceEvents); events != "" {
-			if traceArgs, err := setupQemuTrace(domainName, events); err != nil {
-				logrus.Warnf("qemu tracing requested for %s but setup failed: %v", domainName, err)
-			} else {
-				args = append(args, traceArgs...)
-			}
+		traceEvents = globalConfig.GlobalValueString(types.QemuTraceEvents)
+	}
+	if events := mergeTraceEvents(traceEvents, debugOpts.Get(types.DebugVMQemuTrace)); events != "" {
+		if traceArgs, err := setupQemuTrace(domainName, events); err != nil {
+			logrus.Warnf("qemu tracing requested for %s but setup failed: %v", domainName, err)
+		} else {
+			args = append(args, traceArgs...)
 		}
-		if globalConfig.GlobalValueBool(types.QemuGdb) {
-			args = append(args, "-gdb", "unix:"+gdbSocketPath(domainName)+",server=on,wait=off")
-		}
+	}
+	if globalConfig != nil && globalConfig.GlobalValueBool(types.QemuGdb) {
+		args = append(args, "-gdb", "unix:"+gdbSocketPath(domainName)+",server=on,wait=off")
 	}
 
 	// Add CPUs affinity as a parameter to qemu.
@@ -1081,11 +1085,7 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 	spec.Get().Process.Args = args
 	logrus.Infof("Hypervisor args: %v", args)
 	if ctx.virtualGPUFor(config, aa) {
-		// TEMPORARY: iris in Mesa 26.2 exports a render-compressed scanout
-		// texture as its bare main surface, which the console then imports
-		// as all-black. Keep compression off for the virtual GPU's renderer
-		// until the export is fixed (or the console takes ScanoutDMABUF2).
-		spec.Get().Process.Env = append(spec.Get().Process.Env, "INTEL_DEBUG=noccs")
+		spec.Get().Process.Env = append(spec.Get().Process.Env, virtualGPUEnv(debugOpts)...)
 	}
 
 	// Enable a bounded kernel core dump of the qemu process on a fatal signal
@@ -1164,8 +1164,40 @@ var qemuTracePresets = map[string][]string{
 	},
 }
 
-// setupQemuTrace materializes the debug.qemu.trace.events list (a CSV of event
-// names/globs and/or @<preset> tokens) into a newline-separated events file and
+// virtualGPUEnv is the environment the debug options give a QEMU that
+// renders a virtual GPU on the host.
+func virtualGPUEnv(opts types.DebugOptionValues) []string {
+	var env []string
+	if opts.Bool(types.DebugVMIntelNoCCS) {
+		env = append(env, "INTEL_DEBUG=noccs")
+	}
+	if opts.Bool(types.DebugVMMesaDebug) {
+		env = append(env, "MESA_DEBUG=1")
+	}
+	if v := opts.Get(types.DebugVMVrendDebug); v != "" {
+		env = append(env, "VREND_DEBUG="+v)
+	}
+	return env
+}
+
+// mergeTraceEvents joins trace-event lists (CSV of event names, globs and
+// @presets), dropping repeats.
+func mergeTraceEvents(lists ...string) string {
+	var events []string
+	for _, list := range lists {
+		for _, tok := range strings.Split(list, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok != "" && !slices.Contains(events, tok) {
+				events = append(events, tok)
+			}
+		}
+	}
+	return strings.Join(events, ",")
+}
+
+// setupQemuTrace materializes the trace-event list - debug.qemu.trace.events
+// and the console's vm.qemu_trace, a CSV of event names/globs and/or
+// @<preset> tokens - into a newline-separated events file and
 // returns the qemu argv fragment enabling simpletrace to a per-VM binary log in
 // the vault. Timestamped so a crash dump pairs with its trace by proximity.
 func setupQemuTrace(domainName, traceEvents string) ([]string, error) {

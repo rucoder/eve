@@ -633,7 +633,7 @@ fn set_sampler_params(renderer: &mut GlowRenderer, tex_id: u32) {
 ///
 /// This exists because QMP `screendump` returns "no surface" once the scanout
 /// is a dmabuf, so it is the only way to answer "is there anything in the
-/// buffer at all" on the GL path. Enable with `GUI_PROBE=1`.
+/// buffer at all" on the GL path. Pillar's console.probe turns it on.
 fn probe_target(
     renderer: &mut GlowRenderer,
     target: &mut GlesTexture,

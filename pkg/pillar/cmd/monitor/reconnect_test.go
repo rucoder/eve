@@ -48,6 +48,13 @@ func TestDeviceStatusIsResentToEveryNewClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx.subscriptions = map[string]pubsub.Subscription{"AppStatus": subApp}
+	ctx.pubDebugOptionValues, err = ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.DebugOptionValues{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx.IPCServer = newIPCServer(ctx)
 	ctx.IPCServer.conn = serverConn
 	ctx.IPCServer.codec = serverCodec
@@ -93,15 +100,19 @@ func TestDeviceStatusIsResentToEveryNewClient(t *testing.T) {
 		return false
 	}
 
+	// Each connect pushes DeviceStatus, AppsList and DebugOptions here (no
+	// NetworkStatus subscription).
+	const perConnect = 3
+
 	// First console: gets the snapshot, which is what primes the dedup.
 	ctx.handleClientConnected()
-	if !sawDeviceStatus(t, 2) {
+	if !sawDeviceStatus(t, perConnect) {
 		t.Fatal("first client must get DeviceStatus")
 	}
 
 	// Second console, same agent, nothing upstream changed.
 	ctx.handleClientConnected()
-	if !sawDeviceStatus(t, 2) {
+	if !sawDeviceStatus(t, perConnect) {
 		t.Error("a reconnecting client must get DeviceStatus again, not just AppsList")
 	}
 }

@@ -13,9 +13,11 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::monitorapi::AppsList;
+use super::monitorapi::DebugOptions;
 use super::monitorapi::DeviceStatus;
 use super::monitorapi::GpuAck;
 use super::monitorapi::GpuRequest;
+use super::monitorapi::SetDebugOption;
 use super::monitorapi::SetInterfaceConfig;
 use super::monitorapi::RevertManualConfig;
 use super::monitorapi::TpmLogs;
@@ -47,6 +49,9 @@ pub enum Request {
     /// RequestData / id), the same one the TUI's existing requests use, not
     /// through IpcMessage's adjacently-tagged type/message envelope.
     GPUAck(GpuAck),
+    /// Change one of pillar's debug options. Pillar answers with
+    /// DebugOptions whether or not it took the change.
+    SetDebugOption(SetDebugOption),
 }
 
 // This is the IPC wire type; variant shapes mirror EVE messages and must not
@@ -73,6 +78,9 @@ pub enum IpcMessage {
     /// the console's answer (GPUAck) travels the other way, through the
     /// Request envelope below, not this one.
     GPURequest(GpuRequest),
+    /// Pillar's debug options and their values: on connect, and after every
+    /// change.
+    DebugOptions(DebugOptions),
     Response {
         #[serde(flatten)]
         result: core::result::Result<String, String>,

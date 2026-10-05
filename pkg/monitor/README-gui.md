@@ -77,8 +77,18 @@ All optional; a positional argument overrides `GUI_CARD`.
 | `GUI_LOG` | `info` | `error\|warn\|info\|debug\|trace` |
 | `GUI_LOG_DEPS` | `warn` | same, for libraries |
 | `GUI_LOG_FILE` | `/persist/eve-gui.log` | logging is asynchronous; a hot path never does I/O. /persist, not /run: a log on tmpfs is gone after the reboot you wanted to debug |
-| `GUI_PROBE` | – | read the blit target back and count non-black pixels |
+| `GUI_PROBE` | – | read the blit target back and count non-black pixels, until pillar's `console.probe` arrives |
 | `GUI_VT_KBD` | – | `0` leaves the VT keyboard to the kernel |
+
+### Debug options
+
+The Node tab's **Debug** page lists pillar's debug options (see
+`pkg/pillar/docs/monitor.md`) and shows each value as pillar last sent it.
+Console options take effect at once: the readback probe (`gui.probe` in
+config.json and `GUI_PROBE` only cover the time before pillar answers), the
+log level (it raises, never lowers, `debug.tui.loglevel`) and zbus logging,
+which otherwise stays at warn because zbus logs every D-Bus call at info.
+Application options apply on the application's next start.
 
 ## Using it
 

@@ -373,6 +373,25 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	domainCtx.subGPUConsoleStatus = subGPUConsoleStatus
 
+	// Debug options set from the local console. Persistent, so activating
+	// applies what was set before this boot ahead of any domain start.
+	subDebugOptionValues, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "monitor",
+		MyAgentName:   agentName,
+		TopicImpl:     types.DebugOptionValues{},
+		Persistent:    true,
+		Activate:      true,
+		Ctx:           &domainCtx,
+		CreateHandler: handleDebugOptionValuesCreate,
+		ModifyHandler: handleDebugOptionValuesModify,
+		DeleteHandler: handleDebugOptionValuesDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Look for nodeagent status
 	subNodeAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:   "nodeagent",
@@ -615,6 +634,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case change := <-subGPUConsoleStatus.MsgChan():
 			subGPUConsoleStatus.ProcessChange(change)
 
+		case change := <-subDebugOptionValues.MsgChan():
+			subDebugOptionValues.ProcessChange(change)
+
 		case <-domainCtx.publishTicker.C:
 			publishProcessesHandler(&domainCtx)
 
@@ -840,6 +862,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 		case change := <-subGPUConsoleStatus.MsgChan():
 			subGPUConsoleStatus.ProcessChange(change)
+
+		case change := <-subDebugOptionValues.MsgChan():
+			subDebugOptionValues.ProcessChange(change)
 
 		case change := <-subPhysicalIOAdapter.MsgChan():
 			subPhysicalIOAdapter.ProcessChange(change)
@@ -3309,6 +3334,18 @@ func handleDNSDelete(ctxArg interface{}, key string, statusArg interface{}) {
 	ctx.DNSinitialized = false
 	updatePortAndPciBackIoBundleAll(ctx)
 	log.Functionf("handleDNSDelete done for %s", key)
+}
+
+func handleDebugOptionValuesCreate(_ interface{}, _ string, statusArg interface{}) {
+	hypervisor.SetDebugOptions(statusArg.(types.DebugOptionValues).Values)
+}
+
+func handleDebugOptionValuesModify(_ interface{}, _ string, statusArg interface{}, _ interface{}) {
+	hypervisor.SetDebugOptions(statusArg.(types.DebugOptionValues).Values)
+}
+
+func handleDebugOptionValuesDelete(_ interface{}, _ string, _ interface{}) {
+	hypervisor.SetDebugOptions(nil)
 }
 
 func handleGlobalConfigCreate(ctxArg interface{}, key string,

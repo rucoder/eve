@@ -260,6 +260,17 @@ func (ctx *monitor) subscribe(ps *pubsub.PubSub) error {
 		return err
 	}
 
+	ctx.pubDebugOptionValues, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			TopicType:  types.DebugOptionValues{},
+			Persistent: true,
+		})
+	if err != nil {
+		log.Error("Cannot create DebugOptionValues publication")
+		return err
+	}
+
 	subGPUConsoleConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "domainmgr",
 		MyAgentName:   agentName,
@@ -476,6 +487,7 @@ func (ctx *monitor) handleClientConnected() {
 	ctx.sendDeviceStatus()
 	ctx.sendAppsList()
 	ctx.sendNetworkStatus()
+	ctx.sendDebugOptions()
 
 	// Activating, on the other hand, happens once for the life of the agent.
 	// Subscription.Activate() ends in Subscriber.Start(), which spawns a fresh

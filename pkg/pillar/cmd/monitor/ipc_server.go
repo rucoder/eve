@@ -50,7 +50,8 @@ func (r *request) validate() error {
 	}
 	// check supported request types
 	switch r.RequestType {
-	case "SetInterfaceConfig", "SetServer", "RevertManualConfig", monitorapi.GPUAckTag:
+	case "SetInterfaceConfig", "SetServer", "RevertManualConfig", monitorapi.GPUAckTag,
+		monitorapi.SetDebugOptionTag:
 	default:
 		return errors.New("Unsupported RequestType " + r.RequestType)
 	}
@@ -297,6 +298,16 @@ func (r *request) handleRequest(ctx *monitor) *response {
 			return r.malformedRequestResponse(err)
 		}
 		ctx.handleGPUAck(ack)
+		return r.okResponse()
+
+	case monitorapi.SetDebugOptionTag:
+		var req monitorapi.SetDebugOption
+		if err := json.Unmarshal(r.RequestData, &req); err != nil {
+			return r.malformedRequestResponse(err)
+		}
+		if err := ctx.handleSetDebugOption(req); err != nil {
+			return r.errResponse("Failed to set debug option", err)
+		}
 		return r.okResponse()
 
 	default:

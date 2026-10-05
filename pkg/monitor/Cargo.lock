@@ -1832,6 +1832,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tracing",
  "url",
  "uuid",
  "zbus",

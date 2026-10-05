@@ -55,18 +55,47 @@ fn ours_prefix() -> &'static str {
     module_path!().split("::").next().unwrap_or("monitor")
 }
 
+/// What pillar's console.log_level debug option asks for. It only raises the
+/// level: whatever config.json or TUIConfig set in `OURS` stays the floor.
+static DEBUG: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(log::LevelFilter::Off as usize);
+
+/// Whether zbus may log below WARN; pillar's console.zbus_log.
+static ZBUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set the level for our own code. Dependencies keep whatever they were given
 /// at startup: a request for debug output from us is not a request for every
 /// EGL span from smithay, and at trace those alone fill the log's byte cap in
 /// about two minutes, taking the history with them.
 pub fn set_ours(level: log::LevelFilter) {
     OURS.store(level as usize, std::sync::atomic::Ordering::Relaxed);
-    let deps = LOGGER.get().map_or(log::LevelFilter::Warn, |l| l.deps);
-    log::set_max_level(level.max(deps));
+    apply_levels();
 }
 
-fn ours_level() -> log::LevelFilter {
-    match OURS.load(std::sync::atomic::Ordering::Relaxed) {
+/// Pillar's console.log_level.
+pub fn set_debug_level(level: log::LevelFilter) {
+    if DEBUG.swap(level as usize, std::sync::atomic::Ordering::Relaxed) != level as usize {
+        apply_levels();
+        log::info!("console.log_level {level}: logging at {}", log::max_level());
+    }
+}
+
+/// Pillar's console.zbus_log.
+pub fn set_zbus(on: bool) {
+    if ZBUS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+        log::info!("console.zbus_log {on}");
+    }
+}
+
+fn apply_levels() {
+    let deps = LOGGER.get().map_or(log::LevelFilter::Warn, |l| l.deps);
+    log::set_max_level(ours_level().max(deps));
+    // The tracing bridge's level hint is cached per callsite.
+    tracing::callsite::rebuild_interest_cache();
+}
+
+fn level_at(slot: &std::sync::atomic::AtomicUsize) -> log::LevelFilter {
+    match slot.load(std::sync::atomic::Ordering::Relaxed) {
         0 => log::LevelFilter::Off,
         1 => log::LevelFilter::Error,
         2 => log::LevelFilter::Warn,
@@ -74,6 +103,115 @@ fn ours_level() -> log::LevelFilter {
         4 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     }
+}
+
+fn ours_level() -> log::LevelFilter {
+    level_at(&OURS).max(level_at(&DEBUG))
+}
+
+/// Send what zbus and smithay log through `tracing` on to `log`.
+///
+/// tracing does that by itself while nothing has claimed it, but filters on
+/// nothing but the global level then, and zbus opens an INFO span for every
+/// D-Bus call it dispatches - at least one per guest frame. This holds zbus at
+/// WARN unless console.zbus_log is on. A span is logged once, when it is
+/// created, as tracing's own fallback does; entering and leaving it is not.
+pub fn route_tracing() {
+    let bridge = TracingBridge { next_span: std::sync::atomic::AtomicU64::new(1) };
+    if let Err(e) = tracing::subscriber::set_global_default(bridge) {
+        log::warn!("tracing bridge: {e}");
+    }
+}
+
+struct TracingBridge {
+    next_span: std::sync::atomic::AtomicU64,
+}
+
+fn log_level_of(l: &tracing::Level) -> log::Level {
+    match *l {
+        tracing::Level::ERROR => log::Level::Error,
+        tracing::Level::WARN => log::Level::Warn,
+        tracing::Level::INFO => log::Level::Info,
+        tracing::Level::DEBUG => log::Level::Debug,
+        _ => log::Level::Trace,
+    }
+}
+
+impl tracing::Subscriber for TracingBridge {
+    // Decided per record: the levels and console.zbus_log change at runtime.
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+        let level = log_level_of(m.level());
+        level <= log::max_level()
+            && (level <= log::Level::Warn
+                || !m.target().starts_with("zbus")
+                || ZBUS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        use tracing::level_filters::LevelFilter;
+        Some(match log::max_level() {
+            log::LevelFilter::Off => LevelFilter::OFF,
+            log::LevelFilter::Error => LevelFilter::ERROR,
+            log::LevelFilter::Warn => LevelFilter::WARN,
+            log::LevelFilter::Info => LevelFilter::INFO,
+            log::LevelFilter::Debug => LevelFilter::DEBUG,
+            log::LevelFilter::Trace => LevelFilter::TRACE,
+        })
+    }
+
+    fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut line = Fields(format!("++ {}", a.metadata().name()));
+        a.record(&mut line);
+        forward(a.metadata(), &line.0);
+        tracing::span::Id::from_u64(self.next_span.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, e: &tracing::Event<'_>) {
+        let mut line = Fields(String::new());
+        e.record(&mut line);
+        forward(e.metadata(), &line.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A record's fields as one line: the message as is, the rest as name=value.
+struct Fields(String);
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = match f.name() {
+            "message" => write!(self.0, "{v:?}"),
+            name => write!(self.0, "{name}={v:?}"),
+        };
+    }
+}
+
+fn forward(m: &tracing::Metadata<'_>, msg: &str) {
+    log::logger().log(
+        &log::Record::builder()
+            .level(log_level_of(m.level()))
+            .target(m.target())
+            .module_path(m.module_path())
+            .file(m.file())
+            .line(m.line())
+            .args(format_args!("{msg}"))
+            .build(),
+    );
 }
 
 struct Async {

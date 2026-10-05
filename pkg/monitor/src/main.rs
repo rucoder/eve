@@ -404,6 +404,9 @@ fn sync_console_after_gui(console: &mut frontend::Console, available: bool) {
 async fn main() -> Result<()> {
     let config = AppConfig::load_or_create_app_config(&get_base_dir());
     let _log2 = init_logging(&config.log_level);
+    // The floor that pillar's console.log_level debug option can only raise.
+    gui::logger::set_ours(LevelFilter::from_str(&config.log_level).unwrap_or(LevelFilter::Info));
+    gui::logger::route_tracing();
     initialize_panic_handler()?;
     log_system_info();
 
@@ -445,14 +448,12 @@ async fn main() -> Result<()> {
                     stop_watcher.clone(),
                 );
 
-                let cfg_path = get_base_dir().join("config").join("config.json");
                 if let Err(e) = gui::run(
                     client.state.clone(),
                     client.outbox.clone(),
                     switch.clone(),
                     config.gui.mode.as_deref(),
                     config.gui.clone(),
-                    cfg_path,
                 ) {
                     log::error!("Gui error: {e}");
                 }

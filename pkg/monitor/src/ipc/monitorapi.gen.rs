@@ -210,6 +210,30 @@ pub struct CellProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugOption {
+    #[serde(rename = "key")]
+    pub key: String,
+    #[serde(rename = "label")]
+    pub label: String,
+    #[serde(rename = "description")]
+    pub description: String,
+    #[serde(rename = "scope")]
+    pub scope: String,
+    #[serde(rename = "kind")]
+    pub kind: String,
+    #[serde(rename = "choices", default, deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    #[serde(rename = "value")]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugOptions {
+    #[serde(rename = "options", default, deserialize_with = "null_as_default")]
+    pub options: Vec<DebugOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceStatus {
     #[serde(rename = "server")]
     pub server: String,
@@ -379,6 +403,14 @@ pub struct Sim {
     pub iccid: String,
     #[serde(rename = "imsi")]
     pub imsi: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetDebugOption {
+    #[serde(rename = "key")]
+    pub key: String,
+    #[serde(rename = "value")]
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

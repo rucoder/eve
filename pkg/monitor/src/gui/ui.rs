@@ -24,7 +24,7 @@ pub struct GuestView<'a> {
     /// level pillar last set.
     pub desc: Option<crate::gui::scanout::GuestDesc>,
     /// Non-black pixels the readback last found in the blit target, when
-    /// GUI_PROBE is on: the one fact that separates "we sampled nothing" from
+    /// the probe is on: the one fact that separates "we sampled nothing" from
     /// "the guest drew nothing".
     pub probe_nonblack: Option<(usize, usize)>,
     /// The guest told us it turned this display off.
@@ -52,21 +52,25 @@ fn guest_detail(g: &GuestView<'_>) -> String {
 }
 
 /// Which page of the node tab is showing. Mirrors the TUI's tabs, minus the
-/// two it has that we have no data for over IPC (Vault, Dmesg).
+/// two it has that we have no data for over IPC (Vault, Dmesg), plus pillar's
+/// debug options.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NodePage {
     Summary,
     Network,
     Apps,
+    Debug,
 }
 
 impl NodePage {
-    pub const ALL: [NodePage; 3] = [NodePage::Summary, NodePage::Network, NodePage::Apps];
+    pub const ALL: [NodePage; 4] =
+        [NodePage::Summary, NodePage::Network, NodePage::Apps, NodePage::Debug];
     fn title(self) -> &'static str {
         match self {
             NodePage::Summary => "Summary",
             NodePage::Network => "Network",
             NodePage::Apps => "Applications",
+            NodePage::Debug => "Debug",
         }
     }
 }
@@ -203,9 +207,11 @@ pub struct Frame<'a> {
     pub page: NodePage,
     pub ports: &'a [PortView],
     pub apps: &'a [AppView],
+    /// Pillar's debug options, as it last sent them.
+    pub debug: &'a [crate::ipc::monitorapi::DebugOption],
     /// The port editor, when one is open.
     pub edit: Option<&'a PortEdit>,
-    /// Whether the readback probe is running, for the checkbox that owns it.
+    /// Whether the readback probe is running.
     pub probe: bool,
     /// Host-side memory for the active guest, if it has a cgroup yet.
     pub vmstat: Option<&'a crate::gui::vmstat::Series>,
@@ -235,8 +241,8 @@ pub struct Actions {
     pub send_wake: bool,
     /// Leave fullscreen; the overlay's button, equivalent to Ctrl+Alt+F.
     pub toggle_fullscreen: bool,
-    /// Turn the readback probe on or off; persisted to config.json.
-    pub set_probe: Option<bool>,
+    /// Ask pillar to set a debug option: key, value.
+    pub set_debug: Option<(String, String)>,
     /// Chrome drawn over the guest, in points. Input must reach US here even
     /// while the guest holds the pointer, or the way out is unclickable
     /// exactly when it is needed.
@@ -276,7 +282,7 @@ impl Actions {
         self.send_cad |= other.send_cad;
         self.send_wake |= other.send_wake;
         self.toggle_fullscreen |= other.toggle_fullscreen;
-        self.set_probe = self.set_probe.or(other.set_probe);
+        self.set_debug = self.set_debug.take().or_else(|| other.set_debug.clone());
     }
 }
 
@@ -524,10 +530,11 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             });
         match f.page {
             NodePage::Summary => {
-                node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, f.vmstat, act)
+                node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, f.vmstat)
             }
             NodePage::Network => network_page(ui, f.ports, act),
             NodePage::Apps => apps_page(ui, f.apps),
+            NodePage::Debug => debug_page(ui, f.debug, act),
         }
         return;
     }
@@ -798,6 +805,75 @@ fn apps_page(ui: &mut egui::Ui, apps: &[AppView]) {
     });
 }
 
+/// Pillar's debug options, one widget each. A change goes to pillar, and the
+/// page shows the value pillar sends back rather than assuming it took.
+fn debug_page(ui: &mut egui::Ui, options: &[crate::ipc::monitorapi::DebugOption], act: &mut Actions) {
+    ui.add_space(12.0);
+    ui.heading("Debug");
+    ui.add_space(8.0);
+    if options.is_empty() {
+        ui.label("waiting for pillar…");
+        return;
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.set_max_width(760.0);
+        for o in options {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&o.label).strong());
+                ui.weak(&o.key);
+                if o.scope == "vm" {
+                    ui.weak("·  applies on next start of an application");
+                }
+            });
+            ui.weak(&o.description);
+            ui.add_space(4.0);
+            match o.kind.as_str() {
+                "bool" => {
+                    let mut on = o.value == "true";
+                    let text = if on { "on" } else { "off" };
+                    if ui.checkbox(&mut on, text).changed() {
+                        act.set_debug = Some((o.key.clone(), on.to_string()));
+                    }
+                }
+                "enum" => {
+                    egui::ComboBox::from_id_salt(("debug", o.key.as_str()))
+                        .selected_text(&o.value)
+                        .show_ui(ui, |ui| {
+                            for c in &o.choices {
+                                if ui.selectable_label(*c == o.value, c).clicked() && *c != o.value {
+                                    act.set_debug = Some((o.key.clone(), c.clone()));
+                                }
+                            }
+                        });
+                }
+                "string" => {
+                    // What is being typed, kept until Apply: pillar's value
+                    // must not overwrite it mid-edit.
+                    let id = egui::Id::new(("debug_draft", o.key.as_str()));
+                    let mut draft = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| o.value.clone());
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::TextEdit::singleline(&mut draft).desired_width(420.0));
+                        let entered = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let apply = ui.add_enabled(draft != o.value, egui::Button::new("Apply")).clicked();
+                        if (apply || entered) && draft != o.value {
+                            act.set_debug = Some((o.key.clone(), draft.trim().to_string()));
+                            ui.data_mut(|d| d.remove::<String>(id));
+                        } else if r.changed() {
+                            ui.data_mut(|d| d.insert_temp(id, draft.clone()));
+                        }
+                    });
+                }
+                _ => {
+                    ui.label(&o.value);
+                }
+            }
+            ui.add_space(6.0);
+            ui.separator();
+        }
+    });
+}
+
 fn node_page(
     ui: &mut egui::Ui,
     n: &NodeView,
@@ -806,7 +882,6 @@ fn node_page(
     g: &GuestView<'_>,
     probe: bool,
     vmstat: Option<&crate::gui::vmstat::Series>,
-    act: &mut Actions,
 ) {
     if !n.connected {
         ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
@@ -943,18 +1018,7 @@ fn node_page(
                 ui.end_row();
             }
             ui.label(egui::RichText::new("Probe").strong());
-            let mut on = probe;
-            let c = ui.checkbox(&mut on, "count non-black pixels every 10s");
-            if c.changed() {
-                act.set_probe = Some(on);
-            }
-            c.on_hover_text(
-                "Reads the blitted guest image back off the GPU. The only way \
-                 to tell a guest that is drawing nothing from pixels this \
-                 console is losing, because screendump cannot see a dmabuf \
-                 scanout. Costs a pipeline stall each time, so leave it off \
-                 unless a tab is blank.",
-            );
+            ui.label(if probe { "on (Debug page)" } else { "off (Debug page)" });
             ui.end_row();
         });
 

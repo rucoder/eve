@@ -94,6 +94,8 @@ glow = "0.16"
 # authenticates, so no bus daemon and no session bus are involved.
 zbus = { version = "5", default-features = false, features = ["tokio", "p2p", "blocking-api"] }
 zvariant = "5"
+# zbus and smithay log through tracing; gui::logger hands it on to `log`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 sha2 = "0.10.8"

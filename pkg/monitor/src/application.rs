@@ -53,7 +53,8 @@ pub struct GuiConfig {
     /// non-black pixels. The only way to tell "the guest sent us nothing"
     /// from "we lost the pixels" once the scanout is a dmabuf, because QMP
     /// `screendump` answers "no surface" on that path. Off by default: it is
-    /// a full GPU readback and it stalls the pipeline.
+    /// a full GPU readback and it stalls the pipeline. Only until pillar's
+    /// console.probe debug option arrives, which then decides.
     #[serde(default)]
     pub probe: bool,
 
@@ -286,6 +287,9 @@ impl<'a> Application<'a> {
                 debug!("Got TpmLogs");
                 self.model.borrow_mut().update_tpm_logs(logs);
             }
+
+            // Applied by ipc::apply, whichever frontend is running.
+            IpcMessage::DebugOptions(_) => {}
 
             #[allow(unreachable_patterns)]
             _ => {
