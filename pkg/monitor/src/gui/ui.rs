@@ -143,7 +143,34 @@ pub struct AppView {
     pub version: String,
     pub state: String,
     pub error: String,
-    pub has_console: bool,
+    /// Where its display is; empty for an app without a virtual GPU. The
+    /// tab attached to it carries the same path in `TabView::source`.
+    pub qmp_socket: String,
+}
+
+/// A guest tab, for the Applications page: what each of its heads shows.
+pub struct TabView {
+    pub name: String,
+    /// The QMP socket it was attached through; empty for a GUI_VMS tab.
+    pub source: String,
+    pub heads: Vec<ScanoutView>,
+}
+
+/// One guest head. Guest head N is drawn on host head N.
+pub struct ScanoutView {
+    pub head: usize,
+    /// The host connectors it is drawn on: none while there are fewer
+    /// monitors than the guest has heads, several for a guest's first head
+    /// while there are more.
+    pub monitors: Vec<String>,
+    pub asleep: bool,
+    /// The image size the guest sent, which on the copy path is all there is.
+    pub size: (u32, u32),
+    /// None on the copy path, or before any dmabuf scanout.
+    pub desc: Option<crate::gui::scanout::GuestDesc>,
+    pub fps: f32,
+    pub frames: u64,
+    pub probe_nonblack: Option<(usize, usize)>,
 }
 
 /// A hardware cursor the guest published, for us to draw locally.
@@ -163,23 +190,35 @@ pub struct NodeView<'a> {
     pub connected: bool,
 }
 
-/// What the Node tab shows about the console's own display. Worth surfacing:
-/// a resolution that looks wrong is usually explained by the EDID column -
-/// without one the driver invents a preferred mode, and under QEMU it tracks
-/// the window rather than anything the operator chose.
+/// What the Node tab shows about the console's own monitors. Worth
+/// surfacing: a resolution that looks wrong is usually explained by the mode's
+/// source - without an EDID the driver invents a preferred mode, and under
+/// QEMU it tracks the window rather than anything the operator chose.
 pub struct DisplayView<'a> {
     pub card: &'a str,
-    pub connector: &'a str,
+    pub pinned: Option<&'a str>,
+    pub scale: f32,
+    /// Every head, in order. Empty except while the Summary page is up.
+    pub monitors: &'a [MonitorView],
+}
+
+/// One host head.
+pub struct MonitorView {
+    pub connector: String,
     pub w: i32,
     pub h: i32,
     pub refresh: u32,
     pub edid: bool,
-    pub pinned: Option<&'a str>,
-    pub scale: f32,
+    pub input: bool,
+    /// Flips per second. A head is redrawn only when something on it
+    /// changes, so this is often far below the refresh rate.
+    pub fps: f32,
 }
 
 pub struct Frame<'a> {
     pub head: &'a str,
+    /// This head's mode: width, height, refresh.
+    pub head_mode: (i32, i32, u32),
     /// This head takes input: it alone has the controls and a pointer. Every
     /// other head shows the same bar, read-only, and is never hit-tested.
     pub input: bool,
@@ -207,14 +246,17 @@ pub struct Frame<'a> {
     pub page: NodePage,
     pub ports: &'a [PortView],
     pub apps: &'a [AppView],
+    /// Every guest tab. Empty except while the Applications page is up.
+    pub guest_tabs: &'a [TabView],
     /// Pillar's debug options, as it last sent them.
     pub debug: &'a [crate::ipc::monitorapi::DebugOption],
     /// The port editor, when one is open.
     pub edit: Option<&'a PortEdit>,
     /// Whether the readback probe is running.
     pub probe: bool,
-    /// Host-side memory for the active guest, if it has a cgroup yet.
-    pub vmstat: Option<&'a crate::gui::vmstat::Series>,
+    /// Host-side memory for the active guest, if it has a cgroup yet, and
+    /// that guest's name.
+    pub vmstat: Option<(&'a str, &'a crate::gui::vmstat::Series)>,
     /// A remote session owns the guest's display, so we are not drawing it.
     pub remote: bool,
     /// The guest's pointer is relative (PS/2): it moves its own cursor from
@@ -463,7 +505,7 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             }
             ui.label(format!(
                 "{} {}x{}@{}Hz  ·  {:.0} fps  ·  guest {:.0} fps  ·  frame {}  ·  t={:.1}s",
-                f.head, f.display.w, f.display.h, f.display.refresh, f.fps, f.guest_fps, f.frame, f.elapsed
+                f.head, f.head_mode.0, f.head_mode.1, f.head_mode.2, f.fps, f.guest_fps, f.frame, f.elapsed
             ));
             ui.separator();
             ui.label(match (f.guest.tex, f.guest.dma_id) {
@@ -529,11 +571,9 @@ fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
                 }
             });
         match f.page {
-            NodePage::Summary => {
-                node_page(ui, &f.node, &f.display, f.fps, &f.guest, f.probe, f.vmstat)
-            }
+            NodePage::Summary => node_page(ui, &f.node, &f.display, f.vmstat),
             NodePage::Network => network_page(ui, f.ports, act),
-            NodePage::Apps => apps_page(ui, f.apps),
+            NodePage::Apps => apps_page(ui, f.apps, f.guest_tabs, f.probe),
             NodePage::Debug => debug_page(ui, f.debug, act),
         }
         return;
@@ -769,40 +809,129 @@ fn network_page(ui: &mut egui::Ui, ports: &[PortView], act: &mut Actions) {
     });
 }
 
-/// What pillar says is deployed here, and which of them this console can show.
-fn apps_page(ui: &mut egui::Ui, apps: &[AppView]) {
+/// What pillar says is deployed here and, for each one with a display, what
+/// each of its heads is showing and on which monitor.
+fn apps_page(ui: &mut egui::Ui, apps: &[AppView], tabs: &[TabView], probe: bool) {
     ui.add_space(12.0);
     ui.heading("Applications");
     ui.add_space(8.0);
-    if apps.is_empty() {
+    // GUI_VMS tabs are nobody's app, but they are on screen all the same.
+    let unlisted: Vec<&TabView> = tabs.iter().filter(|t| t.source.is_empty()).collect();
+    if apps.is_empty() && unlisted.is_empty() {
         ui.label("no app instances on this node");
         return;
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("apps")
-            .num_columns(5)
-            .spacing([24.0, 8.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for h in ["Name", "State", "Version", "Console", "UUID"] {
-                    ui.label(egui::RichText::new(h).strong());
+        for a in apps {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&a.name).strong());
+                // An app in error says so where it is read, not in a log.
+                if a.error.is_empty() {
+                    ui.label(&a.state);
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("{} — {}", a.state, a.error));
+                }
+                if !a.version.is_empty() {
+                    ui.weak(format!("v{}", a.version));
+                }
+                ui.weak(&a.uuid);
+            });
+            if a.qmp_socket.is_empty() {
+                ui.weak("no display");
+            } else {
+                match tabs.iter().find(|t| t.source == a.qmp_socket) {
+                    Some(t) => scanout_table(ui, t, probe),
+                    None => {
+                        ui.weak("display not attached yet");
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            ui.separator();
+        }
+        for t in unlisted {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&t.name).strong());
+                ui.weak("GUI_VMS tab");
+            });
+            scanout_table(ui, t, probe);
+            ui.add_space(6.0);
+            ui.separator();
+        }
+    });
+}
+
+/// One row per guest head: where it is shown, what the buffer is, and how
+/// fast it is coming.
+fn scanout_table(ui: &mut egui::Ui, t: &TabView, probe: bool) {
+    let mut cols = vec![
+        "Head", "Monitor", "Scanout", "Format", "Modifier", "Planes", "Method", "Guest fps", "Frames",
+    ];
+    if probe {
+        cols.push("Readback");
+    }
+    egui::Grid::new(("scanouts", t.source.as_str(), t.name.as_str()))
+        .num_columns(cols.len())
+        .spacing([20.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for c in &cols {
+                ui.label(egui::RichText::new(*c).weak());
+            }
+            ui.end_row();
+            for s in &t.heads {
+                ui.label(s.head.to_string());
+                ui.label(if s.monitors.is_empty() { "not shown".to_string() } else { s.monitors.join(", ") });
+                let (w, h) = s.size;
+                match (s.asleep, s.desc) {
+                    (true, _) => {
+                        ui.label("display off");
+                        for _ in 0..4 {
+                            ui.label("—");
+                        }
+                    }
+                    (false, Some(d)) => {
+                        let (x, y, w, h) = d.rect;
+                        ui.label(format!("{w}x{h}+{x}+{y} of {}x{}", d.backing.0, d.backing.1));
+                        let name: String = d.fourcc.to_le_bytes().iter().map(|&c| c as char).collect();
+                        // What we import it as differs whenever the declared
+                        // format claimed an alpha channel a scanout lacks.
+                        ui.label(name).on_hover_text(format!(
+                            "0x{:08x}, imported as {}",
+                            d.fourcc,
+                            crate::gui::scanout::opaque_name(d.fourcc)
+                        ));
+                        ui.label(format!("0x{:x}", d.modifier));
+                        ui.label(d.planes.to_string());
+                        ui.label(d.method);
+                    }
+                    (false, None) if w > 0 => {
+                        ui.label(format!("{w}x{h}"));
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("—");
+                        ui.label("Scanout (copy)");
+                    }
+                    (false, None) => {
+                        ui.label("waiting for a scanout");
+                        for _ in 0..4 {
+                            ui.label("—");
+                        }
+                    }
+                }
+                ui.label(format!("{:.1}", s.fps));
+                ui.label(s.frames.to_string());
+                if probe {
+                    ui.label(match s.probe_nonblack {
+                        Some((nz, total)) => format!("{nz} / {total} non-black"),
+                        None => "—".to_string(),
+                    });
                 }
                 ui.end_row();
-                for a in apps {
-                    ui.label(&a.name);
-                    // An app in error says so where it is read, not in a log.
-                    if a.error.is_empty() {
-                        ui.label(&a.state);
-                    } else {
-                        ui.colored_label(egui::Color32::LIGHT_RED, format!("{} — {}", a.state, a.error));
-                    }
-                    ui.label(if a.version.is_empty() { "—" } else { a.version.as_str() });
-                    ui.label(if a.has_console { "yes" } else { "—" });
-                    ui.label(egui::RichText::new(&a.uuid).weak());
-                    ui.end_row();
-                }
-            });
-    });
+            }
+        });
 }
 
 /// Pillar's debug options, one widget each. A change goes to pillar, and the
@@ -878,10 +1007,7 @@ fn node_page(
     ui: &mut egui::Ui,
     n: &NodeView,
     d: &DisplayView,
-    fps: f32,
-    g: &GuestView<'_>,
-    probe: bool,
-    vmstat: Option<&crate::gui::vmstat::Series>,
+    vmstat: Option<(&str, &crate::gui::vmstat::Series)>,
 ) {
     if !n.connected {
         ui.centered_and_justified(|ui| ui.label("waiting for pillar…"));
@@ -929,104 +1055,43 @@ fn node_page(
     ui.add_space(18.0);
     ui.separator();
     ui.add_space(12.0);
-    ui.heading("Display");
+    ui.heading("Monitors");
     ui.add_space(8.0);
-    let mode = format!("{}x{} @ {}Hz", d.w, d.h, d.refresh);
-    let scale = format!("{:.2}x", d.scale);
-    let source = match (d.pinned, d.edid) {
-        (Some(p), _) => format!("pinned to {p} in config.json"),
-        (None, true) => "preferred mode from the display's EDID".to_string(),
-        (None, false) => "largest mode offered - no EDID, so nothing states a preference".to_string(),
-    };
-    egui::Grid::new("display")
-        .num_columns(2)
-        .spacing([28.0, 10.0])
+    ui.weak(format!(
+        "{}{}",
+        d.card,
+        d.pinned.map_or(String::new(), |p| format!("  ·  mode pinned to {p} in config.json")),
+    ));
+    ui.add_space(6.0);
+    egui::Grid::new("monitors")
+        .num_columns(6)
+        .spacing([28.0, 8.0])
+        .striped(true)
         .show(ui, |ui| {
-            for (k, v) in [
-                ("Resolution", mode.as_str()),
-                ("Chosen", source.as_str()),
-                ("UI scale", scale.as_str()),
-                ("Card", d.card),
-                ("Connector", d.connector),
-            ] {
-                ui.label(egui::RichText::new(k).strong());
-                ui.label(if v.is_empty() { "—" } else { v });
+            for h in ["Connector", "Mode", "Mode from", "Input", "UI scale", "Rendering"] {
+                ui.label(egui::RichText::new(h).strong());
+            }
+            ui.end_row();
+            for m in d.monitors {
+                ui.label(&m.connector);
+                ui.label(format!("{}x{} @ {}Hz", m.w, m.h, m.refresh));
+                ui.label(match (d.pinned, m.edid) {
+                    (Some(_), _) => "config.json",
+                    (None, true) => "EDID preferred",
+                    (None, false) => "largest offered (no EDID)",
+                });
+                ui.label(if m.input { "input" } else { "—" });
+                ui.label(format!("{:.2}x", d.scale));
+                ui.label(format!("{:.0} fps", m.fps));
                 ui.end_row();
             }
-            ui.label(egui::RichText::new("Rendering").strong());
-            ui.label(format!("{fps:.0} fps"));
-            ui.end_row();
         });
 
-    // The active guest's buffer, in the same place an operator already looks
-    // for what this console is drawing. A wrong pixel format shows up as a
-    // blank tab, which is indistinguishable from a guest that is not drawing
-    // until you can see the format.
-    ui.add_space(18.0);
-    ui.separator();
-    ui.add_space(12.0);
-    ui.heading("Guest");
-    ui.add_space(8.0);
-    egui::Grid::new("guest")
-        .num_columns(2)
-        .spacing([28.0, 10.0])
-        .show(ui, |ui| {
-            let path = match (g.tex, g.dma_id) {
-                (_, Some(_)) => "dmabuf, zero-copy",
-                (Some(_), _) => "copy, through host memory",
-                _ => "—",
-            };
-            let size = match (g.dma_id, g.tex) {
-                (Some(_), _) => format!("{}x{}", g.dma_size.x, g.dma_size.y),
-                (None, Some(t)) => format!("{}x{}", t.size()[0], t.size()[1]),
-                _ => "—".to_string(),
-            };
-            let mut rows = vec![
-                ("Scanout".to_string(), path.to_string()),
-                ("Size".to_string(), size),
-                ("Frames".to_string(), g.seq.to_string()),
-            ];
-            if let Some(desc) = g.desc {
-                let name: String = desc.fourcc.to_le_bytes().iter().map(|&c| c as char).collect();
-                // What QEMU declared and what we import it as: they differ
-                // whenever the declared format claimed an alpha channel a
-                // scanout does not have.
-                let mapped = crate::gui::scanout::opaque_name(desc.fourcc);
-                rows.push((
-                    "Format".to_string(),
-                    format!("{name} (0x{:08x}) -> {mapped}", desc.fourcc),
-                ));
-                rows.push(("Modifier".to_string(), format!("0x{:x}", desc.modifier)));
-                rows.push(("Planes".to_string(), desc.planes.to_string()));
-                rows.push(("Stride".to_string(), format!("{} bytes", desc.stride)));
-                let (x, y, _, _) = desc.rect;
-                rows.push((
-                    "Buffer".to_string(),
-                    format!("{}x{}, this head at +{x}+{y}", desc.backing.0, desc.backing.1),
-                ));
-                rows.push((
-                    "Origin".to_string(),
-                    if desc.y0_top { "top-left" } else { "bottom-left" }.to_string(),
-                ));
-            }
-            if let Some((nz, total)) = g.probe_nonblack {
-                rows.push(("Readback".to_string(), format!("{nz} / {total} non-black px")));
-            }
-            for (k, v) in rows {
-                ui.label(egui::RichText::new(k).strong());
-                ui.label(v);
-                ui.end_row();
-            }
-            ui.label(egui::RichText::new("Probe").strong());
-            ui.label(if probe { "on (Debug page)" } else { "off (Debug page)" });
-            ui.end_row();
-        });
-
-    if let Some(v) = vmstat {
+    if let Some((name, v)) = vmstat {
         ui.add_space(18.0);
         ui.separator();
         ui.add_space(12.0);
-        ui.heading("Guest memory");
+        ui.heading(format!("Guest memory: {name}"));
         ui.add_space(8.0);
         memory_plot(ui, v);
     }

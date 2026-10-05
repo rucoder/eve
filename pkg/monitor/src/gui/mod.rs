@@ -266,6 +266,9 @@ pub fn run(
     let mut win_gseq = [0u64; stats::MAX_HEADS];
     let mut fps_now = 0.0f32;
     let mut gfps_now = [0.0f32; stats::MAX_HEADS];
+    // Flips per head, for the Monitors table.
+    let mut win_flips = [0u64; stats::MAX_HEADS];
+    let mut hfps_now = [0.0f32; stats::MAX_HEADS];
     let mut n_done = 0u32;
     // The guest frame each head last put on screen, for stats::Head::shown.
     let mut last_shown = [u64::MAX; stats::MAX_HEADS];
@@ -383,6 +386,12 @@ pub fn run(
                     let seq = vms.get(active).map_or(0, |v| v.head(h).seq);
                     gfps_now[h] = seq.saturating_sub(win_gseq[h]) as f32 / wdt;
                     win_gseq[h] = seq;
+                    let flips = stats::head(h).flips.load(std::sync::atomic::Ordering::Relaxed);
+                    hfps_now[h] = flips.saturating_sub(win_flips[h]) as f32 / wdt;
+                    win_flips[h] = flips;
+                }
+                for vm in vms.iter_mut() {
+                    vm.sample_rates(wdt);
                 }
                 win_t = std::time::Instant::now();
                 win_frames = 0;
@@ -397,12 +406,13 @@ pub fn run(
                     .and_then(|d| d.file_name())
                     .and_then(|n| n.to_str())
                     .and_then(|dom| vmstat_all.get(dom))
+                    .map(|v| (vm.name.as_str(), v))
             });
             // Hand the display over, or take it back. One consumer at a
             // time: with heads enabled for both, the guest spreads its one
             // absolute pointer across the union of them and neither side can
             // place a cursor.
-            let want_remote = vmstat_now.is_some_and(|v| v.vnc_clients > 0);
+            let want_remote = vmstat_now.is_some_and(|(_, v)| v.vnc_clients > 0);
             if want_remote != remote {
                 remote = want_remote;
                 if let Some(vm) = vms.get(active) {
@@ -436,6 +446,30 @@ pub fn run(
             // over a head set with a new head in it, and waiting for a flip
             // that head never queued is a 3s timeout and a dead console.
             let mut flipped: Vec<u32> = Vec::new();
+            // What the Node page's tables show, gathered once rather than
+            // per head; only the input head draws the Node page.
+            let monitors: Vec<ui::MonitorView> = if show_node && node_page == ui::NodePage::Summary {
+                heads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| ui::MonitorView {
+                        connector: h.name.clone(),
+                        w: h.w,
+                        h: h.h,
+                        refresh: h.refresh,
+                        edid: h.edid,
+                        input: i == ih,
+                        fps: hfps_now[i.min(stats::MAX_HEADS - 1)],
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let guest_tabs = if show_node && node_page == ui::NodePage::Apps {
+                tabs_of(&vms, &heads)
+            } else {
+                Vec::new()
+            };
             if drawn_key.len() != heads.len() || std::mem::take(&mut redraw_all) {
                 drawn_key = vec![None; heads.len()];
                 repaint_at = vec![None; heads.len()];
@@ -538,6 +572,7 @@ pub fn run(
                     page: node_page,
                     ports: &ports,
                     apps: &apps,
+                    guest_tabs: &guest_tabs,
                     debug: &debug_opts,
                     edit: edit.as_ref(),
                     probe,
@@ -554,15 +589,12 @@ pub fn run(
                     },
                     display: ui::DisplayView {
                         card: &card,
-                        connector: &head_name,
-                        w: head.w,
-                        h: head.h,
-                        refresh: head.refresh,
-                        edid: head.edid,
                         pinned: mode,
                         scale: points_per_pixel(),
+                        monitors: &monitors,
                     },
                     head: &head_name,
+                    head_mode: (head.w, head.h, head.refresh),
                     input,
                     input_head: &input_name,
                     fps: fps_now,
@@ -1394,7 +1426,49 @@ fn apps_of(p: &crate::ipc::PillarState) -> Vec<ui::AppView> {
             version: a.version.clone(),
             state: format!("{:?}", a.state),
             error: a.error.clone(),
-            has_console: !a.qmp_socket.is_empty(),
+            qmp_socket: a.qmp_socket.clone(),
+        })
+        .collect()
+}
+
+/// What every guest head is showing and where, for the Applications page.
+fn tabs_of(vms: &[Vm], heads: &[drm::Head]) -> Vec<ui::TabView> {
+    vms.iter()
+        .map(|vm| ui::TabView {
+            name: vm.name.clone(),
+            source: vm.source.clone(),
+            heads: vm
+                .scanouts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let g = guest::frame(&s.shared);
+                    // A tab that is not on screen leaves the guest's newest
+                    // buffer pending; the last one taken holds only while the
+                    // guest has not gone back to the copy path.
+                    let desc = g.dmabuf.as_ref().map(scanout::GuestDesc::of).or_else(|| {
+                        s.desc.filter(|_| s.dma_id.is_some() && !g.copy_takeover)
+                    });
+                    // Heads past the guest's last one mirror its first; see
+                    // Vm::head.
+                    let monitors = heads
+                        .iter()
+                        .enumerate()
+                        .filter(|(hi, _)| *hi == i || (i == 0 && *hi >= vm.scanouts.len()))
+                        .map(|(_, h)| h.name.clone())
+                        .collect();
+                    ui::ScanoutView {
+                        head: i,
+                        monitors,
+                        asleep: g.display_off,
+                        size: (g.w, g.h),
+                        desc,
+                        fps: s.fps,
+                        frames: g.seq,
+                        probe_nonblack: s.probe_nonblack,
+                    }
+                })
+                .collect(),
         })
         .collect()
 }

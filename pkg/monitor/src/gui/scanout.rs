@@ -111,6 +111,10 @@ pub struct Scanout {
     pub size: (u32, u32),
     /// Frames seen, for the rate readout. Advanced on both paths.
     pub seq: u64,
+    /// Guest frames per second, from `Vm::sample_rates`, and the listener's
+    /// frame count it last sampled.
+    pub fps: f32,
+    rate_seq: Option<u64>,
 
     /// Copy path: the uploaded guest image.
     pub tex: Option<egui::TextureHandle>,
@@ -172,6 +176,21 @@ pub struct GuestDesc {
     pub rect: (u32, u32, u32, u32),
     pub backing: (u32, u32),
     pub method: &'static str,
+}
+
+impl GuestDesc {
+    pub fn of(d: &guest::GuestDmabuf) -> Self {
+        Self {
+            fourcc: d.fourcc,
+            modifier: d.modifier,
+            stride: d.planes.first().map_or(0, |p| p.stride),
+            y0_top: d.y0_top,
+            planes: d.planes.len(),
+            rect: (d.x, d.y, d.w, d.h),
+            backing: (d.backing_w, d.backing_h),
+            method: d.method,
+        }
+    }
 }
 
 /// More buffers than any sane compositor rotates; a resize also clears it.
@@ -249,6 +268,17 @@ impl Vm {
             s.release_gl();
         }
     }
+
+    /// Update every head's guest frame rate, `dt` seconds after the last
+    /// call. Read off the listener's counter rather than `seq`, which only
+    /// moves while the tab is on screen.
+    pub fn sample_rates(&mut self, dt: f32) {
+        for s in self.scanouts.iter_mut() {
+            let seq = guest::frame(&s.shared).seq;
+            s.fps = s.rate_seq.map_or(0.0, |was| seq.saturating_sub(was) as f32 / dt);
+            s.rate_seq = Some(seq);
+        }
+    }
 }
 
 impl Scanout {
@@ -259,6 +289,8 @@ impl Scanout {
             shared,
             size: (0, 0),
             seq: 0,
+            fps: 0.0,
+            rate_seq: None,
             tex: None,
             dma_id: None,
             dma_size: egui::vec2(1.0, 1.0),
@@ -320,16 +352,7 @@ impl Scanout {
         let new_size = egui::vec2(d.w as f32, d.h as f32);
         let resized = self.dma_size != new_size;
 
-        let desc = GuestDesc {
-            fourcc: d.fourcc,
-            modifier: d.modifier,
-            stride: d.planes.first().map_or(0, |p| p.stride),
-            y0_top: d.y0_top,
-            planes: d.planes.len(),
-            rect: (d.x, d.y, d.w, d.h),
-            backing: (d.backing_w, d.backing_h),
-            method: d.method,
-        };
+        let desc = GuestDesc::of(&d);
         self.desc = Some(desc);
 
         let mut layout = [(0, 0); MAX_PLANES];
