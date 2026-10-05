@@ -440,8 +440,8 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             }
             ui.separator();
             ui.label(format!(
-                "{}  ·  {:.0} fps  ·  guest {:.0} fps  ·  frame {}  ·  t={:.1}s",
-                f.head, f.fps, f.guest_fps, f.frame, f.elapsed
+                "{} {}x{}@{}Hz  ·  {:.0} fps  ·  guest {:.0} fps  ·  frame {}  ·  t={:.1}s",
+                f.head, f.display.w, f.display.h, f.display.refresh, f.fps, f.guest_fps, f.frame, f.elapsed
             ));
             ui.separator();
             ui.label(match (f.guest.tex, f.guest.dma_id) {

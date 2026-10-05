@@ -212,8 +212,10 @@ pub fn run(
     let start = std::time::Instant::now();
     let mut win_t = std::time::Instant::now();
     let mut win_frames = 0u32;
-    let mut win_gseq = 0u64;
-    let (mut fps_now, mut gfps_now) = (0.0f32, 0.0f32);
+    // Per head: a guest can draw on one monitor while the others stay idle.
+    let mut win_gseq = [0u64; stats::MAX_HEADS];
+    let mut fps_now = 0.0f32;
+    let mut gfps_now = [0.0f32; stats::MAX_HEADS];
     let mut n_done = 0u32;
     // The guest frame each head last put on screen, for stats::Head::shown.
     let mut last_shown = [u64::MAX; stats::MAX_HEADS];
@@ -240,6 +242,9 @@ pub fn run(
     let loop_result = (|| -> anyhow::Result<()> {
         for n in 0..limit {
             let frame_t0 = std::time::Instant::now();
+            // Set by a tab switch: this frame's work is finished before the next
+            // guest is drawn, so nothing in flight still reads the one we left.
+            let mut quiesce = false;
             if !vt::running() {
                 log::info!("signal received at frame {n}, shutting down cleanly");
                 break;
@@ -257,7 +262,7 @@ pub fn run(
                 match vms.get(active) {
                     Some(vm) => {
                         inp.set_active(vm.tx.clone());
-                        win_gseq = vm.head(0).seq;
+                        win_gseq = std::array::from_fn(|h| vm.head(h).seq);
                         log::info!("active tab is now {}", vm.name);
                     }
                     None => {
@@ -310,11 +315,13 @@ pub fn run(
             let wdt = win_t.elapsed().as_secs_f32();
             if wdt >= 0.5 {
                 fps_now = win_frames as f32 / wdt;
-                let seq = vms.get(active).map_or(0, |v| v.head(0).seq);
-                gfps_now = seq.saturating_sub(win_gseq) as f32 / wdt;
+                for h in 0..stats::MAX_HEADS {
+                    let seq = vms.get(active).map_or(0, |v| v.head(h).seq);
+                    gfps_now[h] = seq.saturating_sub(win_gseq[h]) as f32 / wdt;
+                    win_gseq[h] = seq;
+                }
                 win_t = std::time::Instant::now();
                 win_frames = 0;
-                win_gseq = seq;
             }
 
             // Hold the sampler's lock for the whole paint: the alternative
@@ -499,7 +506,7 @@ pub fn run(
                     },
                     head: &head_name,
                     fps: fps_now,
-                    guest_fps: gfps_now,
+                    guest_fps: gfps_now[hi.min(stats::MAX_HEADS - 1)],
                     frame: n,
                     elapsed: start.elapsed().as_secs_f32(),
                     tabs: &tabs,
@@ -839,12 +846,13 @@ pub fn run(
             if let Some(t) = want {
                 let (node, idx) = if t == 0 { (true, active) } else { (false, t - 1) };
                 if node != show_node || idx != active {
+                    quiesce = true;
                     show_node = node;
                     if !node {
                         active = idx;
                         if let Some(vm) = vms.get(active) {
                             inp.set_active(vm.tx.clone());
-                            win_gseq = vm.head(0).seq; // not a real rate jump
+                            win_gseq = std::array::from_fn(|h| vm.head(h).seq); // not a real rate jump
                         }
                         cur_seq = u64::MAX; // reload this guest's cursor
                     }
@@ -964,9 +972,36 @@ pub fn run(
                 );
                 stats::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &wait, n)?;
-            for head in heads.iter_mut().filter(|h| wait.contains(&h.crtc.into())) {
-                let _: Option<()> = head.surface.frame_submitted()?;
+            match drm::wait_for_flips(&mut gpu.drm, gpu.raw_fd, &wait, n) {
+                Ok(()) => {
+                    for head in heads.iter_mut().filter(|h| wait.contains(&h.crtc.into())) {
+                        if let Err(e) = head.surface.frame_submitted() {
+                            log::warn!("{}: frame_submitted: {e}; resetting its buffers", head.name);
+                            head.surface.reset_buffers();
+                            redraw_all = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // A flip that never arrives - DRM master taken away, or the
+                    // GPU stalled behind a hung VF - must not take the console
+                    // down. Forget the queued flips and draw every head afresh.
+                    let master = drm::acquire_master(gpu.raw_fd);
+                    log::warn!(
+                        "{e}; dropping the queued flips and redrawing every head (DRM master {})",
+                        if master { "held" } else { "NOT held" }
+                    );
+                    for head in heads.iter_mut() {
+                        head.surface.reset_buffers();
+                    }
+                    redraw_all = true;
+                }
+            }
+            if quiesce {
+                let _ = gpu.renderer.with_context(|gl| unsafe {
+                    use glow::HasContext as _;
+                    gl.finish();
+                });
             }
             n_done = n + 1;
             if wait.is_empty() {
@@ -994,8 +1029,13 @@ pub fn run(
                 } else {
                     String::new()
                 };
+                let guest = gfps_now[..heads.len().min(stats::MAX_HEADS)]
+                    .iter()
+                    .map(|g| format!("{g:.1}"))
+                    .collect::<Vec<_>>()
+                    .join("/");
                 log::info!(
-                    "frame {n}: {:.1} fps drawn avg  guest {gfps_now:.1} fps{lat}",
+                    "frame {n}: {:.1} fps drawn avg  guest {guest} fps{lat}",
                     stats::FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f64
                         / start.elapsed().as_secs_f64()
                 );

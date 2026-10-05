@@ -398,6 +398,15 @@ pub fn wait_for_flips(
     Ok(())
 }
 
+/// Take DRM master back, for a frame whose flip never arrived: a VT switch or
+/// another client may have taken it, and without it every commit fails with
+/// EACCES. True when we hold master afterwards.
+pub fn acquire_master(raw_fd: RawFd) -> bool {
+    // DRM_IO(0x1e)
+    const DRM_IOCTL_SET_MASTER: libc::Ioctl = 0x641e;
+    unsafe { libc::ioctl(raw_fd, DRM_IOCTL_SET_MASTER) == 0 }
+}
+
 /// Release DRM master. Without this, stale state is left behind and the next
 /// run renders black until the host is rebooted.
 pub fn drop_master(raw_fd: RawFd) {
