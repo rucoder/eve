@@ -109,12 +109,12 @@ impl Stats {
     }
 }
 
-/// One head's guest image: where it is on the host, and what it is in the
-/// guest. Everything needed to turn a host pointer position into a point in
-/// the guest's desktop, for the one head the pointer happens to be over.
+/// The input head's guest image: where it is on that head, and what it is in
+/// the guest. Everything needed to turn a host pointer position into a point
+/// in the guest's desktop.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct GuestArea {
-    /// The guest image on the host, in combined host pixels: x, y, w, h.
+    /// The guest image, in the input head's pixels: x, y, w, h.
     pub view: (f32, f32, f32, f32),
     /// The scanout the guest renders for this head.
     pub size: (u32, u32),
@@ -125,18 +125,25 @@ pub struct GuestArea {
 
 #[derive(Default)]
 pub struct State {
+    /// The host pointer, in the input head's pixels. It never leaves that
+    /// head.
     pub x: f64,
     pub y: f64,
     pub focus_guest: bool,
     /// The active guest's pointer is relative. Published by the render loop
     /// from what the guest pump read off QEMU's IsAbsolute.
     pub relative: bool,
-    /// One per head, in head order. Empty until the render loop has drawn.
-    pub areas: Vec<GuestArea>,
-    /// The guest's whole desktop: the bounding box of every `area.off+size`.
+    /// The guest image on the input head. None until the render loop has
+    /// drawn one.
+    pub area: Option<GuestArea>,
+    /// The guest's whole desktop: the bounding box of every scanout, the
+    /// ones on heads that take no input included.
     pub desktop: (u32, u32),
-    /// Chrome drawn ON TOP of the guest, in host pixels. The guest does not
-    /// get pointer buttons here even while it holds the pointer.
+    /// Console 0's scanout: the range `SetAbsPosition` accepts.
+    pub range: (u32, u32),
+    /// Chrome drawn ON TOP of the guest, in the input head's pixels. The
+    /// guest does not get pointer buttons here even while it holds the
+    /// pointer.
     pub chrome: Option<(f32, f32, f32, f32)>,
     pub egui_events: Vec<egui::Event>,
     pub want_tab: Option<usize>,
@@ -149,9 +156,9 @@ pub struct State {
 /// our frame rate - polling libinput once per frame added up to a frame of lag.
 pub struct Handle {
     pub stats: std::sync::Arc<Stats>,
-    /// The area the pointer may move in, packed as `w << 32 | h`. Shared
-    /// rather than owned because the input thread blocks in `poll()` and a
-    /// monitor can be plugged in while it is asleep.
+    /// The input head's size, packed as `w << 32 | h`: the pointer is
+    /// confined to it. Shared rather than owned because the input thread
+    /// blocks in `poll()` and a monitor can be plugged in while it is asleep.
     bounds: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub state: std::sync::Arc<std::sync::Mutex<State>>,
     pub active_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<GuestAct>>>>,
@@ -162,7 +169,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// A head changed size or went away: keep the pointer inside the panel.
+    /// The input head changed, or changed size: keep the pointer inside it.
     pub fn set_bounds(&self, w: i32, h: i32) {
         self.bounds.store(
             ((w.max(1) as u64) << 32) | h.max(1) as u64,
@@ -295,9 +302,9 @@ pub fn spawn(w: i32, h: i32, scale: f64) -> anyhow::Result<Handle> {
             if let Some(t) = inp.want_tab.take() { s.want_tab = Some(t); }
             if std::mem::take(&mut inp.want_fullscreen) { s.want_fullscreen = true; }
             // render loop publishes these back
-            inp.areas.clear();
-            inp.areas.extend_from_slice(&s.areas);
+            inp.area = s.area;
             inp.desktop = s.desktop;
+            inp.range = s.range;
             inp.chrome = s.chrome;
             inp.relative = s.relative;
         }
@@ -339,9 +346,10 @@ pub struct Input {
     held: std::collections::HashSet<u32>,
     pub egui_events: Vec<egui::Event>,
     pub guest: Vec<GuestAct>,
-    /// One per head: the guest image on screen and what it maps to.
-    pub areas: Vec<GuestArea>,
+    /// The input head's guest image and what it maps to.
+    pub area: Option<GuestArea>,
     pub desktop: (u32, u32),
+    pub range: (u32, u32),
     pub chrome: Option<(f32, f32, f32, f32)>,
     /// Tab the user asked for via Ctrl+Alt+N; consumed by the caller.
     pub want_tab: Option<usize>,
@@ -372,9 +380,9 @@ impl Drop for Input {
 }
 
 impl Input {
-    /// Adopt a head set that changed under us, clamping the pointer into it.
-    /// A pointer left outside the panel is invisible and cannot be recovered
-    /// with the mouse, only by unplugging the monitor that was removed.
+    /// Adopt an input head that changed under us, clamping the pointer into
+    /// it. A pointer left outside the panel is invisible and cannot be
+    /// recovered with the mouse.
     fn take_bounds(&mut self) {
         let v = self.bounds.load(std::sync::atomic::Ordering::Relaxed);
         let (w, h) = ((v >> 32) as f64, (v & 0xFFFF_FFFF) as f64);
@@ -418,7 +426,7 @@ impl Input {
             stats: Default::default(),
             held: Default::default(),
             egui_events: Vec::new(), guest: Vec::new(),
-            areas: Vec::new(), desktop: (0, 0), chrome: None, abs_n: 0, want_tab: None,
+            area: None, desktop: (0, 0), range: (0, 0), chrome: None, abs_n: 0, want_tab: None,
             want_fullscreen: false,
             inotify_fd, devices: HashMap::new(),
         };
@@ -513,9 +521,9 @@ impl Input {
 
     pub fn fd(&self) -> i32 { self.li.as_raw_fd() }
 
-    /// The head whose guest image the pointer is over, if any.
+    /// The input head's guest image, if the pointer is over it.
     fn area_at(&self, x: f32, y: f32) -> Option<&GuestArea> {
-        self.areas.iter().find(|a| {
+        self.area.as_ref().filter(|a| {
             let (vx, vy, vw, vh) = a.view;
             // A head with no scanout yet is not a place to grab into: a tab
             // can exist before its guest has produced a frame, and a click
@@ -532,9 +540,10 @@ impl Input {
     /// The guest has ONE absolute pointer covering its whole desktop, however
     /// many monitors it has, and QEMU scales whatever we send by the width of
     /// the console we send it on. So the answer is a point in the guest's
-    /// DESKTOP, expressed as a fraction and then rescaled into console 0's
-    /// pixel range - not a point in the scanout under the cursor, which would
-    /// sweep the entire desktop across one monitor.
+    /// DESKTOP - inside the input head's scanout, at the offset we gave it -
+    /// expressed as a fraction and then rescaled into console 0's pixel range;
+    /// not a point in that scanout alone, which would sweep the entire
+    /// desktop across one monitor.
     ///
     /// With one head this is the identity it always was: the desktop is that
     /// one scanout and the rescale cancels.
@@ -545,7 +554,7 @@ impl Input {
         let (dw, dh) = self.desktop;
         // Console 0's scanout is the range SetAbsPosition accepts; it rejects
         // anything at or past its own width.
-        let (cw, ch) = self.areas.first().map_or((0, 0), |c| c.size);
+        let (cw, ch) = self.range;
         if gw == 0 || gh == 0 || dw < 2 || dh < 2 || cw < 2 || ch < 2 {
             return None;
         }
@@ -611,6 +620,9 @@ impl Input {
                         if self.abs_devices.insert(id.clone()) {
                             log::debug!("pointer: {id} reports absolute; ignoring ITS relative events");
                         }
+                        // The device's whole range is the input head: an
+                        // absolute HID such as a PiKVM's cannot say which
+                        // monitor it means.
                         let (nx, ny) = (m.absolute_x_transformed(self.w as u32),
                                         m.absolute_y_transformed(self.h as u32));
                         let last = self.abs_last.replace((nx, ny));
@@ -813,29 +825,14 @@ impl Input {
     /// sit in the top bar or the letterbox margin, to_guest() returns None, and
     /// the guest cursor silently stops following - it looks like it vanished.
     fn clamp_to_view(&mut self) {
-        if self.focus != Focus::Guest || self.areas.is_empty() {
+        if self.focus != Focus::Guest {
             return;
         }
-        // Already over one head's guest image: nothing to do, and in
-        // particular do NOT pull it back to some other head's rect.
-        if self.in_view() {
+        // At least a pixel, or the clamp below has its bounds crossed.
+        let Some((vx, vy, vw, vh)) = self.area.map(|a| a.view).filter(|v| v.2 >= 1.0 && v.3 >= 1.0)
+        else {
             return;
-        }
-        // Outside every one: clamp into the nearest, by centre distance.
-        let (x, y) = (self.x as f32, self.y as f32);
-        let nearest = self
-            .areas
-            .iter()
-            .filter(|a| a.view.2 > 0.0 && a.view.3 > 0.0)
-            .min_by(|a, b| {
-                let d = |v: (f32, f32, f32, f32)| {
-                    let (cx, cy) = (v.0 + v.2 / 2.0, v.1 + v.3 / 2.0);
-                    (x - cx).powi(2) + (y - cy).powi(2)
-                };
-                d(a.view).total_cmp(&d(b.view))
-            });
-        let Some(a) = nearest else { return };
-        let (vx, vy, vw, vh) = a.view;
+        };
         self.x = self.x.clamp(vx as f64, (vx + vw - 1.0) as f64);
         self.y = self.y.clamp(vy as f64, (vy + vh - 1.0) as f64);
     }
@@ -852,7 +849,7 @@ impl Input {
                         self.x, self.y,
                         a.map(|a| a.view), a.map(|a| a.size), a.map(|a| a.off),
                         self.desktop,
-                        self.areas.first().map(|c| c.size),
+                        self.range,
                     );
                 }
                 self.guest.push(GuestAct::AbsPos(gx, gy)); } }

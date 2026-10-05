@@ -23,6 +23,19 @@ guest ──virtio-gpu──> QEMU ──D-Bus display──> eve-gui ──DRM/
 * **The guest framebuffer arrives over QEMU's D-Bus display** (`-display dbus`),
   which is a peer-to-peer socket QEMU authenticates itself — no bus daemon.
 
+### One monitor takes input
+
+The guest gets a scanout per monitor and lays them out side by side as one
+extended desktop, but only the *input head* takes input. The host pointer is
+confined to it, an absolute device (a PiKVM's HID included) maps its whole
+range onto it, and the guest's absolute pointer is computed from the scanout
+shown there and its offset in the guest's desktop. The tabs, the buttons and
+the Node page are on the input head only; every other monitor shows its
+scanout under a read-only copy of the status bar. The input head is the
+connector named by `GUI_INPUT_HEAD` (or `gui.input_head` in config.json)
+while it is connected, and the first head otherwise; it is chosen again on
+every hotplug.
+
 ### Two framebuffer paths, and why you want the first
 
 | | how | cost |
@@ -58,6 +71,7 @@ All optional; a positional argument overrides `GUI_CARD`.
 | `GUI_VMS` | – | `name=<d-bus addr>` pairs, **semicolon** separated (an address contains a comma) |
 | `GUI_CARD` | probed | DRM device; unset, `card0..card3` are probed and the first with a connected output wins |
 | `GUI_ORIENT` | `1` | 0=none 1=flipY 2=flipX 3=rot180 |
+| `GUI_INPUT_HEAD` | first head | connector that takes input, e.g. `HDMI-A-2`; overrides `gui.input_head` in config.json |
 | `GUI_PTR_SCALE` | `1.0` | pointer sensitivity; motion is otherwise raw 1:1 |
 | `GUI_FRAMES` | `0` | frame limit, 0 = run until signalled |
 | `GUI_LOG` | `info` | `error\|warn\|info\|debug\|trace` |

@@ -176,6 +176,11 @@ pub struct DisplayView<'a> {
 
 pub struct Frame<'a> {
     pub head: &'a str,
+    /// This head takes input: it alone has the controls and a pointer. Every
+    /// other head shows the same bar, read-only, and is never hit-tested.
+    pub input: bool,
+    /// The head that does, named on the others.
+    pub input_head: &'a str,
     pub fps: f32,
     pub guest_fps: f32,
     pub frame: u32,
@@ -302,6 +307,9 @@ pub fn draw(ctx: &egui::Context, f: &Frame) -> Actions {
         egui::Frame::central_panel(&ctx.style())
     };
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| central(ui, f, &mut act));
+    if !f.input {
+        return act;
+    }
     if f.fullscreen {
         fs_tab(ctx, f, &mut act);
     }
@@ -414,31 +422,39 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             ui.heading("EVE GUI");
             ui.separator();
             for (i, name) in f.tabs.iter().enumerate() {
-                if ui.selectable_label(i == f.active, name).clicked() {
-                    act.tab = Some(i);
+                if f.input {
+                    if ui.selectable_label(i == f.active, name).clicked() {
+                        act.tab = Some(i);
+                    }
+                } else {
+                    let t = egui::RichText::new(name);
+                    ui.label(if i == f.active { t.strong() } else { t.weak() });
                 }
             }
             ui.separator();
-            // The chord itself is forwarded too (see vt::CtrlAltDelGuard), but a
-            // Windows logon screen is precisely where you are not grabbed yet.
-            if ui
-                .button("Ctrl+Alt+Del")
-                .on_hover_text("send to the active guest")
-                .clicked()
-            {
-                act.send_cad = true;
+            if f.input {
+                // The chord itself is forwarded too (see vt::CtrlAltDelGuard),
+                // but a Windows logon screen is precisely where you are not
+                // grabbed yet.
+                if ui
+                    .button("Ctrl+Alt+Del")
+                    .on_hover_text("send to the active guest")
+                    .clicked()
+                {
+                    act.send_cad = true;
+                }
+                // A blanked guest display makes QEMU withhold the scanout, so
+                // there is nothing to draw until something wakes it. A
+                // keystroke does; pointer motion does not reliably.
+                if ui
+                    .button("Wake")
+                    .on_hover_text("tap Shift in the active guest to wake its display")
+                    .clicked()
+                {
+                    act.send_wake = true;
+                }
+                ui.separator();
             }
-            // A blanked guest display makes QEMU withhold the scanout, so there
-            // is nothing to draw until something wakes it. A keystroke does;
-            // pointer motion does not reliably.
-            if ui
-                .button("Wake")
-                .on_hover_text("tap Shift in the active guest to wake its display")
-                .clicked()
-            {
-                act.send_wake = true;
-            }
-            ui.separator();
             ui.label(format!(
                 "{} {}x{}@{}Hz  ·  {:.0} fps  ·  guest {:.0} fps  ·  frame {}  ·  t={:.1}s",
                 f.head, f.display.w, f.display.h, f.display.refresh, f.fps, f.guest_fps, f.frame, f.elapsed
@@ -464,6 +480,10 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
             };
             ui.colored_label(colour, text);
             ui.separator();
+            if !f.input {
+                ui.weak(format!("controls on {}", f.input_head));
+                ui.separator();
+            }
             ui.weak("Ctrl+Alt+1/2 = tab");
             ui.separator();
             ui.weak(if f.fullscreen {
@@ -476,6 +496,12 @@ fn bar_contents(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
 }
 
 fn central(ui: &mut egui::Ui, f: &Frame, act: &mut Actions) {
+    if f.node_tab && !f.input {
+        ui.centered_and_justified(|ui| {
+            ui.weak(format!("the Node page is on {}", f.input_head));
+        });
+        return;
+    }
     if f.node_tab {
         // Vertical nav on the left, like the TUI's tab strip but down the
         // side: the pages are few and their names are words, so a column

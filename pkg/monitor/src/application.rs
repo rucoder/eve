@@ -56,6 +56,11 @@ pub struct GuiConfig {
     /// a full GPU readback and it stalls the pipeline.
     #[serde(default)]
     pub probe: bool,
+
+    /// The connector that takes input, e.g. "HDMI-A-2". Unset, or not
+    /// connected, means the first head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_head: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
