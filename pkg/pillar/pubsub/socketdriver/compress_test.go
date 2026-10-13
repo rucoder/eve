@@ -1,0 +1,115 @@
+// Copyright (c) 2026 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package socketdriver
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
+	"testing"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+)
+
+// TestCompressedFrameRoundTrip checks that a message above maxFrameSize is
+// compressed into a frame, flagged, and read back whole into a buffer the
+// caller owns.
+func TestCompressedFrameRoundTrip(t *testing.T) {
+	msg := bytes.Repeat([]byte(`{"Port":"eth0","Pacfile":"x"} `), 200000)
+	frame, err := compress(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frame) > maxFrameSize() {
+		t.Fatalf("frame of %d bytes", len(frame))
+	}
+	var stream bytes.Buffer
+	if err := writeFrame(&stream, frame, true); err != nil {
+		t.Fatal(err)
+	}
+	stats := &pubsub.SubStats{}
+	fr := NewFrameReaderWithStats(&stream, stats)
+	got, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("got %d bytes, sent %d", len(got), len(msg))
+	}
+	if !fr.Owned() {
+		t.Error("a decompressed message is not in a buffer of its own")
+	}
+	if stats.CompressedFrames.Load() != 1 || stats.DecompressedBytes.Load() != int64(len(msg)) {
+		t.Errorf("compressed frames %d, decompressed bytes %d",
+			stats.CompressedFrames.Load(), stats.DecompressedBytes.Load())
+	}
+	fr.Release()
+	if n := stats.RetainedBufBytes.Load(); n != 0 {
+		t.Errorf("%d bytes held after Release", n)
+	}
+}
+
+// TestCompressRefuses checks the two limits of a message above maxFrameSize:
+// it must compress into maxFrameSize bytes, and be at most maxMessageSize.
+func TestCompressRefuses(t *testing.T) {
+	random := make([]byte, 2*maxFrameSize())
+	_, _ = rand.Read(random)
+	if _, err := compress(random); err == nil {
+		t.Error("incompressible message of 2MB accepted")
+	}
+	if _, err := compress(make([]byte, maxMessageSize()+1)); err == nil {
+		t.Error("message above maxMessageSize accepted")
+	}
+}
+
+// TestDecompressRefusesOversizedMessage checks that a small frame which
+// decompresses beyond maxMessageSize is an error rather than an allocation
+// of that size.
+func TestDecompressRefusesOversizedMessage(t *testing.T) {
+	var frame bytes.Buffer
+	enc, err := zstd.NewWriter(&frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeros := make([]byte, 1<<20)
+	for i := 0; i < maxMessageSize()>>20+16; i++ {
+		_, _ = enc.Write(zeros)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stream bytes.Buffer
+	if err := writeFrame(&stream, frame.Bytes(), true); err != nil {
+		t.Fatal(err)
+	}
+	stats := &pubsub.SubStats{}
+	if _, err := NewFrameReaderWithStats(&stream, stats).ReadFrame(); err == nil {
+		t.Fatalf("a %d byte frame of %d MB of zeros was accepted",
+			frame.Len(), maxMessageSize()>>20+16)
+	}
+	if n := stats.RejectedFrames.Load(); n != 1 {
+		t.Errorf("%d frames counted as rejected, expected 1", n)
+	}
+}
+
+// TestRejectedFrameCounted checks that a frame above the frame size is
+// refused before its payload is read, and counted.
+func TestRejectedFrameCounted(t *testing.T) {
+	var stream bytes.Buffer
+	var hdr [4]byte
+	binary.LittleEndian.PutUint32(hdr[:], uint32(maxFrameSize()+1))
+	stream.Write(hdr[:])
+	stats := &pubsub.SubStats{}
+	fr := NewFrameReaderWithStats(&stream, stats)
+	if _, err := fr.ReadFrame(); err == nil {
+		t.Fatal("a frame above the frame size was accepted")
+	}
+	if n := stats.RejectedFrames.Load(); n != 1 {
+		t.Errorf("%d frames counted as rejected, expected 1", n)
+	}
+	if fr.buf != nil {
+		t.Error("a buffer was taken for the rejected frame")
+	}
+}
