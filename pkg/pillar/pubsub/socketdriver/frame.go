@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"unsafe"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
@@ -42,15 +43,21 @@ var (
 
 // WriteFrame writes payload as a single frame.
 func WriteFrame(w io.Writer, payload []byte) error {
-	return writeFrame(w, payload, false)
+	return writeFrame(w, payload, false, nil)
 }
 
 // writeFrame writes payload as a single frame, flagged as compressed if
-// it is.
-func writeFrame(w io.Writer, payload []byte, compressed bool) error {
+// it is, counting its allocations in a: the header and the two-element
+// net.Buffers, which escape to the heap.
+func writeFrame(w io.Writer, payload []byte, compressed bool, a *pubsub.Alloc) error {
 	if maxFrame := maxFrameSize(); len(payload) > maxFrame {
 		return fmt.Errorf("frame of %d bytes exceeds max %d",
 			len(payload), maxFrame)
+	}
+	if a != nil {
+		a.Add(4)
+		a.Add(24)
+		a.Add(48)
 	}
 	n := uint32(len(payload))
 	if compressed {
@@ -70,6 +77,19 @@ type FrameReader struct {
 	buf   *[]byte // the buffer of the current frame, if any
 	class int     // pool of buf, or -1 for a buffer of its own
 	stats *pubsub.SubStats
+	alloc *pubsub.Alloc // counts buffers when there are no stats
+}
+
+// sliceHeaderSize is the size of a slice header, which a buffer kept as a
+// *[]byte moves to the heap.
+const sliceHeaderSize = int(unsafe.Sizeof([]byte{}))
+
+func (fr *FrameReader) countAlloc(n int) {
+	if fr.stats != nil {
+		fr.stats.AllocReadBuf.Add(n)
+	} else if fr.alloc != nil {
+		fr.alloc.Add(n)
+	}
 }
 
 // NewFrameReader returns a FrameReader reading from r.
@@ -119,6 +139,8 @@ func (fr *FrameReader) acquire(size int) []byte {
 		} else {
 			b := make([]byte, bufClasses[fr.class])
 			fr.buf = &b
+			fr.countAlloc(len(b))
+			fr.countAlloc(sliceHeaderSize) // b, moved to the heap by &b
 		}
 	} else {
 		b := make([]byte, size)
@@ -126,9 +148,12 @@ func (fr *FrameReader) acquire(size int) []byte {
 		if fr.stats != nil {
 			fr.stats.OversizedFrames.Add(1)
 		}
+		fr.countAlloc(size)
+		fr.countAlloc(sliceHeaderSize)
 	}
 	if fr.stats != nil {
 		fr.stats.RetainedBufBytes.Add(int64(cap(*fr.buf)))
+		fr.stats.BufTakenBytes.Add(int64(cap(*fr.buf)))
 	}
 	return (*fr.buf)[:size]
 }
@@ -182,6 +207,8 @@ func (fr *FrameReader) decompress(buf []byte) ([]byte, error) {
 		return nil, fmt.Errorf("frame of %d bytes: %w", len(buf), err)
 	}
 	fr.buf, fr.class = &msg, -1
+	fr.countAlloc(cap(msg))
+	fr.countAlloc(sliceHeaderSize)
 	if fr.stats != nil {
 		fr.stats.RetainedBufBytes.Add(int64(cap(msg)))
 		fr.stats.CompressedFrames.Add(1)
