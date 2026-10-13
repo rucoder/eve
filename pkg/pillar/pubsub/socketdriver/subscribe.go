@@ -26,6 +26,7 @@ import (
 // Implements Unix-domain socket or directory subscription,
 // and directory-based persistence.
 type Subscriber struct {
+	stats            *pubsub.SubStats
 	sockName         string   // there is one socket per publishing agent
 	sock             net.Conn // For socket subscriptions
 	subscribeFromDir bool     // Handle special case of file only info
@@ -230,6 +231,8 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 			}
 			s.sock = sock
 			req := fmt.Sprintf("request %s", s.topic)
+			s.stats.AllocDecode.Add(len(req))
+			s.stats.AllocDecode.Add(len(req))
 			_, err = sock.Write([]byte(req))
 			if err != nil {
 				errStr := fmt.Sprintf("connectAndRead(%s): sock write failed %s",
@@ -269,8 +272,11 @@ func (s *Subscriber) connectAndRead() (string, string, []byte) {
 // msg is "" if there is nothing to process
 func (s *Subscriber) read() (string, string, []byte) {
 
-	buf, doneFunc := GetBuffer()
+	buf, doneFunc := getBuffer(&s.stats.AllocReadBuf)
 	defer doneFunc()
+	s.stats.BufTakenBytes.Add(int64(len(buf)))
+	s.stats.RetainedBufBytes.Add(int64(len(buf)))
+	defer s.stats.RetainedBufBytes.Add(-int64(len(buf)))
 
 	res, err := s.sock.Read(buf)
 	if err != nil {
@@ -288,7 +294,10 @@ func (s *Subscriber) read() (string, string, []byte) {
 		s.log.Errorf("connectAndRead(%s) request likely truncated\n", s.name)
 		return "", "", nil
 	}
+	s.stats.AddFrame(res)
 	reply := strings.Split(string(buf[0:res]), " ")
+	s.stats.AllocDecode.Add(res)
+	s.stats.AllocDecode.Add(cap(reply) * 16)
 	count := len(reply)
 	if count < 2 {
 		errStr := fmt.Sprintf("connectAndRead(%s): too short read", s.name)
@@ -332,6 +341,7 @@ func (s *Subscriber) read() (string, string, []byte) {
 		}
 		recvKey := reply[2]
 
+		s.countDecode(len(recvKey))
 		key, err := base64.StdEncoding.DecodeString(recvKey)
 		if err != nil {
 			errStr := fmt.Sprintf("connectAndRead(%s): base64 failed %s", s.name, err)
@@ -340,6 +350,9 @@ func (s *Subscriber) read() (string, string, []byte) {
 		}
 		if s.logger.GetLevel() == logrus.TraceLevel {
 			s.log.Tracef("connectAndRead(%s): delete type %s key %s\n", s.name, t, string(key))
+		}
+		if len(key) > 1 {
+			s.stats.AllocDecode.Add(len(key))
 		}
 		return msg, string(key), nil
 
@@ -351,12 +364,14 @@ func (s *Subscriber) read() (string, string, []byte) {
 		}
 		recvKey := reply[2]
 		recvVal := reply[3]
+		s.countDecode(len(recvKey))
 		key, err := base64.StdEncoding.DecodeString(recvKey)
 		if err != nil {
 			errStr := fmt.Sprintf("connectAndRead(%s): base64 key failed %s", s.name, err)
 			s.log.Errorln(errStr)
 			return "", "", nil
 		}
+		s.countDecode(len(recvVal))
 		val, err := base64.StdEncoding.DecodeString(recvVal)
 		if err != nil {
 			errStr := fmt.Sprintf("connectAndRead(%s): base64 val failed %s", s.name, err)
@@ -365,6 +380,9 @@ func (s *Subscriber) read() (string, string, []byte) {
 		}
 		if s.logger.GetLevel() == logrus.TraceLevel {
 			s.log.Tracef("connectAndRead(%s): update type %s key %s val %s\n", s.name, t, string(key), string(val))
+		}
+		if len(key) > 1 {
+			s.stats.AllocDecode.Add(len(key))
 		}
 		return msg, string(key), val
 
@@ -498,4 +516,11 @@ func (s *Subscriber) translate(in <-chan string, out chan<- pubsub.Change) {
 			}
 		}
 	}
+}
+
+// countDecode counts base64.DecodeString of an n byte string: the decoded
+// buffer, and []byte(s) unless it fits the 32 bytes Go keeps on the stack.
+func (s *Subscriber) countDecode(n int) {
+	s.stats.AllocDecode.Add(base64.StdEncoding.DecodedLen(n))
+	s.stats.AllocDecode.AddTemp(n)
 }

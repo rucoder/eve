@@ -19,6 +19,7 @@ import (
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/containerd"
+	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 )
 
 var (
@@ -276,6 +277,7 @@ func ListenDebug(log *base.LogObject, stacksDumpFileName, memDumpFileName string
 	}
 
 	mux.Handle("GET /debug/info/arch", http.HandlerFunc(archHandler))
+	mux.Handle("GET /debug/pubsub/stats", http.HandlerFunc(pubsub.StatsHandler))
 	mux.Handle("GET /debug/info/linuxkit.yml", http.HandlerFunc(linuxkitYmlHandler))
 	mux.Handle("POST /debug/bpftrace", bpfHandler)
 	mux.Handle("GET /debug/bpftrace", http.HandlerFunc(bpftraceForm))
