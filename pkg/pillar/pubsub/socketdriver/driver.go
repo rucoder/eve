@@ -154,6 +154,7 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 		log:            s.Log,
 		doneChan:       doneChan,
 		rootDir:        s.RootDir,
+		stats:          pubsub.PublicationStats(name),
 	}, nil
 }
 
@@ -211,6 +212,7 @@ func (s *SocketDriver) Subscriber(global bool, name, topic string, persistent bo
 		log:              s.Log,
 		doneChan:         doneChan,
 		rootDir:          s.RootDir,
+		stats:            pubsub.SubscriptionStats(name),
 	}, nil
 }
 
@@ -236,21 +238,28 @@ func (s *SocketDriver) persistentDirName(name string) string {
 }
 
 // Use a buffer pool to minimize memory usage
-var bufPool = &sync.Pool{
-	New: func() interface{} {
-		buffer := make([]byte, maxsize+1)
-		return buffer
-	},
-}
+var bufPool = &sync.Pool{}
 
 // Track allocations for debug
 var allocated uint32
 
 // GetBuffer returns a buffer and a done func to call at defer.
 func GetBuffer() ([]byte, func()) {
-	buf := bufPool.Get().([]byte)
+	return getBuffer(nil)
+}
+
+// getBuffer is GetBuffer counting allocations in a: a new buffer when the
+// pool is empty, the returned closure, and the slice header Put boxes.
+func getBuffer(a *pubsub.Alloc) ([]byte, func()) {
+	buf, ok := bufPool.Get().([]byte)
+	if !ok {
+		buf = make([]byte, maxsize+1)
+		a.Add(len(buf))
+	}
+	a.Add(32) // the closure: function pointer and buf
 	atomic.AddUint32(&allocated, 1)
 	return buf, func() {
+		a.Add(24)
 		bufPool.Put(buf)
 		atomic.AddUint32(&allocated, ^uint32(0))
 	}

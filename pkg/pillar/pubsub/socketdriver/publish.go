@@ -24,6 +24,7 @@ import (
 // Implements Unix-domain socket or directory publication,
 // and directory-based persistence.
 type Publisher struct {
+	stats          *pubsub.PubStats
 	persistent     bool
 	sock           net.Conn // For socket subscriptions
 	sockName       string   // there is one socket per publishing agent
@@ -284,8 +285,12 @@ func (s *Publisher) serveConnection(conn net.Conn, instance int) {
 	sendToPeer := make(pubsub.LocalCollection)
 	sentRestartCounter := 0
 
+	s.stats.Connections.Add(1)
+	defer s.stats.Connections.Add(-1)
+
 	// Small buffer since we only read "request <topic>"
 	buf := make([]byte, 256)
+	s.stats.AllocMessage.Add(len(buf))
 
 	// Read request
 	res, err := conn.Read(buf)
@@ -302,6 +307,8 @@ func (s *Publisher) serveConnection(conn net.Conn, instance int) {
 	}
 
 	request := strings.Split(string(buf[0:res]), " ")
+	s.stats.AllocMessage.Add(res)
+	s.stats.AllocMessage.Add(cap(request) * 16)
 	s.log.Functionf("serveConnection read %d: %v\n", len(request), request)
 	if len(request) != 2 || request[0] != "request" || request[1] != s.topic {
 		s.log.Errorf("Invalid request message: %v\n", request)
@@ -312,6 +319,7 @@ func (s *Publisher) serveConnection(conn net.Conn, instance int) {
 	// between its Persistent option and ours. Older subscribers ignore the
 	// extra field.
 	hello := fmt.Sprintf("hello %s %t", s.topic, s.persistent)
+	s.countSend(len(hello))
 	_, err = conn.Write([]byte(hello))
 	if err != nil {
 		s.log.Errorf("serveConnection(%s/%d) failed %s\n", s.name, instance, err)
@@ -421,10 +429,15 @@ func (s *Publisher) sendUpdate(sock net.Conn, key string,
 	sendKey := base64.StdEncoding.EncodeToString([]byte(key))
 	sendVal := base64.StdEncoding.EncodeToString(val)
 	buf := fmt.Sprintf("update %s %s %s", s.topic, sendKey, sendVal)
+	s.countEncode(len(key), len(sendKey))
+	s.countEncode(len(val), len(sendVal))
+	s.stats.AllocMessage.Add(len(buf))
 	if len(buf) >= maxsize {
 		s.log.Fatalf("Too large message (%d bytes) sent to %s topic %s key %s",
 			len(buf), s.name, s.topic, key)
 	}
+	s.stats.AllocMessage.Add(len(buf)) // []byte(buf)
+	s.stats.AddMessage(len(buf))
 	_, err := sock.Write([]byte(buf))
 	return err
 }
@@ -434,10 +447,14 @@ func (s *Publisher) sendDelete(sock net.Conn, key string) error {
 	// base64-encode to avoid having spaces in the key
 	sendKey := base64.StdEncoding.EncodeToString([]byte(key))
 	buf := fmt.Sprintf("delete %s %s", s.topic, sendKey)
+	s.countEncode(len(key), len(sendKey))
+	s.stats.AllocMessage.Add(len(buf))
 	if len(buf) >= maxsize {
 		s.log.Fatalf("Too large message (%d bytes) sent to %s topic %s key %s",
 			len(buf), s.name, s.topic, key)
 	}
+	s.stats.AllocMessage.Add(len(buf)) // []byte(buf)
+	s.stats.AddMessage(len(buf))
 	_, err := sock.Write([]byte(buf))
 	return err
 }
@@ -445,10 +462,13 @@ func (s *Publisher) sendDelete(sock net.Conn, key string) error {
 func (s *Publisher) sendRestarted(sock net.Conn, restartCounter int) error {
 	s.log.Functionf("sendRestarted(%s)\n", s.name)
 	buf := fmt.Sprintf("restarted %s %d", s.topic, restartCounter)
+	s.stats.AllocMessage.Add(len(buf))
 	if len(buf) >= maxsize {
 		s.log.Fatalf("Too large message (%d bytes) sent to %s topic %s",
 			len(buf), s.name, s.topic)
 	}
+	s.stats.AllocMessage.Add(len(buf)) // []byte(buf)
+	s.stats.AddMessage(len(buf))
 	_, err := sock.Write([]byte(buf))
 	return err
 }
@@ -456,10 +476,13 @@ func (s *Publisher) sendRestarted(sock net.Conn, restartCounter int) error {
 func (s *Publisher) sendComplete(sock net.Conn) error {
 	s.log.Functionf("sendComplete(%s)\n", s.name)
 	buf := fmt.Sprintf("complete %s", s.topic)
+	s.stats.AllocMessage.Add(len(buf))
 	if len(buf) >= maxsize {
 		s.log.Fatalf("Too large message (%d bytes) sent to %s topic %s",
 			len(buf), s.name, s.topic)
 	}
+	s.stats.AllocMessage.Add(len(buf)) // []byte(buf)
+	s.stats.AddMessage(len(buf))
 	_, err := sock.Write([]byte(buf))
 	return err
 }
@@ -471,9 +494,28 @@ func (s *Publisher) CheckMaxSize(key string, val []byte) error {
 	sendKey := base64.StdEncoding.EncodeToString([]byte(key))
 	sendVal := base64.StdEncoding.EncodeToString(val)
 	buf := fmt.Sprintf("update %s %s %s", s.topic, sendKey, sendVal)
+	s.countEncode(len(key), len(sendKey))
+	s.countEncode(len(val), len(sendVal))
+	s.stats.AllocMessage.Add(len(buf))
 	if len(buf) >= maxsize {
 		return fmt.Errorf("key %s serialized to size %d exceeds max %d",
 			key, len(buf), maxsize)
 	}
 	return nil
+}
+
+// countSend counts a message string and its []byte conversion for Write.
+func (s *Publisher) countSend(n int) {
+	s.stats.AllocMessage.Add(n)
+	s.stats.AllocMessage.Add(n)
+	s.stats.AddMessage(n)
+}
+
+// countEncode counts base64.EncodeToString of n bytes into an m byte
+// string: []byte(key) and the buffer stay on the stack up to 32 bytes, the
+// string is always allocated.
+func (s *Publisher) countEncode(n, m int) {
+	s.stats.AllocMessage.AddTemp(n)
+	s.stats.AllocMessage.AddTemp(m)
+	s.stats.AllocMessage.Add(m)
 }

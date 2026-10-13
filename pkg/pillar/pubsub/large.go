@@ -27,20 +27,20 @@ const (
 type jsonTree map[string]interface{}
 
 // removeLarge removes all json with the tagLarge prefix
-func removeLarge(log *base.LogObject, b []byte, rootDir string) ([]byte, error) {
-	return writeLargeImpl(log, b, "", rootDir)
+func removeLarge(log *base.LogObject, b []byte, rootDir string, a *Alloc) ([]byte, error) {
+	return writeLargeImpl(log, b, "", rootDir, a)
 }
 
 // writeAndRemoveLarge looks for the tagLarge prefix, saves the content of those
 // fields to uniquely-named files under dirname, and inserts tagFile prefixed
 // fields in the json to specify the fileaname
-func writeAndRemoveLarge(log *base.LogObject, b []byte, dirname string) ([]byte, error) {
-	return writeLargeImpl(log, b, dirname, "")
+func writeAndRemoveLarge(log *base.LogObject, b []byte, dirname string, a *Alloc) ([]byte, error) {
+	return writeLargeImpl(log, b, dirname, "", a)
 }
 
 // If dirname is set we write files there.
 // Otherwise we use rootDir to estimate the size of the fileTag entries
-func writeLargeImpl(log *base.LogObject, b []byte, dirname string, rootDir string) ([]byte, error) {
+func writeLargeImpl(log *base.LogObject, b []byte, dirname string, rootDir string, a *Alloc) ([]byte, error) {
 	var tree jsonTree
 
 	err := json.Unmarshal(b, &tree)
@@ -49,7 +49,7 @@ func writeLargeImpl(log *base.LogObject, b []byte, dirname string, rootDir strin
 			dirname, err)
 		return nil, err
 	}
-	tree, err = writeRemoveTree(log, tree, dirname, rootDir)
+	tree, err = writeRemoveTree(log, tree, dirname, rootDir, a)
 	if err != nil {
 		return nil, err
 	}
@@ -60,11 +60,12 @@ func writeLargeImpl(log *base.LogObject, b []byte, dirname string, rootDir strin
 			dirname, err)
 		return nil, err
 	}
+	a.Add(len(b))
 	return b, nil
 }
 
 func writeRemoveTree(log *base.LogObject,
-	tree jsonTree, dirname string, rootDir string) (jsonTree, error) {
+	tree jsonTree, dirname string, rootDir string, a *Alloc) (jsonTree, error) {
 
 	// function to recursively descend into a subtree
 	descend := func(k string, v interface{}) (interface{}, error) {
@@ -73,7 +74,7 @@ func writeRemoveTree(log *base.LogObject,
 			return v, nil
 		}
 		log.Tracef("Descending into %s", k)
-		return writeRemoveTree(log, subtree, dirname, rootDir)
+		return writeRemoveTree(log, subtree, dirname, rootDir, a)
 	}
 
 	out := make(jsonTree)
@@ -117,6 +118,7 @@ func writeRemoveTree(log *base.LogObject,
 				nk, err)
 			return out, err
 		}
+		a.Add(len(b))
 		length := len(b)
 		if length >= maxLargeLen {
 			err := fmt.Errorf("too large string %d bytes for %s",
@@ -132,6 +134,8 @@ func writeRemoveTree(log *base.LogObject,
 					filename, err)
 				return out, err
 			}
+			a.Add(len(b))
+			a.Add(len(b))
 			out[nk] = string(b)
 			continue
 		}
@@ -164,6 +168,8 @@ func writeRemoveTree(log *base.LogObject,
 				filename, err)
 			return out, err
 		}
+		a.Add(len(b))
+		a.Add(len(b))
 		out[nk] = string(b)
 	}
 	return out, nil
@@ -172,7 +178,7 @@ func writeRemoveTree(log *base.LogObject,
 // readAddLarge walks the json and uses readfile to fill in those fields which
 // have a tagFile prefix.
 // If there is an error it returns the input
-func readAddLarge(log *base.LogObject, b []byte) ([]byte, error) {
+func readAddLarge(log *base.LogObject, b []byte, a *Alloc) ([]byte, error) {
 	var tree jsonTree
 
 	err := json.Unmarshal(b, &tree)
@@ -181,7 +187,7 @@ func readAddLarge(log *base.LogObject, b []byte) ([]byte, error) {
 			err)
 		return b, err
 	}
-	tree, err = readAddTree(log, tree)
+	tree, err = readAddTree(log, tree, a)
 	if err != nil {
 		return b, err
 	}
@@ -192,10 +198,11 @@ func readAddLarge(log *base.LogObject, b []byte) ([]byte, error) {
 			err)
 		return b, err
 	}
+	a.Add(len(out))
 	return out, nil
 }
 
-func readAddTree(log *base.LogObject, tree jsonTree) (jsonTree, error) {
+func readAddTree(log *base.LogObject, tree jsonTree, a *Alloc) (jsonTree, error) {
 	// function to recursively descend into a subtree
 	descend := func(k string, v interface{}) (interface{}, error) {
 		subtree, ok := v.(map[string]interface{})
@@ -203,7 +210,7 @@ func readAddTree(log *base.LogObject, tree jsonTree) (jsonTree, error) {
 			return v, nil
 		}
 		log.Tracef("Descending into %s", k)
-		return readAddTree(log, subtree)
+		return readAddTree(log, subtree, a)
 	}
 
 	out := make(jsonTree)
@@ -242,6 +249,7 @@ func readAddTree(log *base.LogObject, tree jsonTree) (jsonTree, error) {
 		}
 		log.Tracef("tag %s value: %s", k, str)
 		var filename string
+		a.Add(len(str))
 		err := json.Unmarshal([]byte(str), &filename)
 		if err != nil {
 			err := fmt.Errorf("readAddLarge: filename Unmarshal failed for %s: %v",
@@ -249,6 +257,10 @@ func readAddTree(log *base.LogObject, tree jsonTree) (jsonTree, error) {
 			return nil, err
 		}
 		b, err := fileutils.ReadWithMaxSize(log, filename, maxLargeLen+1)
+		if b != nil {
+			a.Add(4096) // bufio.Reader
+			a.Add(cap(b))
+		}
 		if err != nil {
 			// XXX we handle not exists.
 			if !os.IsNotExist(err) && err != io.EOF {

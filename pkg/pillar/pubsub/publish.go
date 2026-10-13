@@ -88,8 +88,9 @@ func (pub *PublicationImpl) CheckMaxSize(key string, item interface{}) error {
 	if err != nil {
 		pub.log.Fatal("json Marshal in CheckMaxSize", err)
 	}
+	PublicationStats(name).AllocMarshal.Add(len(b))
 	// Remove the large items which would use files
-	b, err = removeLarge(pub.log, b, pub.driver.LargeDirName())
+	b, err = removeLarge(pub.log, b, pub.driver.LargeDirName(), &PublicationStats(name).AllocLarge)
 	if err != nil {
 		return err
 	}
@@ -143,6 +144,7 @@ func (pub *PublicationImpl) Publish(key string, item interface{}) error {
 	if err != nil {
 		pub.log.Fatal("json Marshal in Publish", err)
 	}
+	PublicationStats(name).AllocMarshal.Add(len(b))
 
 	// We pass the full json to the driver including any pubsub-large
 	// items to have a complete checkpoint.
@@ -268,7 +270,7 @@ func (pub *PublicationImpl) populate() {
 	}
 	for key, itemB := range pairs {
 		// Just in case large items were stored separately
-		itemB, err = readAddLarge(pub.log, itemB)
+		itemB, err = readAddLarge(pub.log, itemB, &PublicationStats(pub.nameString()).AllocLarge)
 		if err != nil {
 			// Handle missing files??
 			pub.log.Error(err)
@@ -313,13 +315,14 @@ func (pub *PublicationImpl) DetermineDiffs(localCollection LocalCollection) []st
 		if err != nil {
 			pub.log.Fatalf("json Marshal in DetermineDiffs for origin key %s: %v", originKey, err)
 		}
+		PublicationStats(name).AllocMarshal.Add(len(originb))
 
 		local := lookupLocal(localCollection, originKey)
 		if local == nil {
 			pub.log.Tracef("determineDiffs(%s): key %s added\n",
 				name, originKey)
 			// Extract large fields and save to file
-			originb, err = writeAndRemoveLarge(pub.log, originb, dirname)
+			originb, err = writeAndRemoveLarge(pub.log, originb, dirname, &PublicationStats(name).AllocLarge)
 			if err != nil {
 				pub.log.Fatal(err)
 			}
@@ -329,7 +332,7 @@ func (pub *PublicationImpl) DetermineDiffs(localCollection LocalCollection) []st
 			pub.log.Tracef("determineDiffs(%s): key %s replacing due to diff\n",
 				name, originKey)
 			// Extract large fields and save to file
-			originb, err = writeAndRemoveLarge(pub.log, originb, dirname)
+			originb, err = writeAndRemoveLarge(pub.log, originb, dirname, &PublicationStats(name).AllocLarge)
 			if err != nil {
 				pub.log.Fatal(err)
 			}
